@@ -14,6 +14,9 @@ pub fn index_sweep(
     tile_size: u32,
     active_batch: &[TaggedInterval],
 ) -> Vec<Tile> {
+    // TODO: there's a more general higher order function that is the riggle line-sweep algorithm.
+    // therefore, redundant logic could be consolidated between index_sweep and query_sweep.
+
     if tile_size == 0 {
         return Vec::new();
     }
@@ -63,11 +66,11 @@ pub fn index_sweep(
             } else {
                 // Interval partially overlaps the tile
                 if starts_in_tile {
-                    let offset = (iv.iv.start - tile_start) as u16;
+                    let offset = iv.iv.start - tile_start;
                     tile.start_ivs.push((offset, iv.sid));
                 }
                 if ends_in_tile {
-                    let offset = (iv.iv.end - tile_start) as u16;
+                    let offset = iv.iv.end - tile_start;
                     tile.end_ivs.push((offset, iv.sid));
                 }
             }
@@ -78,6 +81,9 @@ pub fn index_sweep(
 
     // Sort interval lists by offset for binary search during query
     for tile in &mut tiles {
+        // TODO: optimize all such instances of sorting to use non-comparative sort
+        // voracious_radix_sort should be preferred -- crucial asymptotic difference
+        // https://docs.rs/voracious_radix_sort/latest/voracious_radix_sort/
         tile.start_ivs.sort_by_key(|(offset, _)| *offset);
         tile.end_ivs.sort_by_key(|(offset, _)| *offset);
     }

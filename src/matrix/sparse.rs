@@ -1,4 +1,4 @@
-use sprs::{CsMat, TriMat};
+use sprs::CsMat;
 
 use super::dense::{BitwiseMask, DenseMatrix};
 
@@ -6,6 +6,9 @@ use super::dense::{BitwiseMask, DenseMatrix};
 pub type SparseMatrix = CsMat<u32>;
 
 /// Condense a dense matrix to sparse format, using the bitmask to skip zeros
+///
+/// Builds CSR directly in O(nnz) time since data is already row-major ordered.
+/// Avoids the O(N log N) sort that TriMat::to_csr() would require.
 pub fn condense_to_sparse(dense: &DenseMatrix, mask: &BitwiseMask) -> SparseMatrix {
     let num_rows = dense.num_rows();
     let num_cols = dense.num_cols();
@@ -13,19 +16,32 @@ pub fn condense_to_sparse(dense: &DenseMatrix, mask: &BitwiseMask) -> SparseMatr
     // Count total non-zeros for pre-allocation
     let nnz: usize = (0..num_rows).map(|r| mask.count_flagged(r)).sum();
 
-    // Build triplet matrix
-    let mut triplets = TriMat::with_capacity((num_rows, num_cols), nnz);
+    // Build CSR arrays directly (data is already sorted by row, then by column)
+    let mut indptr = Vec::with_capacity(num_rows + 1);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut data = Vec::with_capacity(nnz);
+
+    indptr.push(0);
 
     for row in 0..num_rows {
         for col in mask.flagged_cols(row) {
             let value = dense.get(row, col);
             if value > 0 {
-                triplets.add_triplet(row, col, value);
+                indices.push(col);
+                data.push(value);
             }
         }
+        indptr.push(indices.len());
     }
 
-    triplets.to_csr()
+    // Safety: Data is sorted (rows in order, cols in order within rows)
+    // indptr has correct structure, indices and data have matching length
+    CsMat::new(
+        (num_rows, num_cols),
+        indptr,
+        indices,
+        data,
+    )
 }
 
 /// Merge two sparse matrices by element-wise addition

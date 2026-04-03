@@ -14,6 +14,12 @@ use crate::matrix::{BitwiseMask, DenseMatrix};
 /// # Note
 /// Query indices in `query_batch` are their positions in the sorted order,
 /// which correspond to row indices in `results`.
+///
+/// # Deduplication Strategy
+/// Intervals spanning multiple tiles appear in running_counts of each tile they span.
+/// To avoid double-counting, we only count running_counts and end_ivs in the
+/// "first overlap tile" for each query - determined by `query.start >= tile_start`.
+/// start_ivs are always unique to their tile, so no deduplication needed.
 pub fn query_sweep(
     mapped_chunk: &MappedChunk,
     tile_size: u32,
@@ -26,10 +32,6 @@ pub fn query_sweep(
     }
 
     let chunk_start = mapped_chunk.start_coord();
-
-    // For each query, track which sids we've already counted from running_counts
-    // to avoid double-counting when a query spans multiple tiles
-    let mut seen_running: Vec<Vec<u32>> = vec![Vec::new(); query_batch.len()];
 
     // Head pointer into query_batch
     let mut head = 0;
@@ -54,68 +56,41 @@ pub fn query_sweep(
         while scan < query_batch.len() && query_batch[scan].1.iv.start < tile_end {
             let (query_idx, query) = &query_batch[scan];
 
-            // Process running counts (intervals spanning entire tile)
-            process_running_counts(
-                tile,
-                query,
-                *query_idx,
-                results,
-                mask,
-                &mut seen_running[scan - head],
-            );
+            // Determine if this is the first tile where query overlaps
+            // This is true when query.start falls within [tile_start, tile_end)
+            // Used to avoid double-counting running_counts and end_ivs
+            let is_first_overlap_tile = query.iv.start >= tile_start;
 
-            // Process start_ivs (intervals starting in this tile)
+            // Process running counts only in first overlap tile
+            if is_first_overlap_tile {
+                process_running_counts(tile, *query_idx, results, mask);
+            }
+
+            // Process start_ivs (intervals starting in this tile) - always unique
             process_start_ivs(tile, tile_start, query, *query_idx, results, mask);
 
-            // Process end_ivs (intervals ending in this tile)
-            process_end_ivs(
-                tile,
-                tile_start,
-                query,
-                *query_idx,
-                results,
-                mask,
-                &seen_running[scan - head],
-            );
+            // Process end_ivs only in first overlap tile
+            if is_first_overlap_tile {
+                process_end_ivs(tile, tile_start, query, *query_idx, results, mask);
+            }
 
             scan += 1;
-        }
-
-        // Clear seen_running for queries that no longer intersect future tiles
-        for (i, (_, q)) in query_batch.iter().enumerate().skip(head).take(scan - head) {
-            if q.iv.end <= tile_end {
-                // Query ends in this tile, clear its tracking
-                if i >= head && i - head < seen_running.len() {
-                    seen_running[i - head].clear();
-                }
-            }
         }
     }
 }
 
 /// Process running counts from a tile for a query
+/// Called only for the first overlap tile (deduplication handled by caller)
 fn process_running_counts(
     tile: &ArchivedTile,
-    _query: &TaggedInterval,
     query_idx: usize,
     results: &mut DenseMatrix,
     mask: &mut BitwiseMask,
-    seen: &mut Vec<u32>,
 ) {
     for entry in tile.running_counts.iter() {
         let sid: u32 = entry.0.into();
         let count: u32 = entry.1.into();
 
-        // Check if we've already counted this sid for this query
-        // (from a previous tile it also spans)
-        if seen.contains(&sid) {
-            continue;
-        }
-
-        // Mark as seen
-        seen.push(sid);
-
-        // Add count
         let sid_usize = sid as usize;
         if sid_usize < results.num_cols() {
             results.add(query_idx, sid_usize, count);
@@ -141,19 +116,19 @@ fn process_start_ivs(
     // Binary search to find first interval that might overlap with query
     // We want intervals where: iv_start >= query.start AND iv_start < query.end
     // Since iv_start = tile_start + offset, we need offset >= query.start - tile_start
-    let query_start_offset = query.iv.start.saturating_sub(tile_start) as u16;
+    let query_start_offset = query.iv.start.saturating_sub(tile_start);
 
     // Find first interval with offset >= query_start_offset
     let start_idx = tile.start_ivs.partition_point(|entry| {
-        let offset: u16 = entry.0.into();
+        let offset: u32 = entry.0.into();
         offset < query_start_offset
     });
 
     // Iterate from start_idx until we exceed query.end
     for entry in tile.start_ivs.iter().skip(start_idx) {
-        let offset: u16 = entry.0.into();
+        let offset: u32 = entry.0.into();
         let sid: u32 = entry.1.into();
-        let iv_start = tile_start + offset as u32;
+        let iv_start = tile_start + offset;
 
         // Stop if we've passed the query end
         if iv_start >= query.iv.end {
@@ -171,6 +146,7 @@ fn process_start_ivs(
 
 /// Process intervals ending in this tile
 /// Uses binary search to find the first relevant interval, then iterates
+/// Called only for the first overlap tile (deduplication handled by caller)
 fn process_end_ivs(
     tile: &ArchivedTile,
     tile_start: u32,
@@ -178,7 +154,6 @@ fn process_end_ivs(
     query_idx: usize,
     results: &mut DenseMatrix,
     mask: &mut BitwiseMask,
-    seen: &[u32],
 ) {
     if tile.end_ivs.is_empty() {
         return;
@@ -187,11 +162,11 @@ fn process_end_ivs(
     // Binary search to find first interval that might overlap with query
     // We want intervals where: iv_end > query.start (interval ends after query starts)
     // Since iv_end = tile_start + offset, we need offset > query.start - tile_start
-    let query_start_offset = query.iv.start.saturating_sub(tile_start) as u16;
+    let query_start_offset = query.iv.start.saturating_sub(tile_start);
 
     // Find first interval with offset > query_start_offset
     let start_idx = tile.end_ivs.partition_point(|entry| {
-        let offset: u16 = entry.0.into();
+        let offset: u32 = entry.0.into();
         offset <= query_start_offset
     });
 
@@ -203,11 +178,6 @@ fn process_end_ivs(
         // We overlap if query.start < iv_end (which we ensured with binary search)
         // Note: We don't need to check upper bound since end_ivs only contains
         // intervals ending IN this tile (before tile_end)
-
-        // Don't double-count if we already counted this from running_counts
-        if seen.contains(&sid) {
-            continue;
-        }
 
         // Count this overlap
         let sid_usize = sid as usize;
@@ -265,8 +235,8 @@ mod tests {
 
         query_sweep(&mapped, tile_size, &queries, &mut results, &mut mask);
 
-        // Should count the interval once
-        assert_eq!(results.get(0, 0), 2); // start_iv + end_iv
+        // Should count the interval once (counted from start_ivs in tile0, not from end_ivs in tile1)
+        assert_eq!(results.get(0, 0), 1);
     }
 
     #[test]

@@ -69,6 +69,18 @@ impl DenseMatrix {
     pub fn as_slice(&self) -> &[u32] {
         &self.data
     }
+
+    /// Resize and zero the matrix (only reallocates if larger)
+    pub fn resize_and_zero(&mut self, num_rows: usize, num_cols: usize) {
+        let new_size = num_rows * num_cols;
+        if new_size > self.data.len() {
+            self.data.resize(new_size, 0);
+        }
+        // Zero the used portion
+        self.data[..new_size].fill(0);
+        self.num_rows = num_rows;
+        self.num_cols = num_cols;
+    }
 }
 
 /// Bitwise mask tracking non-zero columns per row
@@ -133,6 +145,18 @@ impl BitwiseMask {
         let start = row * self.num_cols;
         let end = start + self.num_cols;
         self.data[start..end].count_ones()
+    }
+
+    /// Resize and clear the mask (only reallocates if larger)
+    pub fn resize_and_clear(&mut self, num_rows: usize, num_cols: usize) {
+        let new_size = num_rows * num_cols;
+        if new_size > self.data.len() {
+            self.data.resize(new_size, false);
+        }
+        // Clear the used portion
+        self.data[..new_size].fill(false);
+        self.num_rows = num_rows;
+        self.num_cols = num_cols;
     }
 }
 
