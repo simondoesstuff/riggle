@@ -92,6 +92,7 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
             master_header.update_max_coord(iv.iv.end);
         }
 
+        // TODO: optimize by pre-alloc
         all_intervals.extend(intervals);
     }
 
@@ -110,6 +111,7 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
         layer_intervals.sort_by_key(|iv| iv.iv.start);
 
         // Group by chunk and process
+        // TODO: determine if this is worth parallelizing
         let chunks = group_by_chunk(&layer_intervals, layer_config);
 
         // Create layer directory
@@ -186,6 +188,8 @@ fn write_chunk_file(
     config: &LayerConfig,
     intervals: &[TaggedInterval],
 ) -> Result<(), BuildError> {
+    // FIX: don't pass layer_id since it's incluced in LayerConfig;
+    // this will lead to downstream bugs
     let chunk_start = chunk_id * config.chunk_size;
     let chunk_end = chunk_start + config.chunk_size;
     let chunk_bounds = Interval::new(chunk_start, chunk_end);

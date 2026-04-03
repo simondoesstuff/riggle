@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use riggle::io::MasterHeader;
 use riggle::stats::compute_statistics;
-use riggle::tasks::{build_database, query_database, BuildConfig, QueryConfig};
+use riggle::tasks::{BuildConfig, QueryConfig, build_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "riggle")]
@@ -20,6 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Build a database from BED files
+    // TODO: support an Add command; try to consolidate logic with Build/Add as much as possible
     Build {
         /// Input directory containing BED files
         #[arg(short, long)]
@@ -31,6 +32,9 @@ enum Commands {
     },
 
     /// Query a database with a BED file
+    // TODO: Query entrypoint should take in a batch of BED files just as like Build. This supersedes
+    // existing functionality since users can pass a single file. This will allow some similar logic
+    // between index & query to be consolidated, such as flattening, tagging, etc...
     Query {
         /// Path to the database directory
         #[arg(short, long)]

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,8 +8,16 @@ use thiserror::Error;
 
 use crate::core::TaggedInterval;
 use crate::io::{parse_bed_file, BedParseError, MappedChunk, MasterHeader};
-use crate::matrix::{allocate_dense_accumulator, condense_to_sparse, merge_sparse, SparseMatrix};
+use crate::matrix::{
+    condense_to_sparse, merge_sparse, zero_flagged_regions, BitwiseMask, DenseMatrix, SparseMatrix,
+};
 use crate::sweep::query_sweep;
+
+// Thread-local buffer for query accumulation
+// Reuses DenseMatrix and BitwiseMask across chunk tasks on the same thread
+thread_local! {
+    static THREAD_LOCAL_BUFFER: RefCell<Option<(DenseMatrix, BitwiseMask)>> = const { RefCell::new(None) };
+}
 
 /// Errors that can occur during query
 #[derive(Debug, Error)]
@@ -191,7 +200,7 @@ fn chunk_path(db_path: &Path, layer_id: u8, chunk_id: u32) -> PathBuf {
         .join(format!("chunk_{}.bin", chunk_id))
 }
 
-/// Process a single chunk
+/// Process a single chunk using thread-local buffer reuse
 fn process_chunk(
     path: &Path,
     layer_id: u8,
@@ -217,9 +226,6 @@ fn process_chunk(
         return Ok(sprs::CsMat::empty(sprs::CompressedStorage::CSR, num_sources));
     }
 
-    // Allocate thread-local accumulator
-    let (mut dense, mut mask) = allocate_dense_accumulator(num_queries, num_sources);
-
     // Get tile size from layer config
     let tile_size = master_header
         .layer_configs
@@ -227,11 +233,36 @@ fn process_chunk(
         .map(|c| c.tile_size)
         .unwrap_or(1024);
 
-    // Run query sweep
-    query_sweep(&mapped, tile_size, &relevant_queries, &mut dense, &mut mask);
+    // Use thread-local buffer (reused across chunks on same thread)
+    THREAD_LOCAL_BUFFER.with(|cell| {
+        let mut borrow = cell.borrow_mut();
 
-    // Condense to sparse
-    Ok(condense_to_sparse(&dense, &mask))
+        // Initialize or resize buffers as needed
+        let (dense, mask) = borrow.get_or_insert_with(|| {
+            (
+                DenseMatrix::new(num_queries, num_sources),
+                BitwiseMask::new(num_queries, num_sources),
+            )
+        });
+
+        // Resize if dimensions changed (only reallocates if larger)
+        if dense.num_rows() != num_queries || dense.num_cols() != num_sources {
+            dense.resize_and_zero(num_queries, num_sources);
+            mask.resize_and_clear(num_queries, num_sources);
+        }
+
+        // Run query sweep
+        query_sweep(&mapped, tile_size, &relevant_queries, dense, mask);
+
+        // Condense to sparse result
+        let result = condense_to_sparse(dense, mask);
+
+        // Clear only flagged regions for next use (more efficient than zeroing all)
+        zero_flagged_regions(dense, mask);
+        mask.clear_all();
+
+        Ok(result)
+    })
 }
 
 /// Tree-reduce sparse matrices

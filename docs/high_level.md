@@ -102,6 +102,8 @@ _Note: Because $I$ is duplicated across chunk boundaries prior to this step, an 
 
 _Goal: Calculate exact intersection counts while strictly preventing double-counting of duplicated database intervals._
 
+We can guarantee no duplication without hashes or a bit masks with a simple logical rule, borrowed from IGD. Only take an interval as overlapping if either the query or database interval start in the current chunk, that is, at most one of them can intersect the left boundary. We encode this as follows...
+
 For the current Tile $T$, we evaluate the active query intervals. For a given active query $Q$:
 
 **1. Apply Running Counts (The Fast Path)**
@@ -128,4 +130,3 @@ For each $D_{end} \in T$`.end_ivs`:
 - If $Q$ overlaps $D_{end}$ (i.e., $Q.start < D.end$ AND $Q.end > D.end$):
   - _IGD Deduplication Check:_ We only count this if the intersection _began_ in this tile. If $Q$ crosses the left boundary of $T$ ($Q.start < T.start$), this intersection was already counted by a `running_counts` or `start_ivs` evaluation in a previous tile.
   - If $Q.start \ge T.start$, increment `results[Q.sid][D.sid]`.
-

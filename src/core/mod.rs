@@ -66,6 +66,7 @@ impl LayerID {
         if len == 0 {
             LayerID(0)
         } else {
+            // floor(log2(x))
             LayerID((32 - len.leading_zeros() - 1) as u8)
         }
     }
@@ -110,10 +111,12 @@ pub struct Tile {
     pub running_counts: Vec<(u32, u32)>,
     /// Intervals starting within this tile (offset from tile start, sid)
     /// SORTED by offset for binary search
-    pub start_ivs: Vec<(u16, u32)>,
+    /// Note: u32 offset required since tile_size can exceed 65535 for larger layers
+    pub start_ivs: Vec<(u32, u32)>,
     /// Intervals ending within this tile (offset from tile start, sid)
     /// SORTED by offset for binary search
-    pub end_ivs: Vec<(u16, u32)>,
+    /// Note: u32 offset required since tile_size can exceed 65535 for larger layers
+    pub end_ivs: Vec<(u32, u32)>,
 }
 
 impl Tile {
