@@ -1,5 +1,5 @@
 mod build;
 mod query;
 
-pub use build::{build_database, BuildConfig, BuildError};
-pub use query::{query_database, QueryConfig, QueryError, QueryResult};
+pub use build::{add_to_database, build_database, AddConfig, BuildConfig, BuildError};
+pub use query::{query_database, QueryConfig, QueryError, QueryResult, QuerySource};
