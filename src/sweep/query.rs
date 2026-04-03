@@ -120,14 +120,14 @@ fn process_start_ivs(
 
     // Find first interval with offset >= query_start_offset
     let start_idx = tile.start_ivs.partition_point(|entry| {
-        let offset: u32 = entry.0.into();
+        let offset: u32 = entry.offset.into();
         offset < query_start_offset
     });
 
     // Iterate from start_idx until we exceed query.end
     for entry in tile.start_ivs.iter().skip(start_idx) {
-        let offset: u32 = entry.0.into();
-        let sid: u32 = entry.1.into();
+        let offset: u32 = entry.offset.into();
+        let sid: u32 = entry.sid.into();
         let iv_start = tile_start + offset;
 
         // Stop if we've passed the query end
@@ -166,13 +166,13 @@ fn process_end_ivs(
 
     // Find first interval with offset > query_start_offset
     let start_idx = tile.end_ivs.partition_point(|entry| {
-        let offset: u32 = entry.0.into();
+        let offset: u32 = entry.offset.into();
         offset <= query_start_offset
     });
 
     // Iterate from start_idx
     for entry in tile.end_ivs.iter().skip(start_idx) {
-        let sid: u32 = entry.1.into();
+        let sid: u32 = entry.sid.into();
 
         // The interval ends in this tile, started somewhere before
         // We overlap if query.start < iv_end (which we ensured with binary search)
@@ -191,7 +191,7 @@ fn process_end_ivs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Tile;
+    use crate::core::{OffsetSid, Tile};
     use crate::io::{write_chunk, ChunkHeader};
     use tempfile::NamedTempFile;
 
@@ -219,10 +219,10 @@ mod tests {
     fn test_query_sweep_basic() {
         // Create a chunk with 2 tiles, tile_size = 100
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push((50, 0)); // interval starting at 50, sid 0
+        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval starting at 50, sid 0
 
         let mut tile1 = Tile::new(100);
-        tile1.end_ivs.push((50, 0)); // interval ending at 150, sid 0
+        tile1.end_ivs.push(OffsetSid::new(50, 0)); // interval ending at 150, sid 0
 
         let (file, tile_size) = create_test_chunk(vec![tile0, tile1], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn test_query_sweep_no_overlap() {
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push((50, 0)); // interval at 50
+        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval at 50
 
         let (file, tile_size) = create_test_chunk(vec![tile0], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn test_query_sweep_multiple_queries() {
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push((25, 0)); // interval at 25, sid 0
-        tile0.start_ivs.push((75, 1)); // interval at 75, sid 1
+        tile0.start_ivs.push(OffsetSid::new(25, 0)); // interval at 25, sid 0
+        tile0.start_ivs.push(OffsetSid::new(75, 1)); // interval at 75, sid 1
 
         let (file, tile_size) = create_test_chunk(vec![tile0], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();

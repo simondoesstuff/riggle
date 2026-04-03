@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use riggle::io::MasterHeader;
 use riggle::stats::compute_statistics;
-use riggle::tasks::{BuildConfig, QueryConfig, build_database, query_database};
+use riggle::tasks::{AddConfig, BuildConfig, QueryConfig, add_to_database, build_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "riggle")]
@@ -20,7 +20,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Build a database from BED files
-    // TODO: support an Add command; try to consolidate logic with Build/Add as much as possible
     Build {
         /// Input directory containing BED files
         #[arg(short, long)]
@@ -31,16 +30,24 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// Query a database with a BED file
-    // TODO: Query entrypoint should take in a batch of BED files just as like Build. This supersedes
-    // existing functionality since users can pass a single file. This will allow some similar logic
-    // between index & query to be consolidated, such as flattening, tagging, etc...
+    /// Add BED files to an existing database
+    Add {
+        /// Input directory containing BED files to add
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Path to existing database directory
+        #[arg(short, long)]
+        db: PathBuf,
+    },
+
+    /// Query a database with BED file(s)
     Query {
         /// Path to the database directory
         #[arg(short, long)]
         db: PathBuf,
 
-        /// Query BED file
+        /// Query BED file or directory containing BED files
         #[arg(short, long)]
         query: PathBuf,
 
@@ -66,6 +73,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Build { input, output } => run_build(input, output),
+        Commands::Add { input, db } => run_add(input, db),
         Commands::Query {
             db,
             query,
@@ -79,6 +87,27 @@ fn main() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
+}
+
+fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Adding files to database...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let config = AddConfig::new(input, db.clone());
+    let added_count = add_to_database(&config)?;
+
+    pb.finish_with_message(format!(
+        "Added {} source(s) to database at {}",
+        added_count,
+        db.display()
+    ));
+    Ok(())
 }
 
 fn run_build(input: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {

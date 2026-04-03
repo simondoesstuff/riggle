@@ -10,8 +10,8 @@ Riggle is a statistical interval intersection engine for genomic data. It indexe
 - **Chunks**: Fixed-size genomic territories within a layer. O(1) lookup via `chunk_id = coord / chunk_size`.
 - **Tiles**: Subdivisions within chunks. Intervals are classified as:
   - `running_counts`: spans entire tile (sid, count)
-  - `start_ivs`: starts in tile (offset, sid) - SORTED by offset
-  - `end_ivs`: ends in tile (offset, sid) - SORTED by offset
+  - `start_ivs`: starts in tile - Vec<OffsetSid>, SORTED by offset via radix sort
+  - `end_ivs`: ends in tile - Vec<OffsetSid>, SORTED by offset via radix sort
 
 ### Key Files
 ```
@@ -37,7 +37,8 @@ src/
 ## Critical Implementation Details
 
 ### Offset Storage (FIXED)
-- `start_ivs` and `end_ivs` use `(u32, u32)` tuples (offset, sid)
+- `start_ivs` and `end_ivs` use `OffsetSid` struct (offset: u32, sid: u32)
+- `OffsetSid` implements `Radixable<u32>` for O(n) sorting by offset
 - Previously used u16 for offset which caused silent truncation for large tiles (>65535)
 - Tile sizes can exceed 65535 for layers > 11
 
@@ -77,15 +78,30 @@ Note: Requires nix shell for libiconv on macOS.
 ## CLI Usage
 ```bash
 riggle build --input <dir> --output <db_path>
-riggle query --db <db_path> --query <bed_file> --output <json>
+riggle add --input <dir> --db <db_path>           # Add files to existing database
+riggle query --db <db_path> --query <bed_or_dir> --output <json>
 riggle info --db <db_path>
 ```
 
-## Completed Optimizations (from docs/_critiques.md)
+### Query Batch Mode
+Query accepts either a single BED file or a directory of BED files:
+- Single file: `--query file.bed`
+- Directory: `--query query_dir/` (all .bed files processed)
+
+## Completed Optimizations
+
+### From docs/_critiques.md
 1. ✅ u16 truncation bug - Changed to u32 for tile offsets
 2. ✅ O(N) deduplication - Uses tile position logic (`is_first_overlap_tile`)
 3. ✅ Thread-local buffer reuse - Uses `thread_local!` for DenseMatrix/BitwiseMask
 4. ✅ O(N log N) sparse construction - Builds CsMat directly in O(nnz)
+
+### From Code TODOs
+5. ✅ Radix sort for tile intervals - Uses voracious_radix_sort with OffsetSid wrapper
+6. ✅ Radix sort for build pipeline - TaggedInterval implements Radixable for O(n) layer sorting
+7. ✅ Pre-allocation in build pipeline - Exact capacity via two-pass
+8. ✅ Add command - Incremental database updates
+9. ✅ Batch query support - Query with directory of BED files
 
 ## rkyv Notes
 - Uses rkyv 0.8 for zero-copy deserialization

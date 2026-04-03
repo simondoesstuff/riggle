@@ -1,4 +1,6 @@
-use crate::core::{Interval, TaggedInterval, Tile};
+use voracious_radix_sort::RadixSort;
+
+use crate::core::{Interval, OffsetSid, TaggedInterval, Tile};
 
 /// Build tiles from a sorted batch of intervals within a chunk
 ///
@@ -14,8 +16,16 @@ pub fn index_sweep(
     tile_size: u32,
     active_batch: &[TaggedInterval],
 ) -> Vec<Tile> {
-    // TODO: there's a more general higher order function that is the riggle line-sweep algorithm.
-    // therefore, redundant logic could be consolidated between index_sweep and query_sweep.
+    // Design note: index_sweep and query_sweep share a similar head-pointer pattern:
+    // 1. Maintain head pointer into sorted batch
+    // 2. For each tile, advance head past completed items
+    // 3. Process active items intersecting current tile
+    //
+    // Consolidation was considered but deferred because:
+    // - Different input types (TaggedInterval vs MappedChunk tiles)
+    // - Different processing (tile building vs counting)
+    // - Abstraction overhead may outweigh benefits for two similar functions
+    // - Both are performance-critical paths where clarity aids optimization
 
     if tile_size == 0 {
         return Vec::new();
@@ -67,11 +77,11 @@ pub fn index_sweep(
                 // Interval partially overlaps the tile
                 if starts_in_tile {
                     let offset = iv.iv.start - tile_start;
-                    tile.start_ivs.push((offset, iv.sid));
+                    tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
                 }
                 if ends_in_tile {
                     let offset = iv.iv.end - tile_start;
-                    tile.end_ivs.push((offset, iv.sid));
+                    tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
                 }
             }
 
@@ -80,12 +90,10 @@ pub fn index_sweep(
     }
 
     // Sort interval lists by offset for binary search during query
+    // Uses radix sort O(n * w) where w is word size, vs O(n log n) for comparison sort
     for tile in &mut tiles {
-        // TODO: optimize all such instances of sorting to use non-comparative sort
-        // voracious_radix_sort should be preferred -- crucial asymptotic difference
-        // https://docs.rs/voracious_radix_sort/latest/voracious_radix_sort/
-        tile.start_ivs.sort_by_key(|(offset, _)| *offset);
-        tile.end_ivs.sort_by_key(|(offset, _)| *offset);
+        tile.start_ivs.voracious_sort();
+        tile.end_ivs.voracious_sort();
     }
 
     tiles
@@ -113,10 +121,10 @@ mod tests {
         // - Start in tile 1 (100-200) at offset 50
         // - End in tile 2 (200-300) at offset 50
         assert_eq!(tiles[1].start_ivs.len(), 1);
-        assert_eq!(tiles[1].start_ivs[0], (50, 1)); // offset 50 from tile start
+        assert_eq!(tiles[1].start_ivs[0], OffsetSid::new(50, 1)); // offset 50 from tile start
 
         assert_eq!(tiles[2].end_ivs.len(), 1);
-        assert_eq!(tiles[2].end_ivs[0], (50, 1)); // offset 50 from tile start
+        assert_eq!(tiles[2].end_ivs[0], OffsetSid::new(50, 1)); // offset 50 from tile start
     }
 
     #[test]
@@ -198,9 +206,9 @@ mod tests {
 
         // Single tile, interval starts and ends in it
         assert_eq!(tiles[0].start_ivs.len(), 1);
-        assert_eq!(tiles[0].start_ivs[0], (50, 1));
+        assert_eq!(tiles[0].start_ivs[0], OffsetSid::new(50, 1));
         assert_eq!(tiles[0].end_ivs.len(), 1);
-        assert_eq!(tiles[0].end_ivs[0], (51, 1));
+        assert_eq!(tiles[0].end_ivs[0], OffsetSid::new(51, 1));
     }
 
     #[test]

@@ -188,10 +188,10 @@ mod tests {
         // Create some tiles
         let mut tile0 = Tile::new(0);
         tile0.running_counts.push((1, 5));
-        tile0.start_ivs.push((10, 2));
+        tile0.start_ivs.push(crate::core::OffsetSid::new(10, 2));
 
         let mut tile1 = Tile::new(500);
-        tile1.end_ivs.push((50, 3));
+        tile1.end_ivs.push(crate::core::OffsetSid::new(50, 3));
 
         let tiles = vec![tile0, tile1];
 

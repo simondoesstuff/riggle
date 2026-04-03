@@ -1,7 +1,8 @@
 use rkyv::{Archive, Deserialize, Serialize};
+use voracious_radix_sort::Radixable;
 
 /// Basic interval representation with half-open coordinates [start, end)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
 pub struct Interval {
     pub start: u32,
     pub end: u32,
@@ -39,7 +40,7 @@ impl Interval {
 }
 
 /// Interval tagged with a source ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
 pub struct TaggedInterval {
     pub iv: Interval,
     pub sid: u32,
@@ -51,6 +52,16 @@ impl TaggedInterval {
             iv: Interval::new(start, end),
             sid,
         }
+    }
+}
+
+// Implement Radixable to enable O(n) radix sorting by start coordinate
+impl Radixable<u32> for TaggedInterval {
+    type Key = u32;
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        self.iv.start
     }
 }
 
@@ -98,10 +109,50 @@ impl TileID {
     }
 }
 
+/// Offset-Sid pair for tile interval lists
+/// Wrapper struct to enable radix sorting by offset
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
+#[repr(C)]
+pub struct OffsetSid {
+    pub offset: u32,
+    pub sid: u32,
+}
+
+impl OffsetSid {
+    #[inline]
+    pub fn new(offset: u32, sid: u32) -> Self {
+        Self { offset, sid }
+    }
+}
+
+impl From<(u32, u32)> for OffsetSid {
+    #[inline]
+    fn from((offset, sid): (u32, u32)) -> Self {
+        Self { offset, sid }
+    }
+}
+
+impl From<OffsetSid> for (u32, u32) {
+    #[inline]
+    fn from(os: OffsetSid) -> Self {
+        (os.offset, os.sid)
+    }
+}
+
+// Implement Radixable to enable O(n) radix sorting by offset
+impl Radixable<u32> for OffsetSid {
+    type Key = u32;
+
+    #[inline]
+    fn key(&self) -> Self::Key {
+        self.offset
+    }
+}
+
 /// Tile structure - the leaf node in the index
 /// Contains intervals that touch this tile, organized for efficient querying.
 ///
-/// INVARIANT: `start_ivs` and `end_ivs` are sorted by offset (first tuple element)
+/// INVARIANT: `start_ivs` and `end_ivs` are sorted by offset
 /// to enable binary search during query. This sorting is performed by `index_sweep`.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Tile {
@@ -109,14 +160,12 @@ pub struct Tile {
     pub start_coord: u32,
     /// Running counts: intervals that span the entire tile (sid, count)
     pub running_counts: Vec<(u32, u32)>,
-    /// Intervals starting within this tile (offset from tile start, sid)
-    /// SORTED by offset for binary search
-    /// Note: u32 offset required since tile_size can exceed 65535 for larger layers
-    pub start_ivs: Vec<(u32, u32)>,
-    /// Intervals ending within this tile (offset from tile start, sid)
-    /// SORTED by offset for binary search
-    /// Note: u32 offset required since tile_size can exceed 65535 for larger layers
-    pub end_ivs: Vec<(u32, u32)>,
+    /// Intervals starting within this tile
+    /// SORTED by offset for binary search via radix sort
+    pub start_ivs: Vec<OffsetSid>,
+    /// Intervals ending within this tile
+    /// SORTED by offset for binary search via radix sort
+    pub end_ivs: Vec<OffsetSid>,
 }
 
 impl Tile {
@@ -221,8 +270,8 @@ mod tests {
         let mut tile = Tile::new(1000);
         tile.running_counts.push((1, 10));
         tile.running_counts.push((2, 5));
-        tile.start_ivs.push((50, 3));
-        tile.end_ivs.push((75, 4));
+        tile.start_ivs.push(OffsetSid::new(50, 3));
+        tile.end_ivs.push(OffsetSid::new(75, 4));
 
         // Serialize
         let bytes = rkyv::to_bytes::<Error>(&tile).unwrap();

@@ -7,9 +7,9 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::core::TaggedInterval;
-use crate::io::{parse_bed_file, BedParseError, MappedChunk, MasterHeader};
+use crate::io::{BedParseError, MappedChunk, MasterHeader, parse_bed_file};
 use crate::matrix::{
-    condense_to_sparse, merge_sparse, zero_flagged_regions, BitwiseMask, DenseMatrix, SparseMatrix,
+    BitwiseMask, DenseMatrix, SparseMatrix, condense_to_sparse, merge_sparse, zero_flagged_regions,
 };
 use crate::sweep::query_sweep;
 
@@ -43,7 +43,7 @@ pub enum QueryError {
 pub struct QueryConfig {
     /// Path to database directory
     pub db_path: PathBuf,
-    /// Path to query BED file
+    /// Path to query BED file or directory containing BED files
     pub query_path: PathBuf,
     /// Number of threads (default: all available)
     pub num_threads: Option<usize>,
@@ -59,6 +59,17 @@ impl QueryConfig {
     }
 }
 
+/// Metadata for a query source file
+#[derive(Debug, Clone)]
+pub struct QuerySource {
+    /// File name
+    pub name: String,
+    /// Starting row index in results matrix
+    pub start_idx: usize,
+    /// Number of intervals
+    pub count: usize,
+}
+
 /// Result of a query operation
 #[derive(Debug)]
 pub struct QueryResult {
@@ -66,11 +77,16 @@ pub struct QueryResult {
     pub counts: SparseMatrix,
     /// Query metadata (index -> name mapping)
     pub query_names: Vec<String>,
+    /// Query source files (when querying with a directory)
+    pub query_sources: Vec<QuerySource>,
     /// Database source metadata
     pub db_sources: HashMap<u32, String>,
 }
 
 /// Execute a query against the database
+///
+/// Accepts either a single BED file or a directory containing multiple BED files.
+/// When given a directory, each file is treated as a separate query source.
 pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     // Load master header
     let header_path = config.db_path.join("header.json");
@@ -82,14 +98,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let master_header: MasterHeader = serde_json::from_str(&header_content)
         .map_err(|e| QueryError::InvalidDatabase(e.to_string()))?;
 
-    // Parse query file
-    let queries = parse_bed_file(&config.query_path, 0)?;
+    // Parse query file(s) - handle both single file and directory
+    let (queries, query_sources, query_names) = if config.query_path.is_dir() {
+        parse_query_directory(&config.query_path)?
+    } else {
+        parse_single_query_file(&config.query_path)?
+    };
+
     if queries.is_empty() {
         // Return empty result
         let counts = sprs::CsMat::empty(sprs::CompressedStorage::CSR, master_header.num_sources());
         return Ok(QueryResult {
             counts,
             query_names: Vec::new(),
+            query_sources: Vec::new(),
             db_sources: master_header
                 .sid_map
                 .iter()
@@ -99,10 +121,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     }
 
     // Sort queries and track original indices
-    let mut indexed_queries: Vec<(usize, TaggedInterval)> = queries
-        .into_iter()
-        .enumerate()
-        .collect();
+    let mut indexed_queries: Vec<(usize, TaggedInterval)> =
+        queries.into_iter().enumerate().collect();
     indexed_queries.sort_by_key(|(_, iv)| iv.iv.start);
 
     let num_queries = indexed_queries.len();
@@ -132,20 +152,90 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     // Merge all sparse matrices
     let final_counts = tree_reduce_sparse(sparse_matrices, num_queries, num_sources);
 
-    // Build query names
-    let query_names: Vec<String> = (0..num_queries)
-        .map(|i| format!("query_{}", i))
-        .collect();
-
     Ok(QueryResult {
         counts: final_counts,
         query_names,
+        query_sources,
         db_sources: master_header
             .sid_map
             .iter()
             .map(|(k, v)| (*k, v.name.clone()))
             .collect(),
     })
+}
+
+/// Parse a single query BED file
+fn parse_single_query_file(
+    path: &Path,
+) -> Result<(Vec<TaggedInterval>, Vec<QuerySource>, Vec<String>), QueryError> {
+    let intervals = parse_bed_file(path, 0)?;
+    let count = intervals.len();
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "query".to_string());
+
+    let query_names: Vec<String> = (0..count).map(|i| format!("{}:{}", name, i)).collect();
+
+    let query_sources = vec![QuerySource {
+        name,
+        start_idx: 0,
+        count,
+    }];
+
+    Ok((intervals, query_sources, query_names))
+}
+
+/// Parse all BED files in a directory
+fn parse_query_directory(
+    dir: &Path,
+) -> Result<(Vec<TaggedInterval>, Vec<QuerySource>, Vec<String>), QueryError> {
+    // Find all BED files
+    let bed_files: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
+        .collect();
+
+    if bed_files.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let mut all_intervals = Vec::new();
+    let mut query_sources = Vec::new();
+    let mut query_names = Vec::new();
+    let mut current_idx = 0;
+
+    for bed_path in bed_files {
+        let intervals = parse_bed_file(&bed_path, 0)?;
+        let count = intervals.len();
+
+        if count == 0 {
+            continue;
+        }
+
+        let name = bed_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("query_{}", query_sources.len()));
+
+        // Generate names for each interval in this file
+        for i in 0..count {
+            query_names.push(format!("{}:{}", name, i));
+        }
+
+        query_sources.push(QuerySource {
+            name,
+            start_idx: current_idx,
+            count,
+        });
+
+        current_idx += count;
+        all_intervals.extend(intervals);
+    }
+
+    Ok((all_intervals, query_sources, query_names))
 }
 
 /// Compute chunk file paths to query based on query coordinates
@@ -223,7 +313,10 @@ fn process_chunk(
         .collect();
 
     if relevant_queries.is_empty() {
-        return Ok(sprs::CsMat::empty(sprs::CompressedStorage::CSR, num_sources));
+        return Ok(sprs::CsMat::empty(
+            sprs::CompressedStorage::CSR,
+            num_sources,
+        ));
     }
 
     // Get tile size from layer config
@@ -302,7 +395,7 @@ fn tree_reduce_sparse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::build::{build_database, BuildConfig};
+    use crate::tasks::build::{BuildConfig, build_database};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -324,16 +417,10 @@ mod tests {
             "a.bed",
             "chr1\t100\t200\nchr1\t300\t400\n",
         );
-        create_test_bed(
-            input_dir.path(),
-            "b.bed",
-            "chr1\t150\t250\n",
-        );
+        create_test_bed(input_dir.path(), "b.bed", "chr1\t150\t250\n");
 
-        let build_config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            db_dir.path().to_path_buf(),
-        );
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         build_database(&build_config).unwrap();
 
         // Create query file
@@ -386,5 +473,45 @@ mod tests {
 
         // Should sum to 1+2+3+4+5 = 15
         assert_eq!(result.get(0, 0), Some(&15));
+    }
+
+    #[test]
+    fn test_query_database_batch() {
+        let input_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let query_dir = TempDir::new().unwrap();
+
+        // Create database
+        create_test_bed(
+            input_dir.path(),
+            "a.bed",
+            "chr1\t100\t200\nchr1\t300\t400\n",
+        );
+
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+        build_database(&build_config).unwrap();
+
+        // Create multiple query files
+        create_test_bed(query_dir.path(), "query1.bed", "chr1\t100\t200\n");
+        create_test_bed(
+            query_dir.path(),
+            "query2.bed",
+            "chr1\t300\t400\nchr1\t350\t450\n",
+        );
+
+        // Query with directory
+        let query_config =
+            QueryConfig::new(db_dir.path().to_path_buf(), query_dir.path().to_path_buf());
+
+        let result = query_database(&query_config).unwrap();
+
+        // Should have 3 total query intervals (1 from query1, 2 from query2)
+        assert_eq!(result.counts.rows(), 3);
+        assert_eq!(result.query_sources.len(), 2);
+
+        // Check source metadata
+        let total_count: usize = result.query_sources.iter().map(|s| s.count).sum();
+        assert_eq!(total_count, 3);
     }
 }
