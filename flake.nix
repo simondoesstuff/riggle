@@ -25,7 +25,15 @@
             htslib # bgzip
             giggle.packages.${system}.default
             cargo
+            libiconv
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.CoreFoundation
           ];
+
+          # Help the linker find libiconv on Darwin
+          LIBRARY_PATH = pkgs.lib.optionalString pkgs.stdenv.isDarwin
+            "${pkgs.libiconv}/lib";
         };
       }
     );
