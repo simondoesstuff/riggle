@@ -1,7 +1,7 @@
 {
   description = "Rust Giggle";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
     giggle.url = "path:/Users/simon/Code/lab/giggle-dev/giggle";
     treefmt-nix = {
@@ -11,11 +11,12 @@
   };
 
   outputs =
-    { nixpkgs
-    , flake-utils
-    , treefmt-nix
-    , giggle
-    , ...
+    {
+      nixpkgs,
+      flake-utils,
+      treefmt-nix,
+      giggle,
+      ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -36,8 +37,9 @@
             just
             htslib # bgzip
             giggle.packages.${system}.default
-            cargo
             libiconv
+            cargo
+            samply
           ];
           # ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
           #   pkgs.darwin.apple_sdk.frameworks.Security
