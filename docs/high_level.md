@@ -6,13 +6,24 @@ Riggle is a statistical interval intersection engine, an evolution of IGD that i
 
 ## 2. Data Hierarchy & Memory Layout
 
-As all logic is interval-centric, the overall database is sharded by chromosome.
-The database is further distributed across layers (exponentially bounded interval sizes) and chunks (memory-mapped files representing fixed genomic territories).
+The database is sharded by chromosome/contig (detected from the first non-integer column in BED files).
+Each shard is further distributed across layers (exponentially bounded interval sizes) and chunks (memory-mapped files representing fixed genomic territories).
 
 ### A. Master Header (Global Metadata)
 
 - **SID Map:** `database_sid -> metadata` (name, filepath, etc.)
 - **Layer Configurations:** Defines the exponential tiling bounds and chunk sizes per layer.
+- **Shards:** List of shard names (e.g., `["chr1", "chr2", "chrX"]`)
+- **Shard Max Coords:** Maximum coordinate seen per shard.
+
+### A.1 Shard Detection (BED Parsing)
+
+Columns are scanned left-to-right:
+- First non-integer column → shard name (e.g., "chr1", "chrX")
+- First two integer columns → (start, end) coordinates
+- If no non-integer column exists → uses `"default"` as shard name
+
+This flexible parsing supports standard BED (chrom, start, end) as well as coordinate-only formats.
 
 ### B. Chunk Layout (The Mmap)
 
@@ -30,7 +41,11 @@ Tiles track the _state_ of intervals relative to the tile boundaries. Data is se
 
 ## 3. Indexing Pipeline (`ChunkWrite`)
 
-**Phase 1: Map & Sort**
+**Phase 0: Parse & Shard**
+
+Intervals are parsed from BED files and grouped by shard (chromosome). Each shard is processed independently into `{db}/{shard}/layer_{id}/chunk_{id}.bin`.
+
+**Phase 1: Map & Sort (per shard)**
 
 1. **Flatten & Tag:** Intervals are parsed and flattened into `(interval, sid)`.
 2. **Layer Splitting:** Intervals are partitioned into their appropriate exponential layers based on their size.
@@ -41,22 +56,31 @@ Tiles track the _state_ of intervals relative to the tile boundaries. Data is se
 
 - A worker thread takes a `Chunk` and its sorted `[(interval, sid)]` list.
 - It performs the **Riggle Scan** (detailed below) to construct the `running_counts`, `start_ivs`, and `end_ivs` for each tile.
-- The tile is serialized to disk, updating the Chunk Header.
+- The tile is serialized to disk at `{shard}/layer_{id}/chunk_{id}.bin`, updating the Chunk Header.
 
 ## 4. Query Pipeline (`ChunkQuery`)
 
-**Phase 1: Query Preparation**
+**Phase 0: Shard Grouping**
 
-1. **Flatten & Tag:** Query intervals are flattened into `(interval, query_sid)` and Radix sorted by start coordinate.
+Query intervals are parsed and grouped by shard. Only shards present in both the query AND database are processed (missing shards are silently skipped—no overlaps possible).
+
+**Phase 1: Query Preparation (per shard)**
+
+1. **Flatten & Tag:** Query intervals are flattened into `(global_index, interval)` preserving indices for aggregation.
 2. **Layer-Wise Splitting:** _Crucial Step._ A query interval must be tested against all layers because overlaps can happen irrespective of size.
 3. **Results Initialization:** The thread initializes a dense results matrix of dimensions `(batch_query_sids, database_sids)`. Because we expect fewer than 100k database SIDs and significantly fewer query SIDs per batch, a dense matrix is highly memory-efficient for continuous writes. Concurrently, a bit mask is initialized to track non-zero regions during the sweep.
 
-**Phase 2: The Sweep & Aggregate**
+**Phase 2: The Sweep & Aggregate (per shard)**
 
 - The thread executes the **Riggle Scan** (detailed below) across the mapped tiles.
 - Results are mutated in-place within the thread's dense matrix, while the bit mask flags intersecting regions.
 - Following the sweep, the dense matrix is efficiently condensed into a sparse matrix by utilizing the bit mask to locate non-zero data.
-- Thread-local sparse matrices are merged (across chunks, across layers), statistics (e.g., Fisher's Exact) are computed, and JSON is returned.
+
+**Phase 3: Cross-Shard Aggregation**
+
+- Thread-local sparse matrices are merged (across chunks, across layers, across shards) via tree-reduce.
+- Statistics (e.g., Fisher's Exact) are computed on the aggregated totals.
+- JSON results are returned.
 
 ---
 
