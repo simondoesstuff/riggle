@@ -1,6 +1,8 @@
 use voracious_radix_sort::RadixSort;
 
-use crate::core::{Interval, OffsetSid, TaggedInterval, Tile};
+use crate::core::{OffsetSid, TaggedInterval, Tile};
+
+use super::sweep_tiles;
 
 /// Build tiles from a sorted batch of intervals within a chunk
 ///
@@ -12,21 +14,10 @@ use crate::core::{Interval, OffsetSid, TaggedInterval, Tile};
 /// # Returns
 /// Vector of tiles covering the chunk, each containing interval information
 pub fn index_sweep(
-    chunk_bounds: Interval,
+    chunk_bounds: crate::core::Interval,
     tile_size: u32,
     active_batch: &[TaggedInterval],
 ) -> Vec<Tile> {
-    // Design note: index_sweep and query_sweep share a similar head-pointer pattern:
-    // 1. Maintain head pointer into sorted batch
-    // 2. For each tile, advance head past completed items
-    // 3. Process active items intersecting current tile
-    //
-    // Consolidation was considered but deferred because:
-    // - Different input types (TaggedInterval vs MappedChunk tiles)
-    // - Different processing (tile building vs counting)
-    // - Abstraction overhead may outweigh benefits for two similar functions
-    // - Both are performance-critical paths where clarity aids optimization
-
     if tile_size == 0 {
         return Vec::new();
     }
@@ -40,54 +31,47 @@ pub fn index_sweep(
         return tiles;
     }
 
-    // Head pointer into active_batch
-    let mut head = 0;
+    // Use sweep_tiles to iterate over active intervals for each tile
+    sweep_tiles(
+        num_tiles as usize,
+        chunk_bounds.start,
+        tile_size,
+        active_batch,
+        |iv| iv.iv,
+        |tile_idx, tile_start, tile_end, active_items| {
+            let tile = &mut tiles[tile_idx];
+            let tile_end = tile_end.min(chunk_bounds.end);
 
-    // Process each tile
-    for (tile_idx, tile) in tiles.iter_mut().enumerate() {
-        let tile_start = chunk_bounds.start + tile_idx as u32 * tile_size;
-        let tile_end = (tile_start + tile_size).min(chunk_bounds.end);
+            for iv in active_items {
+                // Classify the interval's relationship to this tile
+                let starts_before = iv.iv.start <= tile_start;
+                let ends_after = iv.iv.end >= tile_end;
+                let starts_in_tile = iv.iv.start >= tile_start && iv.iv.start < tile_end;
+                let ends_in_tile = iv.iv.end > tile_start && iv.iv.end <= tile_end;
 
-        // Advance head to first interval that could intersect this tile
-        // An interval intersects if interval.end > tile_start
-        while head < active_batch.len() && active_batch[head].iv.end <= tile_start {
-            head += 1;
-        }
-
-        // Process all intervals that intersect this tile
-        let mut scan = head;
-        while scan < active_batch.len() && active_batch[scan].iv.start < tile_end {
-            let iv = &active_batch[scan];
-
-            // Classify the interval's relationship to this tile
-            let starts_before = iv.iv.start <= tile_start;
-            let ends_after = iv.iv.end >= tile_end;
-            let starts_in_tile = iv.iv.start >= tile_start && iv.iv.start < tile_end;
-            let ends_in_tile = iv.iv.end > tile_start && iv.iv.end <= tile_end;
-
-            if starts_before && ends_after {
-                // Interval spans the entire tile - add to running counts
-                // Aggregate by sid
-                if let Some(entry) = tile.running_counts.iter_mut().find(|(s, _)| *s == iv.sid) {
-                    entry.1 += 1;
+                if starts_before && ends_after {
+                    // Interval spans the entire tile - add to running counts
+                    // Aggregate by sid
+                    if let Some(entry) = tile.running_counts.iter_mut().find(|(s, _)| *s == iv.sid)
+                    {
+                        entry.1 += 1;
+                    } else {
+                        tile.running_counts.push((iv.sid, 1));
+                    }
                 } else {
-                    tile.running_counts.push((iv.sid, 1));
-                }
-            } else {
-                // Interval partially overlaps the tile
-                if starts_in_tile {
-                    let offset = iv.iv.start - tile_start;
-                    tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
-                }
-                if ends_in_tile {
-                    let offset = iv.iv.end - tile_start;
-                    tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
+                    // Interval partially overlaps the tile
+                    if starts_in_tile {
+                        let offset = iv.iv.start - tile_start;
+                        tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
+                    }
+                    if ends_in_tile {
+                        let offset = iv.iv.end - tile_start;
+                        tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
+                    }
                 }
             }
-
-            scan += 1;
-        }
-    }
+        },
+    );
 
     // Sort interval lists by offset for binary search during query
     // Uses radix sort O(n * w) where w is word size, vs O(n log n) for comparison sort
@@ -102,6 +86,7 @@ pub fn index_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Interval;
 
     #[test]
     fn test_index_sweep_empty() {

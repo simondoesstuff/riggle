@@ -25,6 +25,57 @@ pub enum BedParseError {
     InvalidRange { line: usize, start: u32, end: u32 },
 }
 
+/// Parse a single BED line into a TaggedInterval
+///
+/// Returns:
+/// - None if the line should be skipped (empty or comment)
+/// - Some(Ok(interval)) for valid intervals
+/// - Some(Err(error)) for invalid lines
+fn parse_bed_line(line_num: usize, line: &str, sid: u32) -> Option<Result<TaggedInterval, BedParseError>> {
+    let trimmed = line.trim();
+
+    // Skip empty lines and comments
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    // Split by whitespace (handles both tabs and spaces)
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+
+    if parts.len() < 3 {
+        return Some(Err(BedParseError::InvalidFormat { line: line_num }));
+    }
+
+    // Parse start coordinate
+    let start: u32 = match parts[1].parse() {
+        Ok(v) => v,
+        Err(_) => return Some(Err(BedParseError::InvalidStart {
+            line: line_num,
+            value: parts[1].to_string(),
+        })),
+    };
+
+    // Parse end coordinate
+    let end: u32 = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return Some(Err(BedParseError::InvalidEnd {
+            line: line_num,
+            value: parts[2].to_string(),
+        })),
+    };
+
+    // Validate range
+    if start >= end {
+        return Some(Err(BedParseError::InvalidRange {
+            line: line_num,
+            start,
+            end,
+        }));
+    }
+
+    Some(Ok(TaggedInterval::new(start, end, sid)))
+}
+
 /// Parse a BED file into a vector of TaggedIntervals
 ///
 /// Features:
@@ -41,42 +92,10 @@ pub fn parse_bed_file(path: &Path, sid: u32) -> Result<Vec<TaggedInterval>, BedP
     for (line_idx, line_result) in reader.lines().enumerate() {
         let line_num = line_idx + 1;
         let line = line_result?;
-        let trimmed = line.trim();
 
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        if let Some(result) = parse_bed_line(line_num, &line, sid) {
+            intervals.push(result?);
         }
-
-        // Split by whitespace (handles both tabs and spaces)
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if parts.len() < 3 {
-            return Err(BedParseError::InvalidFormat { line: line_num });
-        }
-
-        // Parse start coordinate
-        let start: u32 = parts[1].parse().map_err(|_| BedParseError::InvalidStart {
-            line: line_num,
-            value: parts[1].to_string(),
-        })?;
-
-        // Parse end coordinate
-        let end: u32 = parts[2].parse().map_err(|_| BedParseError::InvalidEnd {
-            line: line_num,
-            value: parts[2].to_string(),
-        })?;
-
-        // Validate range
-        if start >= end {
-            return Err(BedParseError::InvalidRange {
-                line: line_num,
-                start,
-                end,
-            });
-        }
-
-        intervals.push(TaggedInterval::new(start, end, sid));
     }
 
     Ok(intervals)
@@ -88,39 +107,10 @@ pub fn parse_bed_string(content: &str, sid: u32) -> Result<Vec<TaggedInterval>, 
 
     for (line_idx, line) in content.lines().enumerate() {
         let line_num = line_idx + 1;
-        let trimmed = line.trim();
 
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        if let Some(result) = parse_bed_line(line_num, line, sid) {
+            intervals.push(result?);
         }
-
-        // Split by whitespace
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if parts.len() < 3 {
-            return Err(BedParseError::InvalidFormat { line: line_num });
-        }
-
-        let start: u32 = parts[1].parse().map_err(|_| BedParseError::InvalidStart {
-            line: line_num,
-            value: parts[1].to_string(),
-        })?;
-
-        let end: u32 = parts[2].parse().map_err(|_| BedParseError::InvalidEnd {
-            line: line_num,
-            value: parts[2].to_string(),
-        })?;
-
-        if start >= end {
-            return Err(BedParseError::InvalidRange {
-                line: line_num,
-                start,
-                end,
-            });
-        }
-
-        intervals.push(TaggedInterval::new(start, end, sid));
     }
 
     Ok(intervals)

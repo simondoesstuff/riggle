@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
-use crate::core::{ChunkID, Interval, LayerID, TaggedInterval, Tile};
+use crate::core::{ChunkID, Interval, LayerID, TaggedInterval};
 use crate::io::{
-    BedParseError, ChunkHeader, LayerConfig, MasterHeader, SidMetadata, parse_bed_file,
+    BedParseError, ChunkHeader, LayerConfig, MasterHeader, SidMetadata,
+    mmap::MmapError, parse_bed_file, write_chunk,
 };
 use crate::sweep::index_sweep;
 
@@ -33,6 +33,9 @@ pub enum BuildError {
 
     #[error("Invalid database: {0}")]
     InvalidDatabase(String),
+
+    #[error("Chunk write error: {0}")]
+    ChunkWrite(#[from] MmapError),
 }
 
 /// Configuration for database build
@@ -71,34 +74,37 @@ impl AddConfig {
     }
 }
 
-/// Build a database from BED files in a directory
-pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
-    // Find all BED files
-    let bed_files: Vec<_> = fs::read_dir(&config.input_dir)?
+// =============================================================================
+// Shared Pipeline Helpers
+// =============================================================================
+
+/// Find all BED files in a directory
+fn find_bed_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
+    let files: Vec<_> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
         .collect();
 
-    if bed_files.is_empty() {
+    if files.is_empty() {
         return Err(BuildError::NoInputFiles);
     }
 
-    // Create output directory
-    fs::create_dir_all(&config.output_dir)?;
+    Ok(files)
+}
 
-    // Parse all files and collect intervals
-    let mut master_header = MasterHeader::new();
-    if let Some(ref configs) = config.layer_configs {
-        master_header.layer_configs = configs.clone();
-    }
-
+/// Parse BED files, update header metadata, and return all intervals
+fn ingest_bed_files(
+    bed_files: Vec<PathBuf>,
+    start_sid: u32,
+    header: &mut MasterHeader,
+) -> Result<Vec<TaggedInterval>, BuildError> {
     // Parse all files first to collect intervals and metadata
     let parsed_files: Vec<(u32, PathBuf, Vec<TaggedInterval>)> = bed_files
         .into_iter()
         .enumerate()
-        .map(|(sid, bed_path)| {
-            let sid = sid as u32;
+        .map(|(idx, bed_path)| {
+            let sid = start_sid + idx as u32;
             let intervals = parse_bed_file(&bed_path, sid)?;
             Ok((sid, bed_path, intervals))
         })
@@ -118,39 +124,42 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("source_{}", sid));
 
-        master_header.add_source(sid, SidMetadata::new(name, interval_count, total_bases));
+        header.add_source(sid, SidMetadata::new(name, interval_count, total_bases));
 
         // Update max coordinate
         for iv in &intervals {
-            master_header.update_max_coord(iv.iv.end);
+            header.update_max_coord(iv.iv.end);
         }
 
         all_intervals.extend(intervals);
     }
 
-    // Partition intervals by layer
-    let partitions = partition_by_layer(&all_intervals, &master_header.layer_configs);
+    Ok(all_intervals)
+}
 
-    // Process each layer
+/// Partition intervals by layer, sort, and write chunks to disk
+fn flush_intervals_to_disk(
+    intervals: &[TaggedInterval],
+    header: &MasterHeader,
+    output_dir: &Path,
+) -> Result<(), BuildError> {
+    let partitions = partition_by_layer(intervals, &header.layer_configs);
+
     for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
         if layer_intervals.is_empty() {
             continue;
         }
 
-        let layer_config = &master_header.layer_configs[layer_id];
+        let layer_config = &header.layer_configs[layer_id];
 
         // Sort by start coordinate using radix sort O(n * w)
         layer_intervals.voracious_sort();
 
-        // Group by chunk - O(n) sequential, but chunk writing below is parallel.
-        // Parallelizing this grouping step is unlikely to help since:
-        // 1. It's a simple O(n) pass with HashMap insertions
-        // 2. The expensive work (serialization, I/O) is already parallel in into_par_iter()
-        // 3. Parallel HashMap merging has overhead that may exceed benefits
+        // Group by chunk - O(n) sequential, but chunk writing below is parallel
         let chunks = group_by_chunk(&layer_intervals, layer_config);
 
         // Create layer directory
-        let layer_dir = config.output_dir.join(format!("layer_{}", layer_id));
+        let layer_dir = output_dir.join(format!("layer_{}", layer_id));
         fs::create_dir_all(&layer_dir)?;
 
         // Process chunks in parallel
@@ -160,6 +169,32 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
                 write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
             })?;
     }
+
+    Ok(())
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/// Build a database from BED files in a directory
+pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
+    let bed_files = find_bed_files(&config.input_dir)?;
+
+    // Create output directory
+    fs::create_dir_all(&config.output_dir)?;
+
+    // Initialize master header
+    let mut master_header = MasterHeader::new();
+    if let Some(ref configs) = config.layer_configs {
+        master_header.layer_configs = configs.clone();
+    }
+
+    // Ingest BED files starting from sid 0
+    let all_intervals = ingest_bed_files(bed_files, 0, &mut master_header)?;
+
+    // Write intervals to disk
+    flush_intervals_to_disk(&all_intervals, &master_header, &config.output_dir)?;
 
     // Write master header
     write_master_header(&config.output_dir, &master_header)?;
@@ -223,53 +258,21 @@ fn write_chunk_file(
     // Build tiles using sweep algorithm
     let tiles = index_sweep(chunk_bounds, config.tile_size, intervals);
 
-    // Create header
+    // Create header with tile offsets
     let mut header = ChunkHeader::new(config.layer_id, chunk_id, chunk_start, chunk_end);
 
-    // Calculate tile offsets
-    let tile_bytes: Vec<_> = tiles
-        .iter()
-        .map(|t| {
-            rkyv::to_bytes::<rkyv::rancor::Error>(t)
-                .map_err(|e| BuildError::Serialization(e.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
+    // Calculate tile offsets for header
     let mut offset = 0u32;
-    for bytes in &tile_bytes {
+    for tile in &tiles {
         header.tile_offsets.push(offset);
-        offset += bytes.len() as u32;
-    }
-
-    // Write to file
-    let chunk_path = layer_dir.join(format!("chunk_{}.bin", chunk_id));
-    write_chunk_to_file(&chunk_path, &header, &tiles)?;
-
-    Ok(())
-}
-
-/// Write a chunk to file
-fn write_chunk_to_file(
-    path: &Path,
-    header: &ChunkHeader,
-    tiles: &[Tile],
-) -> Result<(), BuildError> {
-    let mut file = File::create(path)?;
-
-    // Serialize header
-    let header_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(header)
-        .map_err(|e| BuildError::Serialization(e.to_string()))?;
-
-    // Write header length and header
-    file.write_all(&(header_bytes.len() as u32).to_le_bytes())?;
-    file.write_all(&header_bytes)?;
-
-    // Write each tile
-    for tile in tiles {
         let tile_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(tile)
             .map_err(|e| BuildError::Serialization(e.to_string()))?;
-        file.write_all(&tile_bytes)?;
+        offset += tile_bytes.len() as u32;
     }
+
+    // Write to file using consolidated write_chunk from io module
+    let chunk_path = layer_dir.join(format!("chunk_{}.bin", chunk_id));
+    write_chunk(&chunk_path, &header, &tiles)?;
 
     Ok(())
 }
@@ -298,15 +301,8 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
         .map_err(|e| BuildError::InvalidDatabase(e.to_string()))?;
 
     // Find new BED files
-    let bed_files: Vec<_> = fs::read_dir(&config.input_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
-        .collect();
-
-    if bed_files.is_empty() {
-        return Err(BuildError::NoInputFiles);
-    }
+    let bed_files = find_bed_files(&config.input_dir)?;
+    let num_added = bed_files.len();
 
     // Determine starting sid (max existing + 1)
     let start_sid = master_header
@@ -316,65 +312,12 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
         .map(|&max| max + 1)
         .unwrap_or(0);
 
-    // Parse new files
-    let parsed_files: Vec<(u32, PathBuf, Vec<TaggedInterval>)> = bed_files
-        .into_iter()
-        .enumerate()
-        .map(|(idx, bed_path)| {
-            let sid = start_sid + idx as u32;
-            let intervals = parse_bed_file(&bed_path, sid)?;
-            Ok((sid, bed_path, intervals))
-        })
-        .collect::<Result<Vec<_>, BedParseError>>()?;
+    // Ingest BED files
+    let all_intervals = ingest_bed_files(bed_files, start_sid, &mut master_header)?;
 
-    let num_added = parsed_files.len();
-
-    // Collect all new intervals
-    let total_intervals: usize = parsed_files.iter().map(|(_, _, ivs)| ivs.len()).sum();
-    let mut all_intervals: Vec<TaggedInterval> = Vec::with_capacity(total_intervals);
-
-    for (sid, bed_path, intervals) in parsed_files {
-        let interval_count = intervals.len() as u32;
-        let total_bases: u64 = intervals.iter().map(|iv| iv.iv.len() as u64).sum();
-        let name = bed_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("source_{}", sid));
-
-        master_header.add_source(sid, SidMetadata::new(name, interval_count, total_bases));
-
-        for iv in &intervals {
-            master_header.update_max_coord(iv.iv.end);
-        }
-
-        all_intervals.extend(intervals);
-    }
-
-    // Partition by layer and write chunks (same logic as build)
-    let partitions = partition_by_layer(&all_intervals, &master_header.layer_configs);
-
-    for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
-        if layer_intervals.is_empty() {
-            continue;
-        }
-
-        let layer_config = &master_header.layer_configs[layer_id];
-        layer_intervals.voracious_sort();
-
-        let chunks = group_by_chunk(&layer_intervals, layer_config);
-
-        let layer_dir = config.db_dir.join(format!("layer_{}", layer_id));
-        fs::create_dir_all(&layer_dir)?;
-
-        // Write chunks - for add mode, we append to existing tiles if chunk exists
-        // For simplicity, this implementation rewrites affected chunks
-        // A more sophisticated approach would merge with existing tile data
-        chunks
-            .into_par_iter()
-            .try_for_each(|(chunk_id, chunk_intervals)| {
-                write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
-            })?;
-    }
+    // Write intervals to disk
+    // Note: For simplicity, this rewrites affected chunks rather than merging
+    flush_intervals_to_disk(&all_intervals, &master_header, &config.db_dir)?;
 
     // Update master header
     write_master_header(&config.db_dir, &master_header)?;
@@ -385,6 +328,7 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write as IoWrite;
     use tempfile::TempDir;
 
