@@ -2,6 +2,8 @@ use crate::core::{ArchivedTile, TaggedInterval};
 use crate::io::MappedChunk;
 use crate::matrix::{BitwiseMask, DenseMatrix};
 
+use super::sweep_tiles;
+
 /// Query sweep over a mapped chunk to count intersections
 ///
 /// # Arguments
@@ -33,50 +35,40 @@ pub fn query_sweep(
 
     let chunk_start = mapped_chunk.start_coord();
 
-    // Head pointer into query_batch
-    let mut head = 0;
+    // Use sweep_tiles to iterate over active queries for each tile
+    sweep_tiles(
+        mapped_chunk.num_tiles(),
+        chunk_start,
+        tile_size,
+        query_batch,
+        |q| q.1.iv,
+        |tile_idx, tile_start, _tile_end, active_queries| {
+            let tile = match mapped_chunk.get_tile(tile_idx) {
+                Ok(t) => t,
+                Err(_) => return, // Skip tiles we can't read
+            };
 
-    // Process each tile
-    for tile_id in 0..mapped_chunk.num_tiles() {
-        let tile = match mapped_chunk.get_tile(tile_id) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+            for (query_idx, query) in active_queries {
+                // Determine if this is the first tile where query overlaps
+                // This is true when query.start falls within [tile_start, tile_end)
+                // Used to avoid double-counting running_counts and end_ivs
+                let is_first_overlap_tile = query.iv.start >= tile_start;
 
-        let tile_start = chunk_start + tile_id as u32 * tile_size;
-        let tile_end = tile_start + tile_size;
+                // Process running counts only in first overlap tile
+                if is_first_overlap_tile {
+                    process_running_counts(tile, *query_idx, results, mask);
+                }
 
-        // Advance head past queries that end before this tile
-        while head < query_batch.len() && query_batch[head].1.iv.end <= tile_start {
-            head += 1;
-        }
+                // Process start_ivs (intervals starting in this tile) - always unique
+                process_start_ivs(tile, tile_start, query, *query_idx, results, mask);
 
-        // Process all queries that intersect this tile
-        let mut scan = head;
-        while scan < query_batch.len() && query_batch[scan].1.iv.start < tile_end {
-            let (query_idx, query) = &query_batch[scan];
-
-            // Determine if this is the first tile where query overlaps
-            // This is true when query.start falls within [tile_start, tile_end)
-            // Used to avoid double-counting running_counts and end_ivs
-            let is_first_overlap_tile = query.iv.start >= tile_start;
-
-            // Process running counts only in first overlap tile
-            if is_first_overlap_tile {
-                process_running_counts(tile, *query_idx, results, mask);
+                // Process end_ivs only in first overlap tile
+                if is_first_overlap_tile {
+                    process_end_ivs(tile, tile_start, query, *query_idx, results, mask);
+                }
             }
-
-            // Process start_ivs (intervals starting in this tile) - always unique
-            process_start_ivs(tile, tile_start, query, *query_idx, results, mask);
-
-            // Process end_ivs only in first overlap tile
-            if is_first_overlap_tile {
-                process_end_ivs(tile, tile_start, query, *query_idx, results, mask);
-            }
-
-            scan += 1;
-        }
-    }
+        },
+    );
 }
 
 /// Process running counts from a tile for a query
