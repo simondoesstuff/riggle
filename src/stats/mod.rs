@@ -59,12 +59,8 @@ pub fn compute_statistics(
             let db_size = db_sizes.get(&db_sid).copied().unwrap_or(0);
 
             // Compute Fisher's exact test
-            let (p_value, odds_ratio) = fishers_exact_test(
-                count as u64,
-                query_size,
-                db_size,
-                genome_size,
-            );
+            let (p_value, odds_ratio) =
+                fishers_exact_test(count as u64, query_size, db_size, genome_size);
 
             results.push(StatResult {
                 query_id: row_idx,
@@ -77,7 +73,11 @@ pub fn compute_statistics(
     }
 
     // Sort by p-value
-    results.sort_by(|a, b| a.p_value.partial_cmp(&b.p_value).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        a.p_value
+            .partial_cmp(&b.p_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     StatsOutput { results }
 }
@@ -134,7 +134,12 @@ pub fn fishers_exact_test(
 
     // Compute p-value using log-space hypergeometric
     // P-value is the probability of observing this many or more overlaps by chance
-    let p_value = hypergeometric_pvalue(a as u64, (a + b) as u64, (a + c) as u64, (a + b + c + d) as u64);
+    let p_value = hypergeometric_pvalue(
+        a as u64,
+        (a + b) as u64,
+        (a + c) as u64,
+        (a + b + c + d) as u64,
+    );
 
     (p_value, odds_ratio)
 }
@@ -274,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_compute_statistics() {
-        use crate::matrix::{condense_to_sparse, BitwiseMask, DenseMatrix};
+        use crate::matrix::{BitwiseMask, DenseMatrix, condense_to_sparse};
 
         let mut dense = DenseMatrix::new(2, 2);
         let mut mask = BitwiseMask::new(2, 2);
@@ -293,7 +298,12 @@ mod tests {
         let stats = compute_statistics(&counts, &query_sizes, &db_sizes, genome_size);
 
         assert_eq!(stats.results.len(), 2);
-        assert!(stats.results.iter().all(|r| r.p_value >= 0.0 && r.p_value <= 1.0));
+        assert!(
+            stats
+                .results
+                .iter()
+                .all(|r| r.p_value >= 0.0 && r.p_value <= 1.0)
+        );
     }
 
     #[test]

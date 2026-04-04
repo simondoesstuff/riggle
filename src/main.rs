@@ -7,7 +7,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use riggle::io::MasterHeader;
 use riggle::stats::compute_statistics;
-use riggle::tasks::{AddConfig, BuildConfig, QueryConfig, add_to_database, build_database, query_database};
+use riggle::tasks::{
+    AddConfig, BuildConfig, QueryConfig, add_to_database, build_database, query_database,
+};
 
 #[derive(Parser)]
 #[command(name = "riggle")]

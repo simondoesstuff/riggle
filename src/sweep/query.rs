@@ -192,7 +192,7 @@ fn process_end_ivs(
 mod tests {
     use super::*;
     use crate::core::{OffsetSid, Tile};
-    use crate::io::{write_chunk, ChunkHeader};
+    use crate::io::{ChunkHeader, write_chunk};
     use tempfile::NamedTempFile;
 
     fn create_test_chunk(tiles: Vec<Tile>, tile_size: u32) -> (NamedTempFile, u32) {
@@ -298,7 +298,7 @@ mod tests {
         let mut mask = BitwiseMask::new(2, 2);
 
         let queries = vec![
-            (0, TaggedInterval::new(0, 50, 100)),  // overlaps interval at 25
+            (0, TaggedInterval::new(0, 50, 100)), // overlaps interval at 25
             (1, TaggedInterval::new(50, 100, 101)), // overlaps interval at 75
         ];
 

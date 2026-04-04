@@ -48,7 +48,13 @@ pub struct LayerConfig {
 
 impl LayerConfig {
     /// Create a new layer configuration
-    pub fn new(layer_id: u8, min_size: u32, max_size: u32, tile_size: u32, chunk_size: u32) -> Self {
+    pub fn new(
+        layer_id: u8,
+        min_size: u32,
+        max_size: u32,
+        tile_size: u32,
+        chunk_size: u32,
+    ) -> Self {
         Self {
             layer_id,
             min_size,
