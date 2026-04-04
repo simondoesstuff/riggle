@@ -94,8 +94,15 @@ pub struct MasterHeader {
     pub sid_map: HashMap<u32, SidMetadata>,
     /// Configuration for each layer
     pub layer_configs: Vec<LayerConfig>,
-    /// Maximum coordinate seen across all data
+    /// Maximum coordinate seen across all data (legacy, use shard_max_coords for sharded DBs)
+    #[serde(default)]
     pub max_coord: u32,
+    /// List of shard names (e.g., chromosome names)
+    #[serde(default)]
+    pub shards: Vec<String>,
+    /// Maximum coordinate per shard
+    #[serde(default)]
+    pub shard_max_coords: HashMap<String, u32>,
 }
 
 impl MasterHeader {
@@ -104,6 +111,8 @@ impl MasterHeader {
             sid_map: HashMap::new(),
             layer_configs: LayerConfig::default_layers(),
             max_coord: 0,
+            shards: Vec::new(),
+            shard_max_coords: HashMap::new(),
         }
     }
 
@@ -112,14 +121,32 @@ impl MasterHeader {
         self.sid_map.insert(sid, metadata);
     }
 
-    /// Update max coordinate
+    /// Update max coordinate (global)
     pub fn update_max_coord(&mut self, coord: u32) {
         self.max_coord = self.max_coord.max(coord);
+    }
+
+    /// Update max coordinate for a specific shard
+    pub fn update_shard_max_coord(&mut self, shard: &str, coord: u32) {
+        let entry = self.shard_max_coords.entry(shard.to_string()).or_insert(0);
+        *entry = (*entry).max(coord);
+    }
+
+    /// Add a shard if it doesn't exist
+    pub fn add_shard(&mut self, shard: String) {
+        if !self.shards.contains(&shard) {
+            self.shards.push(shard);
+        }
     }
 
     /// Get the number of sources
     pub fn num_sources(&self) -> usize {
         self.sid_map.len()
+    }
+
+    /// Get the number of shards
+    pub fn num_shards(&self) -> usize {
+        self.shards.len()
     }
 }
 
@@ -196,6 +223,7 @@ mod tests {
     fn test_master_header() {
         let mut header = MasterHeader::new();
         assert_eq!(header.num_sources(), 0);
+        assert_eq!(header.num_shards(), 0);
 
         header.add_source(1, SidMetadata::new("a.bed".to_string(), 10, 1000));
         header.add_source(2, SidMetadata::new("b.bed".to_string(), 20, 2000));
@@ -204,6 +232,16 @@ mod tests {
         header.update_max_coord(50000);
         header.update_max_coord(30000);
         assert_eq!(header.max_coord, 50000);
+
+        // Test shard functionality
+        header.add_shard("chr1".to_string());
+        header.add_shard("chr2".to_string());
+        header.add_shard("chr1".to_string()); // duplicate, should not add
+        assert_eq!(header.num_shards(), 2);
+
+        header.update_shard_max_coord("chr1", 100000);
+        header.update_shard_max_coord("chr1", 50000); // should keep 100000
+        assert_eq!(header.shard_max_coords["chr1"], 100000);
     }
 
     #[test]

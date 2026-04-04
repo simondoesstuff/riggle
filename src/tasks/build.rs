@@ -93,32 +93,35 @@ fn find_bed_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
     Ok(files)
 }
 
-/// Parse BED files, update header metadata, and return all intervals
+/// Parse BED files, update header metadata, and return intervals grouped by shard
 fn ingest_bed_files(
     bed_files: Vec<PathBuf>,
     start_sid: u32,
     header: &mut MasterHeader,
-) -> Result<Vec<TaggedInterval>, BuildError> {
-    // Parse all files first to collect intervals and metadata
-    let parsed_files: Vec<(u32, PathBuf, Vec<TaggedInterval>)> = bed_files
+) -> Result<HashMap<String, Vec<TaggedInterval>>, BuildError> {
+    // Parse all files first to collect intervals grouped by shard
+    let parsed_files: Vec<(u32, PathBuf, HashMap<String, Vec<TaggedInterval>>)> = bed_files
         .into_iter()
         .enumerate()
         .map(|(idx, bed_path)| {
             let sid = start_sid + idx as u32;
-            let intervals = parse_bed_file(&bed_path, sid)?;
-            Ok((sid, bed_path, intervals))
+            let shard_intervals = parse_bed_file(&bed_path, sid)?;
+            Ok((sid, bed_path, shard_intervals))
         })
         .collect::<Result<Vec<_>, BedParseError>>()?;
 
-    // Pre-allocate with exact capacity
-    let total_intervals: usize = parsed_files.iter().map(|(_, _, ivs)| ivs.len()).sum();
-    let mut all_intervals: Vec<TaggedInterval> = Vec::with_capacity(total_intervals);
+    // Global shard map to aggregate across files
+    let mut all_shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
 
     // Process each file's intervals
-    for (sid, bed_path, intervals) in parsed_files {
-        // Compute metadata
-        let interval_count = intervals.len() as u32;
-        let total_bases: u64 = intervals.iter().map(|iv| iv.iv.len() as u64).sum();
+    for (sid, bed_path, shard_intervals) in parsed_files {
+        // Compute metadata across all shards for this file
+        let interval_count: u32 = shard_intervals.values().map(|v| v.len() as u32).sum();
+        let total_bases: u64 = shard_intervals
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|iv| iv.iv.len() as u64)
+            .sum();
         let name = bed_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -126,23 +129,33 @@ fn ingest_bed_files(
 
         header.add_source(sid, SidMetadata::new(name, interval_count, total_bases));
 
-        // Update max coordinate
-        for iv in &intervals {
-            header.update_max_coord(iv.iv.end);
-        }
+        // Process each shard's intervals
+        for (shard, intervals) in shard_intervals {
+            // Update shard max coordinate
+            for iv in &intervals {
+                header.update_shard_max_coord(&shard, iv.iv.end);
+                header.update_max_coord(iv.iv.end); // Keep global max for backwards compat
+            }
 
-        all_intervals.extend(intervals);
+            // Add shard to header
+            header.add_shard(shard.clone());
+
+            // Aggregate intervals by shard
+            all_shards.entry(shard).or_default().extend(intervals);
+        }
     }
 
-    Ok(all_intervals)
+    Ok(all_shards)
 }
 
-/// Partition intervals by layer, sort, and write chunks to disk
-fn flush_intervals_to_disk(
+/// Partition intervals by layer, sort, and write chunks to disk for a single shard
+fn flush_shard_to_disk(
+    shard: &str,
     intervals: &[TaggedInterval],
     header: &MasterHeader,
     output_dir: &Path,
 ) -> Result<(), BuildError> {
+    let shard_dir = output_dir.join(shard);
     let partitions = partition_by_layer(intervals, &header.layer_configs);
 
     for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
@@ -158,8 +171,8 @@ fn flush_intervals_to_disk(
         // Group by chunk - O(n) sequential, but chunk writing below is parallel
         let chunks = group_by_chunk(&layer_intervals, layer_config);
 
-        // Create layer directory
-        let layer_dir = output_dir.join(format!("layer_{}", layer_id));
+        // Create layer directory within shard
+        let layer_dir = shard_dir.join(format!("layer_{}", layer_id));
         fs::create_dir_all(&layer_dir)?;
 
         // Process chunks in parallel
@@ -168,6 +181,23 @@ fn flush_intervals_to_disk(
             .try_for_each(|(chunk_id, chunk_intervals)| {
                 write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
             })?;
+    }
+
+    Ok(())
+}
+
+/// Partition intervals by shard, layer, and write chunks to disk
+fn flush_intervals_to_disk(
+    shard_intervals: &HashMap<String, Vec<TaggedInterval>>,
+    header: &MasterHeader,
+    output_dir: &Path,
+) -> Result<(), BuildError> {
+    // Process each shard (could parallelize at this level too if desired)
+    for (shard, intervals) in shard_intervals {
+        if intervals.is_empty() {
+            continue;
+        }
+        flush_shard_to_disk(shard, intervals, header, output_dir)?;
     }
 
     Ok(())
@@ -190,11 +220,11 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
         master_header.layer_configs = configs.clone();
     }
 
-    // Ingest BED files starting from sid 0
-    let all_intervals = ingest_bed_files(bed_files, 0, &mut master_header)?;
+    // Ingest BED files starting from sid 0 (returns grouped by shard)
+    let shard_intervals = ingest_bed_files(bed_files, 0, &mut master_header)?;
 
-    // Write intervals to disk
-    flush_intervals_to_disk(&all_intervals, &master_header, &config.output_dir)?;
+    // Write intervals to disk (per shard)
+    flush_intervals_to_disk(&shard_intervals, &master_header, &config.output_dir)?;
 
     // Write master header
     write_master_header(&config.output_dir, &master_header)?;
@@ -312,12 +342,12 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
         .map(|&max| max + 1)
         .unwrap_or(0);
 
-    // Ingest BED files
-    let all_intervals = ingest_bed_files(bed_files, start_sid, &mut master_header)?;
+    // Ingest BED files (returns grouped by shard)
+    let shard_intervals = ingest_bed_files(bed_files, start_sid, &mut master_header)?;
 
-    // Write intervals to disk
+    // Write intervals to disk (per shard)
     // Note: For simplicity, this rewrites affected chunks rather than merging
-    flush_intervals_to_disk(&all_intervals, &master_header, &config.db_dir)?;
+    flush_intervals_to_disk(&shard_intervals, &master_header, &config.db_dir)?;
 
     // Update master header
     write_master_header(&config.db_dir, &master_header)?;
@@ -367,9 +397,46 @@ mod tests {
         assert!(header_path.exists());
 
         // Read and verify header
-        let header_content = fs::read_to_string(header_path).unwrap();
+        let header_content = fs::read_to_string(&header_path).unwrap();
         let header: MasterHeader = serde_json::from_str(&header_content).unwrap();
         assert_eq!(header.num_sources(), 2);
+        assert_eq!(header.num_shards(), 1);
+        assert!(header.shards.contains(&"chr1".to_string()));
+
+        // Check shard directory was created
+        assert!(output_dir.path().join("chr1").exists());
+    }
+
+    #[test]
+    fn test_build_database_multi_shard() {
+        let input_dir = TempDir::new().unwrap();
+        let output_dir = TempDir::new().unwrap();
+
+        // Create test BED file with multiple chromosomes
+        create_test_bed(
+            input_dir.path(),
+            "a.bed",
+            "chr1\t100\t200\nchr2\t300\t400\nchr1\t500\t600\n",
+        );
+
+        let config = BuildConfig::new(
+            input_dir.path().to_path_buf(),
+            output_dir.path().to_path_buf(),
+        );
+
+        build_database(&config).unwrap();
+
+        let header_path = output_dir.path().join("header.json");
+        let header: MasterHeader =
+            serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
+
+        assert_eq!(header.num_shards(), 2);
+        assert!(header.shards.contains(&"chr1".to_string()));
+        assert!(header.shards.contains(&"chr2".to_string()));
+
+        // Check shard directories
+        assert!(output_dir.path().join("chr1").exists());
+        assert!(output_dir.path().join("chr2").exists());
     }
 
     #[test]
@@ -438,10 +505,11 @@ mod tests {
         let initial_header: MasterHeader =
             serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
         assert_eq!(initial_header.num_sources(), 1);
+        assert_eq!(initial_header.num_shards(), 1);
 
-        // Add new files
+        // Add new files (including a new shard)
         create_test_bed(add_dir.path(), "b.bed", "chr1\t300\t400\n");
-        create_test_bed(add_dir.path(), "c.bed", "chr1\t500\t600\n");
+        create_test_bed(add_dir.path(), "c.bed", "chr2\t500\t600\n");
 
         let add_config = AddConfig::new(add_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         let added = add_to_database(&add_config).unwrap();
@@ -452,11 +520,16 @@ mod tests {
         let updated_header: MasterHeader =
             serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
         assert_eq!(updated_header.num_sources(), 3);
+        assert_eq!(updated_header.num_shards(), 2);
 
         // Check sids are sequential
         assert!(updated_header.sid_map.contains_key(&0)); // original
         assert!(updated_header.sid_map.contains_key(&1)); // added
         assert!(updated_header.sid_map.contains_key(&2)); // added
+
+        // Check shard directories
+        assert!(db_dir.path().join("chr1").exists());
+        assert!(db_dir.path().join("chr2").exists());
     }
 
     #[test]

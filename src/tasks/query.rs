@@ -162,10 +162,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     })
 }
 
+/// Parsed query result with shard grouping
+struct ParsedQueries {
+    /// Intervals grouped by shard
+    shard_intervals: HashMap<String, Vec<TaggedInterval>>,
+    /// Query source metadata
+    query_sources: Vec<QuerySource>,
+    /// Flat list of query names (for result indexing)
+    query_names: Vec<String>,
+    /// Total number of query intervals
+    total_count: usize,
+}
+
 /// Parse query BED file(s) from a path (file or directory)
-fn parse_query_path(
-    path: &Path,
-) -> Result<(Vec<TaggedInterval>, Vec<QuerySource>, Vec<String>), QueryError> {
+fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
     // Collect BED files to process
     let bed_files: Vec<PathBuf> = if path.is_dir() {
         fs::read_dir(path)?
@@ -178,18 +188,26 @@ fn parse_query_path(
     };
 
     if bed_files.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+        return Ok(ParsedQueries {
+            shard_intervals: HashMap::new(),
+            query_sources: Vec::new(),
+            query_names: Vec::new(),
+            total_count: 0,
+        });
     }
 
-    let mut all_intervals = Vec::new();
+    let mut shard_intervals: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
     let mut current_idx = 0;
 
     for bed_path in bed_files {
-        let intervals = parse_bed_file(&bed_path, 0)?;
+        let file_shards = parse_bed_file(&bed_path, 0)?;
 
-        if intervals.is_empty() {
+        // Count total intervals in this file
+        let file_count: usize = file_shards.values().map(|v| v.len()).sum();
+
+        if file_count == 0 {
             continue;
         }
 
@@ -198,18 +216,27 @@ fn parse_query_path(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "query".to_string());
 
-        query_names.extend((0..intervals.len()).map(|i| format!("{}:{}", name, i)));
+        query_names.extend((0..file_count).map(|i| format!("{}:{}", name, i)));
         query_sources.push(QuerySource {
             name,
             start_idx: current_idx,
-            count: intervals.len(),
+            count: file_count,
         });
 
-        current_idx += intervals.len();
-        all_intervals.extend(intervals);
+        current_idx += file_count;
+
+        // Merge into global shard map
+        for (shard, intervals) in file_shards {
+            shard_intervals.entry(shard).or_default().extend(intervals);
+        }
     }
 
-    Ok((all_intervals, query_sources, query_names))
+    Ok(ParsedQueries {
+        shard_intervals,
+        query_sources,
+        query_names,
+        total_count: current_idx,
+    })
 }
 
 /// Compute chunk file paths to query based on query coordinates

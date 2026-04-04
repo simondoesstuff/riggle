@@ -34,6 +34,22 @@
         "type": "path"
       }
     },
+    "igd-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1630503650,
+        "narHash": "sha256-5mzwz/BbuC058AMpN7AmImHwYGqbWjr/Mb2q8J1JI/c=",
+        "owner": "databio",
+        "repo": "iGD",
+        "rev": "4197c239380059e7e3d6eafce10011fc96047f5a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "databio",
+        "repo": "iGD",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1773222311,
@@ -70,6 +86,7 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "giggle": "giggle",
+        "igd-src": "igd-src",
         "nixpkgs": "nixpkgs_2",
         "treefmt-nix": "treefmt-nix"
       }
