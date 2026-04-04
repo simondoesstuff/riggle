@@ -186,9 +186,20 @@ fn run_info(db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Database: {}", db.display());
     println!("Sources: {}", header.num_sources());
-    println!("Max coordinate: {}", header.max_coord);
+    println!("Shards: {}", header.num_shards());
     println!("Layers: {}", header.layer_configs.len());
     println!();
+
+    // Show shards
+    if !header.shards.is_empty() {
+        println!("Shards:");
+        for shard in &header.shards {
+            let max_coord = header.shard_max_coords.get(shard).copied().unwrap_or(0);
+            println!("  {} (max coord: {})", shard, max_coord);
+        }
+        println!();
+    }
+
     println!("Source files:");
 
     let mut sources: Vec<_> = header.sid_map.iter().collect();

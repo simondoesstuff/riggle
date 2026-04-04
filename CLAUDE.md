@@ -1,11 +1,17 @@
 # Riggle - Claude Code Context
 
 ## Project Overview
-Riggle is a statistical interval intersection engine for genomic data. It indexes BED files into a hierarchical structure (layers → chunks → tiles) and supports fast parallel queries with Fisher's exact test statistics.
+Riggle is a statistical interval intersection engine for genomic data. It indexes BED files into a hierarchical structure (shards → layers → chunks → tiles) and supports fast parallel queries with Fisher's exact test statistics.
 
 ## Architecture
 
-### Hierarchical Structure
+### Sharding (Genomic)
+- **Shards**: Partition data by chromosome/contig (first non-integer column in BED)
+- Each shard has its own independent index under `{db}/{shard}/`
+- Queries are processed per-shard and results aggregated
+- If no non-integer column exists, uses `"default"` as shard name
+
+### Hierarchical Structure (per shard)
 - **Layers**: Partition intervals by size (log2 of length). Each interval goes to exactly ONE layer.
 - **Chunks**: Fixed-size genomic territories within a layer. O(1) lookup via `chunk_id = coord / chunk_size`.
 - **Tiles**: Subdivisions within chunks. Intervals are classified as:
@@ -21,20 +27,41 @@ src/
 │   ├── dense.rs     # DenseMatrix, BitwiseMask, allocate_dense_accumulator
 │   └── sparse.rs    # condense_to_sparse, merge_sparse
 ├── io/
-│   ├── header.rs    # MasterHeader, ChunkHeader, LayerConfig
+│   ├── header.rs    # MasterHeader (with shards), ChunkHeader, LayerConfig
 │   ├── mmap.rs      # MappedChunk (zero-copy via memmap2)
-│   └── parse.rs     # BED parsing
+│   └── parse.rs     # BED parsing with shard detection
 ├── sweep/
 │   ├── index.rs     # index_sweep - builds tiles from intervals
 │   └── query.rs     # query_sweep - counts intersections
 ├── tasks/
-│   ├── build.rs     # build_database pipeline
-│   └── query.rs     # query_database pipeline
+│   ├── build.rs     # build_database pipeline (per-shard)
+│   └── query.rs     # query_database pipeline (per-shard, aggregated)
 ├── stats/mod.rs     # Fisher's exact test
-└── main.rs          # CLI (build, query, info commands)
+└── main.rs          # CLI (build, add, query, info commands)
+```
+
+### Database Structure
+```
+database/
+├── header.json           # Global metadata + shard list + shard_max_coords
+├── chr1/                 # Shard directory
+│   ├── layer_0/
+│   │   └── chunk_*.bin
+│   └── layer_N/
+├── chr2/
+│   └── ...
+└── chrX/
+    └── ...
 ```
 
 ## Critical Implementation Details
+
+### BED Parsing & Shard Detection
+- Flexible column detection: scans left-to-right
+- First non-integer column → shard name (e.g., "chr1", "chrX")
+- First two integer columns → (start, end) coordinates
+- If no non-integer column → uses `"default"` as shard
+- Returns `HashMap<String, Vec<TaggedInterval>>` grouped by shard
 
 ### Offset Storage (FIXED)
 - `start_ivs` and `end_ivs` use `OffsetSid` struct (offset: u32, sid: u32)
@@ -47,8 +74,8 @@ src/
 - Query uses `partition_point()` for O(log n) lookup to initiate iteration
 
 ### O(1) Chunk Lookup
-- Chunk paths are predictable: `layer_{layer_id}/chunk_{chunk_id}.bin`
-- `compute_chunk_tasks()` in query.rs computes which chunks to access from coordinates
+- Chunk paths are predictable: `{shard}/layer_{layer_id}/chunk_{chunk_id}.bin`
+- `compute_chunk_tasks_for_shard()` in query.rs computes which chunks to access from coordinates
 - No filesystem scanning needed
 
 ### Deduplication (FIXED)
@@ -102,6 +129,7 @@ Query accepts either a single BED file or a directory of BED files:
 7. ✅ Pre-allocation in build pipeline - Exact capacity via two-pass
 8. ✅ Add command - Incremental database updates
 9. ✅ Batch query support - Query with directory of BED files
+10. ✅ Genomic sharding - Chromosome-based partitioning with per-shard indices
 
 ## rkyv Notes
 - Uses rkyv 0.8 for zero-copy deserialization

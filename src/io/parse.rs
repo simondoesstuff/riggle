@@ -154,6 +154,7 @@ pub fn parse_bed_string(content: &str, sid: u32) -> Result<HashMap<String, Vec<T
 
 /// Parse BED data from a string, returning a flat vector of intervals (ignores shard)
 /// This is a convenience function for tests that don't need shard information
+#[cfg(test)]
 pub fn parse_bed_string_flat(content: &str, sid: u32) -> Result<Vec<TaggedInterval>, BedParseError> {
     let shards = parse_bed_string(content, sid)?;
     Ok(shards.into_values().flatten().collect())
@@ -161,6 +162,7 @@ pub fn parse_bed_string_flat(content: &str, sid: u32) -> Result<Vec<TaggedInterv
 
 /// Parse a BED file, returning a flat vector of intervals (ignores shard)
 /// This is a convenience function for cases that don't need shard information
+#[cfg(test)]
 pub fn parse_bed_file_flat(path: &Path, sid: u32) -> Result<Vec<TaggedInterval>, BedParseError> {
     let shards = parse_bed_file(path, sid)?;
     Ok(shards.into_values().flatten().collect())

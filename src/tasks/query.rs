@@ -87,6 +87,9 @@ pub struct QueryResult {
 ///
 /// Accepts either a single BED file or a directory containing multiple BED files.
 /// When given a directory, each file is treated as a separate query source.
+///
+/// Queries are processed per-shard: only shards present in both the query AND
+/// the database are queried. Results are aggregated across all shards.
 pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     // Load master header
     let header_path = config.db_path.join("header.json");
@@ -99,9 +102,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         .map_err(|e| QueryError::InvalidDatabase(e.to_string()))?;
 
     // Parse query file(s) - handles both single file and directory
-    let (queries, query_sources, query_names) = parse_query_path(&config.query_path)?;
+    let parsed = parse_query_path(&config.query_path)?;
 
-    if queries.is_empty() {
+    if parsed.total_count == 0 {
         // Return empty result
         let counts = sprs::CsMat::empty(sprs::CompressedStorage::CSR, master_header.num_sources());
         return Ok(QueryResult {
@@ -116,44 +119,65 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         });
     }
 
-    // Sort queries by start coordinate and track original indices
-    // Note: Using (usize, TaggedInterval) tuple prevents radix sort, but query batches
-    // are typically small enough that O(n log n) comparison sort is acceptable.
-    let mut indexed_queries: Vec<(usize, TaggedInterval)> =
-        queries.into_iter().enumerate().collect();
-    indexed_queries.sort_by_key(|(_, iv)| iv.iv.start);
-
-    let num_queries = indexed_queries.len();
+    let num_queries = parsed.total_count;
     let num_sources = master_header.num_sources();
 
-    // Compute which chunks to query based on query coordinates (O(1) per query)
-    // Each interval goes to exactly one layer based on its size
-    let chunk_tasks = compute_chunk_tasks(&config.db_path, &indexed_queries, &master_header);
+    // Build a set of database shards for fast lookup
+    let db_shards: std::collections::HashSet<&str> =
+        master_header.shards.iter().map(|s| s.as_str()).collect();
 
-    // Process chunks in parallel, each with thread-local accumulator
-    let sparse_matrices: Vec<SparseMatrix> = chunk_tasks
-        .par_iter()
-        .filter_map(|(layer_id, chunk_id, path)| {
-            process_chunk(
-                path,
-                *layer_id,
-                *chunk_id,
-                &master_header,
-                &indexed_queries,
-                num_queries,
-                num_sources,
-            )
-            .ok()
-        })
-        .collect();
+    // Collect all sparse matrices from all shards
+    let mut all_sparse_matrices: Vec<SparseMatrix> = Vec::new();
 
-    // Merge all sparse matrices
-    let final_counts = tree_reduce_sparse(sparse_matrices, num_queries, num_sources);
+    // Process each shard that exists in both query and database
+    for (shard, shard_queries) in &parsed.shard_intervals {
+        // Skip if shard doesn't exist in database
+        if !db_shards.contains(shard.as_str()) {
+            continue;
+        }
+
+        if shard_queries.is_empty() {
+            continue;
+        }
+
+        // Sort queries by start coordinate while preserving global indices
+        let mut indexed_queries: Vec<(usize, TaggedInterval)> = shard_queries.clone();
+        indexed_queries.sort_by_key(|(_, iv)| iv.iv.start);
+
+        // Compute which chunks to query for this shard
+        let chunk_tasks = compute_chunk_tasks_for_shard(
+            &config.db_path,
+            shard,
+            &indexed_queries,
+            &master_header,
+        );
+
+        // Process chunks in parallel
+        let shard_matrices: Vec<SparseMatrix> = chunk_tasks
+            .par_iter()
+            .filter_map(|(layer_id, _chunk_id, path)| {
+                process_chunk(
+                    path,
+                    *layer_id,
+                    &master_header,
+                    &indexed_queries,
+                    num_queries,
+                    num_sources,
+                )
+                .ok()
+            })
+            .collect();
+
+        all_sparse_matrices.extend(shard_matrices);
+    }
+
+    // Merge all sparse matrices from all shards
+    let final_counts = tree_reduce_sparse(all_sparse_matrices, num_queries, num_sources);
 
     Ok(QueryResult {
         counts: final_counts,
-        query_names,
-        query_sources,
+        query_names: parsed.query_names,
+        query_sources: parsed.query_sources,
         db_sources: master_header
             .sid_map
             .iter()
@@ -164,8 +188,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
 /// Parsed query result with shard grouping
 struct ParsedQueries {
-    /// Intervals grouped by shard
-    shard_intervals: HashMap<String, Vec<TaggedInterval>>,
+    /// Intervals grouped by shard, with global indices preserved
+    /// Each entry is (global_index, interval)
+    shard_intervals: HashMap<String, Vec<(usize, TaggedInterval)>>,
     /// Query source metadata
     query_sources: Vec<QuerySource>,
     /// Flat list of query names (for result indexing)
@@ -196,10 +221,11 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
         });
     }
 
-    let mut shard_intervals: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
+    // First pass: collect all intervals with global indices
+    let mut shard_intervals: HashMap<String, Vec<(usize, TaggedInterval)>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
-    let mut current_idx = 0;
+    let mut global_idx = 0;
 
     for bed_path in bed_files {
         let file_shards = parse_bed_file(&bed_path, 0)?;
@@ -219,15 +245,21 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
         query_names.extend((0..file_count).map(|i| format!("{}:{}", name, i)));
         query_sources.push(QuerySource {
             name,
-            start_idx: current_idx,
+            start_idx: global_idx,
             count: file_count,
         });
 
-        current_idx += file_count;
-
-        // Merge into global shard map
+        // Merge into global shard map with global indices
         for (shard, intervals) in file_shards {
-            shard_intervals.entry(shard).or_default().extend(intervals);
+            let indexed: Vec<(usize, TaggedInterval)> = intervals
+                .into_iter()
+                .map(|iv| {
+                    let idx = global_idx;
+                    global_idx += 1;
+                    (idx, iv)
+                })
+                .collect();
+            shard_intervals.entry(shard).or_default().extend(indexed);
         }
     }
 
@@ -235,15 +267,16 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
         shard_intervals,
         query_sources,
         query_names,
-        total_count: current_idx,
+        total_count: global_idx,
     })
 }
 
-/// Compute chunk file paths to query based on query coordinates
+/// Compute chunk file paths to query for a specific shard
 /// This provides O(1) lookup per query - we compute exactly which chunks need to be accessed
 /// based on coordinates rather than scanning the filesystem.
-fn compute_chunk_tasks(
+fn compute_chunk_tasks_for_shard(
     db_path: &Path,
+    shard: &str,
     indexed_queries: &[(usize, TaggedInterval)],
     master_header: &MasterHeader,
 ) -> Vec<(u8, u32, PathBuf)> {
@@ -273,7 +306,7 @@ fn compute_chunk_tasks(
     tasks
         .into_iter()
         .filter_map(|(layer_id, chunk_id)| {
-            let path = chunk_path(db_path, layer_id, chunk_id);
+            let path = chunk_path(db_path, shard, layer_id, chunk_id);
             if path.exists() {
                 Some((layer_id, chunk_id, path))
             } else {
@@ -283,10 +316,11 @@ fn compute_chunk_tasks(
         .collect()
 }
 
-/// Construct the path to a chunk file (O(1) - predictable location)
+/// Construct the path to a chunk file within a shard (O(1) - predictable location)
 #[inline]
-fn chunk_path(db_path: &Path, layer_id: u8, chunk_id: u32) -> PathBuf {
+fn chunk_path(db_path: &Path, shard: &str, layer_id: u8, chunk_id: u32) -> PathBuf {
     db_path
+        .join(shard)
         .join(format!("layer_{}", layer_id))
         .join(format!("chunk_{}.bin", chunk_id))
 }
@@ -295,7 +329,6 @@ fn chunk_path(db_path: &Path, layer_id: u8, chunk_id: u32) -> PathBuf {
 fn process_chunk(
     path: &Path,
     layer_id: u8,
-    _chunk_id: u32,
     master_header: &MasterHeader,
     indexed_queries: &[(usize, TaggedInterval)],
     num_queries: usize,
@@ -362,11 +395,17 @@ fn process_chunk(
 /// Tree-reduce sparse matrices
 fn tree_reduce_sparse(
     matrices: Vec<SparseMatrix>,
-    _num_queries: usize,
+    num_queries: usize,
     num_sources: usize,
 ) -> SparseMatrix {
     if matrices.is_empty() {
-        return sprs::CsMat::empty(sprs::CompressedStorage::CSR, num_sources);
+        // Return properly sized empty matrix
+        return sprs::CsMat::new(
+            (num_queries, num_sources),
+            vec![0; num_queries + 1],
+            Vec::new(),
+            Vec::new(),
+        );
     }
 
     if matrices.len() == 1 {
@@ -424,7 +463,7 @@ mod tests {
             BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         build_database(&build_config).unwrap();
 
-        // Create query file
+        // Create query file (must include shard/chromosome)
         create_test_bed(
             query_dir.path(),
             "query.bed",
@@ -440,6 +479,68 @@ mod tests {
 
         assert_eq!(result.counts.rows(), 1);
         assert_eq!(result.db_sources.len(), 2);
+    }
+
+    #[test]
+    fn test_query_database_multi_shard() {
+        let input_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let query_dir = TempDir::new().unwrap();
+
+        // Create database with multiple shards
+        create_test_bed(
+            input_dir.path(),
+            "a.bed",
+            "chr1\t100\t200\nchr2\t300\t400\n",
+        );
+
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+        build_database(&build_config).unwrap();
+
+        // Create query file targeting both shards
+        create_test_bed(
+            query_dir.path(),
+            "query.bed",
+            "chr1\t100\t200\nchr2\t300\t400\n",
+        );
+
+        let query_config = QueryConfig::new(
+            db_dir.path().to_path_buf(),
+            query_dir.path().join("query.bed"),
+        );
+
+        let result = query_database(&query_config).unwrap();
+
+        // Should have 2 query intervals
+        assert_eq!(result.counts.rows(), 2);
+    }
+
+    #[test]
+    fn test_query_database_shard_not_in_db() {
+        let input_dir = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let query_dir = TempDir::new().unwrap();
+
+        // Create database with chr1 only
+        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\n");
+
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+        build_database(&build_config).unwrap();
+
+        // Query with chr2 (not in database) - should be silently skipped
+        create_test_bed(query_dir.path(), "query.bed", "chr2\t100\t200\n");
+
+        let query_config = QueryConfig::new(
+            db_dir.path().to_path_buf(),
+            query_dir.path().join("query.bed"),
+        );
+
+        let result = query_database(&query_config).unwrap();
+
+        // Should have 1 query interval but no overlaps
+        assert_eq!(result.counts.rows(), 1);
     }
 
     #[test]
