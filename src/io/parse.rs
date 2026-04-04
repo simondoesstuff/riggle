@@ -56,20 +56,16 @@ pub fn parse_bed_file(path: &Path, sid: u32) -> Result<Vec<TaggedInterval>, BedP
         }
 
         // Parse start coordinate
-        let start: u32 = parts[1]
-            .parse()
-            .map_err(|_| BedParseError::InvalidStart {
-                line: line_num,
-                value: parts[1].to_string(),
-            })?;
+        let start: u32 = parts[1].parse().map_err(|_| BedParseError::InvalidStart {
+            line: line_num,
+            value: parts[1].to_string(),
+        })?;
 
         // Parse end coordinate
-        let end: u32 = parts[2]
-            .parse()
-            .map_err(|_| BedParseError::InvalidEnd {
-                line: line_num,
-                value: parts[2].to_string(),
-            })?;
+        let end: u32 = parts[2].parse().map_err(|_| BedParseError::InvalidEnd {
+            line: line_num,
+            value: parts[2].to_string(),
+        })?;
 
         // Validate range
         if start >= end {
@@ -106,19 +102,15 @@ pub fn parse_bed_string(content: &str, sid: u32) -> Result<Vec<TaggedInterval>, 
             return Err(BedParseError::InvalidFormat { line: line_num });
         }
 
-        let start: u32 = parts[1]
-            .parse()
-            .map_err(|_| BedParseError::InvalidStart {
-                line: line_num,
-                value: parts[1].to_string(),
-            })?;
+        let start: u32 = parts[1].parse().map_err(|_| BedParseError::InvalidStart {
+            line: line_num,
+            value: parts[1].to_string(),
+        })?;
 
-        let end: u32 = parts[2]
-            .parse()
-            .map_err(|_| BedParseError::InvalidEnd {
-                line: line_num,
-                value: parts[2].to_string(),
-            })?;
+        let end: u32 = parts[2].parse().map_err(|_| BedParseError::InvalidEnd {
+            line: line_num,
+            value: parts[2].to_string(),
+        })?;
 
         if start >= end {
             return Err(BedParseError::InvalidRange {

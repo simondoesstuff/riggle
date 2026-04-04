@@ -98,12 +98,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let master_header: MasterHeader = serde_json::from_str(&header_content)
         .map_err(|e| QueryError::InvalidDatabase(e.to_string()))?;
 
-    // Parse query file(s) - handle both single file and directory
-    let (queries, query_sources, query_names) = if config.query_path.is_dir() {
-        parse_query_directory(&config.query_path)?
-    } else {
-        parse_single_query_file(&config.query_path)?
-    };
+    // Parse query file(s) - handles both single file and directory
+    let (queries, query_sources, query_names) = parse_query_path(&config.query_path)?;
 
     if queries.is_empty() {
         // Return empty result
@@ -120,7 +116,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         });
     }
 
-    // Sort queries and track original indices
+    // Sort queries by start coordinate and track original indices
+    // Note: Using (usize, TaggedInterval) tuple prevents radix sort, but query batches
+    // are typically small enough that O(n log n) comparison sort is acceptable.
     let mut indexed_queries: Vec<(usize, TaggedInterval)> =
         queries.into_iter().enumerate().collect();
     indexed_queries.sort_by_key(|(_, iv)| iv.iv.start);
@@ -164,39 +162,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     })
 }
 
-/// Parse a single query BED file
-fn parse_single_query_file(
+/// Parse query BED file(s) from a path (file or directory)
+fn parse_query_path(
     path: &Path,
 ) -> Result<(Vec<TaggedInterval>, Vec<QuerySource>, Vec<String>), QueryError> {
-    let intervals = parse_bed_file(path, 0)?;
-    let count = intervals.len();
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "query".to_string());
-
-    let query_names: Vec<String> = (0..count).map(|i| format!("{}:{}", name, i)).collect();
-
-    let query_sources = vec![QuerySource {
-        name,
-        start_idx: 0,
-        count,
-    }];
-
-    Ok((intervals, query_sources, query_names))
-}
-
-/// Parse all BED files in a directory
-fn parse_query_directory(
-    dir: &Path,
-) -> Result<(Vec<TaggedInterval>, Vec<QuerySource>, Vec<String>), QueryError> {
-    // Find all BED files
-    let bed_files: Vec<_> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
-        .collect();
+    // Collect BED files to process
+    let bed_files: Vec<PathBuf> = if path.is_dir() {
+        fs::read_dir(path)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
 
     if bed_files.is_empty() {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
@@ -209,29 +188,24 @@ fn parse_query_directory(
 
     for bed_path in bed_files {
         let intervals = parse_bed_file(&bed_path, 0)?;
-        let count = intervals.len();
 
-        if count == 0 {
+        if intervals.is_empty() {
             continue;
         }
 
         let name = bed_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("query_{}", query_sources.len()));
+            .unwrap_or_else(|| "query".to_string());
 
-        // Generate names for each interval in this file
-        for i in 0..count {
-            query_names.push(format!("{}:{}", name, i));
-        }
-
+        query_names.extend((0..intervals.len()).map(|i| format!("{}:{}", name, i)));
         query_sources.push(QuerySource {
             name,
             start_idx: current_idx,
-            count,
+            count: intervals.len(),
         });
 
-        current_idx += count;
+        current_idx += intervals.len();
         all_intervals.extend(intervals);
     }
 

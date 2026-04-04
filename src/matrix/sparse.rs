@@ -36,12 +36,7 @@ pub fn condense_to_sparse(dense: &DenseMatrix, mask: &BitwiseMask) -> SparseMatr
 
     // Safety: Data is sorted (rows in order, cols in order within rows)
     // indptr has correct structure, indices and data have matching length
-    CsMat::new(
-        (num_rows, num_cols),
-        indptr,
-        indices,
-        data,
-    )
+    CsMat::new((num_rows, num_cols), indptr, indices, data)
 }
 
 /// Merge two sparse matrices by element-wise addition

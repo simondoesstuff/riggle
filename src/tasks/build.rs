@@ -157,13 +157,7 @@ pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
         chunks
             .into_par_iter()
             .try_for_each(|(chunk_id, chunk_intervals)| {
-                write_chunk_file(
-                    &layer_dir,
-                    layer_id as u8,
-                    chunk_id,
-                    layer_config,
-                    &chunk_intervals,
-                )
+                write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
             })?;
     }
 
@@ -218,13 +212,10 @@ fn group_by_chunk(
 /// Write a chunk file
 fn write_chunk_file(
     layer_dir: &Path,
-    layer_id: u8,
     chunk_id: u32,
     config: &LayerConfig,
     intervals: &[TaggedInterval],
 ) -> Result<(), BuildError> {
-    // FIX: don't pass layer_id since it's incluced in LayerConfig;
-    // this will lead to downstream bugs
     let chunk_start = chunk_id * config.chunk_size;
     let chunk_end = chunk_start + config.chunk_size;
     let chunk_bounds = Interval::new(chunk_start, chunk_end);
@@ -233,7 +224,7 @@ fn write_chunk_file(
     let tiles = index_sweep(chunk_bounds, config.tile_size, intervals);
 
     // Create header
-    let mut header = ChunkHeader::new(layer_id, chunk_id, chunk_start, chunk_end);
+    let mut header = ChunkHeader::new(config.layer_id, chunk_id, chunk_start, chunk_end);
 
     // Calculate tile offsets
     let tile_bytes: Vec<_> = tiles
@@ -381,13 +372,7 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
         chunks
             .into_par_iter()
             .try_for_each(|(chunk_id, chunk_intervals)| {
-                write_chunk_file(
-                    &layer_dir,
-                    layer_id as u8,
-                    chunk_id,
-                    layer_config,
-                    &chunk_intervals,
-                )
+                write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
             })?;
     }
 
@@ -498,16 +483,10 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
 
         // Create initial database
-        create_test_bed(
-            input_dir.path(),
-            "a.bed",
-            "chr1\t100\t200\n",
-        );
+        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\n");
 
-        let build_config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            db_dir.path().to_path_buf(),
-        );
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         build_database(&build_config).unwrap();
 
         // Verify initial state
@@ -517,21 +496,10 @@ mod tests {
         assert_eq!(initial_header.num_sources(), 1);
 
         // Add new files
-        create_test_bed(
-            add_dir.path(),
-            "b.bed",
-            "chr1\t300\t400\n",
-        );
-        create_test_bed(
-            add_dir.path(),
-            "c.bed",
-            "chr1\t500\t600\n",
-        );
+        create_test_bed(add_dir.path(), "b.bed", "chr1\t300\t400\n");
+        create_test_bed(add_dir.path(), "c.bed", "chr1\t500\t600\n");
 
-        let add_config = AddConfig::new(
-            add_dir.path().to_path_buf(),
-            db_dir.path().to_path_buf(),
-        );
+        let add_config = AddConfig::new(add_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         let added = add_to_database(&add_config).unwrap();
 
         assert_eq!(added, 2);

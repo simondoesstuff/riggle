@@ -2,7 +2,9 @@ use rkyv::{Archive, Deserialize, Serialize};
 use voracious_radix_sort::Radixable;
 
 /// Basic interval representation with half-open coordinates [start, end)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
+)]
 pub struct Interval {
     pub start: u32,
     pub end: u32,
@@ -40,7 +42,9 @@ impl Interval {
 }
 
 /// Interval tagged with a source ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
+)]
 pub struct TaggedInterval {
     pub iv: Interval,
     pub sid: u32,

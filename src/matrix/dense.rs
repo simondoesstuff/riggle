@@ -136,8 +136,7 @@ impl BitwiseMask {
     pub fn flagged_cols(&self, row: usize) -> impl Iterator<Item = usize> + '_ {
         let start = row * self.num_cols;
         let end = start + self.num_cols;
-        self.data[start..end]
-            .iter_ones()
+        self.data[start..end].iter_ones()
     }
 
     /// Count flagged positions in a row
@@ -161,7 +160,10 @@ impl BitwiseMask {
 }
 
 /// Allocate a paired dense matrix and bitmask for accumulation
-pub fn allocate_dense_accumulator(num_queries: usize, num_db_sids: usize) -> (DenseMatrix, BitwiseMask) {
+pub fn allocate_dense_accumulator(
+    num_queries: usize,
+    num_db_sids: usize,
+) -> (DenseMatrix, BitwiseMask) {
     (
         DenseMatrix::new(num_queries, num_db_sids),
         BitwiseMask::new(num_queries, num_db_sids),

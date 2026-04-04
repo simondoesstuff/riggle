@@ -56,8 +56,10 @@ impl MappedChunk {
             .map_err(|e| MmapError::InvalidFormat(format!("Failed to read header: {}", e)))?;
 
         // Deserialize the archived header to owned
-        let header: ChunkHeader = rkyv::deserialize::<ChunkHeader, RkyvError>(archived)
-            .map_err(|e| MmapError::InvalidFormat(format!("Failed to deserialize header: {}", e)))?;
+        let header: ChunkHeader =
+            rkyv::deserialize::<ChunkHeader, RkyvError>(archived).map_err(|e| {
+                MmapError::InvalidFormat(format!("Failed to deserialize header: {}", e))
+            })?;
 
         Ok(Self {
             mmap,
@@ -67,7 +69,11 @@ impl MappedChunk {
     }
 
     /// Create a MappedChunk from raw bytes (useful for testing)
-    pub fn from_bytes(bytes: Vec<u8>, _header: ChunkHeader, _data_offset: usize) -> Result<Self, MmapError> {
+    pub fn from_bytes(
+        bytes: Vec<u8>,
+        _header: ChunkHeader,
+        _data_offset: usize,
+    ) -> Result<Self, MmapError> {
         // For testing, we create a mmap from a file backed by the bytes
         // This is a simplified version - in real use, we'd read from disk
         let _ = bytes; // We can't actually create Mmap from bytes directly
@@ -116,15 +122,17 @@ impl MappedChunk {
         }
 
         let tile_bytes = &self.mmap[offset..end];
-        rkyv::access::<ArchivedTile, RkyvError>(tile_bytes)
-            .map_err(|e| MmapError::InvalidFormat(format!("Failed to read tile {}: {}", tile_id, e)))
+        rkyv::access::<ArchivedTile, RkyvError>(tile_bytes).map_err(|e| {
+            MmapError::InvalidFormat(format!("Failed to read tile {}: {}", tile_id, e))
+        })
     }
 
     /// Deserialize a tile (owned copy)
     pub fn read_tile(&self, tile_id: usize) -> Result<Tile, MmapError> {
         let archived = self.get_tile(tile_id)?;
-        rkyv::deserialize::<Tile, RkyvError>(archived)
-            .map_err(|e| MmapError::InvalidFormat(format!("Failed to deserialize tile {}: {}", tile_id, e)))
+        rkyv::deserialize::<Tile, RkyvError>(archived).map_err(|e| {
+            MmapError::InvalidFormat(format!("Failed to deserialize tile {}: {}", tile_id, e))
+        })
     }
 
     /// Get the start coordinate of the chunk
@@ -149,11 +157,7 @@ impl MappedChunk {
 }
 
 /// Write a chunk to a file
-pub fn write_chunk(
-    path: &Path,
-    header: &ChunkHeader,
-    tiles: &[Tile],
-) -> Result<(), MmapError> {
+pub fn write_chunk(path: &Path, header: &ChunkHeader, tiles: &[Tile]) -> Result<(), MmapError> {
     use std::io::Write;
 
     let mut file = File::create(path)?;
