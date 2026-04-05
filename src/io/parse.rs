@@ -30,9 +30,10 @@ pub enum BedParseError {
 }
 
 /// Result of parsing a single BED line
-struct ParsedLine {
+/// Uses borrowed string slice for shard to avoid per-line allocations
+struct ParsedLine<'a> {
     /// Shard name (first non-integer column, or DEFAULT_SHARD if none)
-    shard: String,
+    shard: &'a str,
     /// The interval
     interval: TaggedInterval,
 }
@@ -45,11 +46,18 @@ struct ParsedLine {
 /// - First two integer columns -> (start, end) coordinates
 /// - If no non-integer column found -> use DEFAULT_SHARD
 ///
+/// Performance: Zero allocations per line - borrows shard from input,
+/// uses scalar variables for coordinates instead of Vec.
+///
 /// Returns:
 /// - None if the line should be skipped (empty or comment)
 /// - Some(Ok(parsed)) for valid intervals
 /// - Some(Err(error)) for invalid lines
-fn parse_bed_line(line_num: usize, line: &str, sid: u32) -> Option<Result<ParsedLine, BedParseError>> {
+fn parse_bed_line<'a>(
+    line_num: usize,
+    line: &'a str,
+    sid: u32,
+) -> Option<Result<ParsedLine<'a>, BedParseError>> {
     let trimmed = line.trim();
 
     // Skip empty lines and comments
@@ -57,40 +65,43 @@ fn parse_bed_line(line_num: usize, line: &str, sid: u32) -> Option<Result<Parsed
         return None;
     }
 
-    // Split by whitespace (handles both tabs and spaces)
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return Some(Err(BedParseError::InvalidFormat { line: line_num }));
-    }
-
     // Scan columns to find shard and coordinates
-    let mut shard: Option<String> = None;
-    let mut coords: Vec<u32> = Vec::with_capacity(2);
+    // Use scalar variables instead of Vec to avoid allocation
+    let mut shard: Option<&'a str> = None;
+    let mut start: Option<u32> = None;
+    let mut end: Option<u32> = None;
+    let mut col_count = 0;
 
-    for part in &parts {
+    // Iterate directly instead of collecting to Vec
+    for part in trimmed.split_whitespace() {
+        col_count += 1;
         if let Ok(val) = part.parse::<u32>() {
             // Integer column - use as coordinate (take first two)
-            if coords.len() < 2 {
-                coords.push(val);
+            if start.is_none() {
+                start = Some(val);
+            } else if end.is_none() {
+                end = Some(val);
             }
         } else if shard.is_none() {
-            // First non-integer column - use as shard name
-            shard = Some(part.to_string());
+            // First non-integer column - borrow as shard name (no allocation!)
+            shard = Some(part);
         }
         // Stop once we have both shard and 2 coordinates
-        if shard.is_some() && coords.len() == 2 {
+        if shard.is_some() && end.is_some() {
             break;
         }
     }
 
-    // Need at least 2 coordinates
-    if coords.len() < 2 {
+    // Need at least 2 columns to be valid
+    if col_count < 2 {
         return Some(Err(BedParseError::InvalidFormat { line: line_num }));
     }
 
-    let start = coords[0];
-    let end = coords[1];
+    // Need at least 2 coordinates
+    let (start, end) = match (start, end) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return Some(Err(BedParseError::InvalidFormat { line: line_num })),
+    };
 
     // Validate range
     if start >= end {
@@ -101,10 +112,8 @@ fn parse_bed_line(line_num: usize, line: &str, sid: u32) -> Option<Result<Parsed
         }));
     }
 
-    let shard_name = shard.unwrap_or_else(|| DEFAULT_SHARD.to_string());
-
     Some(Ok(ParsedLine {
-        shard: shard_name,
+        shard: shard.unwrap_or(DEFAULT_SHARD),
         interval: TaggedInterval::new(start, end, sid),
     }))
 }
@@ -117,6 +126,9 @@ fn parse_bed_line(line_num: usize, line: &str, sid: u32) -> Option<Result<Parsed
 /// - Flexible column detection: first non-integer = shard, first two integers = coords
 /// - Supports tab or space delimiters
 /// - Returns intervals grouped by shard name, tagged with the given source ID
+///
+/// Performance: Only allocates a String once per unique shard (~24 for human genome)
+/// instead of once per line (millions of allocations avoided).
 pub fn parse_bed_file(path: &Path, sid: u32) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -128,7 +140,12 @@ pub fn parse_bed_file(path: &Path, sid: u32) -> Result<HashMap<String, Vec<Tagge
 
         if let Some(result) = parse_bed_line(line_num, &line, sid) {
             let parsed = result?;
-            shards.entry(parsed.shard).or_default().push(parsed.interval);
+            // Check using &str first - only allocate String if shard is new
+            if let Some(intervals) = shards.get_mut(parsed.shard) {
+                intervals.push(parsed.interval);
+            } else {
+                shards.insert(parsed.shard.to_string(), vec![parsed.interval]);
+            }
         }
     }
 
@@ -137,6 +154,8 @@ pub fn parse_bed_file(path: &Path, sid: u32) -> Result<HashMap<String, Vec<Tagge
 
 /// Parse BED data from a string (useful for testing)
 /// Returns intervals grouped by shard
+///
+/// Performance: Only allocates a String once per unique shard.
 pub fn parse_bed_string(content: &str, sid: u32) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
     let mut shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
 
@@ -145,7 +164,12 @@ pub fn parse_bed_string(content: &str, sid: u32) -> Result<HashMap<String, Vec<T
 
         if let Some(result) = parse_bed_line(line_num, line, sid) {
             let parsed = result?;
-            shards.entry(parsed.shard).or_default().push(parsed.interval);
+            // Check using &str first - only allocate String if shard is new
+            if let Some(intervals) = shards.get_mut(parsed.shard) {
+                intervals.push(parsed.interval);
+            } else {
+                shards.insert(parsed.shard.to_string(), vec![parsed.interval]);
+            }
         }
     }
 
