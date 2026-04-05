@@ -13,6 +13,11 @@ use super::sweep_tiles;
 ///
 /// # Returns
 /// Vector of tiles covering the chunk, each containing interval information
+///
+/// # Note
+/// Since tile_size is > the max interval size for each layer, no interval can
+/// span an entire tile. Each interval either starts in the tile, ends in the tile,
+/// or both - never spans it completely.
 pub fn index_sweep(
     chunk_bounds: crate::core::Interval,
     tile_size: u32,
@@ -44,30 +49,17 @@ pub fn index_sweep(
 
             for iv in active_items {
                 // Classify the interval's relationship to this tile
-                let starts_before = iv.iv.start <= tile_start;
-                let ends_after = iv.iv.end >= tile_end;
+                // Since tile_size > max_interval_size, no interval can span a tile
                 let starts_in_tile = iv.iv.start >= tile_start && iv.iv.start < tile_end;
                 let ends_in_tile = iv.iv.end > tile_start && iv.iv.end <= tile_end;
 
-                if starts_before && ends_after {
-                    // Interval spans the entire tile - add to running counts
-                    // Aggregate by sid
-                    if let Some(entry) = tile.running_counts.iter_mut().find(|(s, _)| *s == iv.sid)
-                    {
-                        entry.1 += 1;
-                    } else {
-                        tile.running_counts.push((iv.sid, 1));
-                    }
-                } else {
-                    // Interval partially overlaps the tile
-                    if starts_in_tile {
-                        let offset = iv.iv.start - tile_start;
-                        tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
-                    }
-                    if ends_in_tile {
-                        let offset = iv.iv.end - tile_start;
-                        tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
-                    }
+                if starts_in_tile {
+                    let offset = iv.iv.start - tile_start;
+                    tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
+                }
+                if ends_in_tile {
+                    let offset = iv.iv.end - tile_start;
+                    tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
                 }
             }
         },
@@ -113,59 +105,52 @@ mod tests {
     }
 
     #[test]
-    fn test_index_sweep_spanning_interval() {
+    fn test_index_sweep_crossing_interval() {
         let bounds = Interval::new(0, 500);
-        // Interval spans tiles 1 and 2 completely (100-300)
-        let intervals = vec![TaggedInterval::new(50, 350, 1)];
+        // Interval crosses tiles but doesn't span any (with proper tile sizing)
+        let intervals = vec![TaggedInterval::new(50, 150, 1)];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Tile 0 (0-100): starts before, ends after -> but interval starts at 50
-        // Actually interval 50-350:
-        // - Tile 0: starts in tile at 50, doesn't span entire tile (end is at 350 > 100)
-        // - Tile 1 (100-200): spans entire tile (50 < 100, 350 > 200)
-        // - Tile 2 (200-300): spans entire tile (50 < 200, 350 > 300)
-        // - Tile 3 (300-400): starts before (50 < 300), ends in tile at 350
+        // Interval 50-150:
+        // - Tile 0 (0-100): starts at offset 50
+        // - Tile 1 (100-200): ends at offset 50
 
         assert_eq!(tiles[0].start_ivs.len(), 1); // starts at offset 50
-        assert!(tiles[0].running_counts.is_empty());
+        assert_eq!(tiles[0].start_ivs[0], OffsetSid::new(50, 1));
 
-        assert_eq!(tiles[1].running_counts.len(), 1); // spans entire tile
-        assert_eq!(tiles[1].running_counts[0], (1, 1));
-
-        assert_eq!(tiles[2].running_counts.len(), 1); // spans entire tile
-        assert_eq!(tiles[2].running_counts[0], (1, 1));
-
-        assert_eq!(tiles[3].end_ivs.len(), 1); // ends at offset 50
-        assert!(tiles[3].running_counts.is_empty());
+        assert_eq!(tiles[1].end_ivs.len(), 1); // ends at offset 50
+        assert_eq!(tiles[1].end_ivs[0], OffsetSid::new(50, 1));
     }
 
     #[test]
     fn test_index_sweep_multiple_intervals_same_sid() {
         let bounds = Interval::new(0, 300);
+        // Two intervals from same sid, both start and end in same tiles
         let intervals = vec![
-            TaggedInterval::new(0, 300, 1), // spans all tiles
-            TaggedInterval::new(0, 300, 1), // same sid
+            TaggedInterval::new(50, 150, 1),
+            TaggedInterval::new(60, 160, 1),
         ];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // All three tiles should have running count of 2 for sid 1
-        assert_eq!(tiles[0].running_counts, vec![(1, 2)]);
-        assert_eq!(tiles[1].running_counts, vec![(1, 2)]);
-        assert_eq!(tiles[2].running_counts, vec![(1, 2)]);
+        // Tile 0: both intervals start
+        assert_eq!(tiles[0].start_ivs.len(), 2);
+        // Tile 1: both intervals end
+        assert_eq!(tiles[1].end_ivs.len(), 2);
     }
 
     #[test]
     fn test_index_sweep_different_sids() {
         let bounds = Interval::new(0, 200);
         let intervals = vec![
-            TaggedInterval::new(0, 200, 1),
-            TaggedInterval::new(0, 200, 2),
+            TaggedInterval::new(50, 150, 1),
+            TaggedInterval::new(50, 150, 2),
         ];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Both tiles should have running counts for both sids
-        assert!(tiles[0].running_counts.contains(&(1, 1)));
-        assert!(tiles[0].running_counts.contains(&(2, 1)));
+        // Tile 0: both intervals start
+        assert_eq!(tiles[0].start_ivs.len(), 2);
+        assert!(tiles[0].start_ivs.iter().any(|e| e.sid == 1));
+        assert!(tiles[0].start_ivs.iter().any(|e| e.sid == 2));
     }
 
     #[test]
@@ -178,8 +163,9 @@ mod tests {
         // Tile 0 (0-100): no overlap (end is 100, exclusive)
         assert!(tiles[0].is_empty());
 
-        // Tile 1 (100-200): spans entire tile
-        assert_eq!(tiles[1].running_counts.len(), 1);
+        // Tile 1 (100-200): starts and ends in this tile
+        assert_eq!(tiles[1].start_ivs.len(), 1);
+        assert_eq!(tiles[1].end_ivs.len(), 1);
     }
 
     #[test]

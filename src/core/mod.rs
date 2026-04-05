@@ -158,12 +158,13 @@ impl Radixable<u32> for OffsetSid {
 ///
 /// INVARIANT: `start_ivs` and `end_ivs` are sorted by offset
 /// to enable binary search during query. This sorting is performed by `index_sweep`.
+///
+/// NOTE: tile_size is set larger than the max interval size for each layer. This guarantees
+/// no interval can span an entire tile, eliminating the need for running_counts.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Tile {
     /// Start coordinate of this tile
     pub start_coord: u32,
-    /// Running counts: intervals that span the entire tile (sid, count)
-    pub running_counts: Vec<(u32, u32)>,
     /// Intervals starting within this tile
     /// SORTED by offset for binary search via radix sort
     pub start_ivs: Vec<OffsetSid>,
@@ -176,7 +177,6 @@ impl Tile {
     pub fn new(start_coord: u32) -> Self {
         Self {
             start_coord,
-            running_counts: Vec::new(),
             start_ivs: Vec::new(),
             end_ivs: Vec::new(),
         }
@@ -184,7 +184,7 @@ impl Tile {
 
     /// Check if the tile is empty (no intervals touch it)
     pub fn is_empty(&self) -> bool {
-        self.running_counts.is_empty() && self.start_ivs.is_empty() && self.end_ivs.is_empty()
+        self.start_ivs.is_empty() && self.end_ivs.is_empty()
     }
 }
 
@@ -263,7 +263,7 @@ mod tests {
         assert!(empty.is_empty());
 
         let mut non_empty = Tile::new(0);
-        non_empty.running_counts.push((1, 5));
+        non_empty.start_ivs.push(OffsetSid::new(50, 1));
         assert!(!non_empty.is_empty());
     }
 
@@ -272,10 +272,9 @@ mod tests {
         use rkyv::rancor::Error;
 
         let mut tile = Tile::new(1000);
-        tile.running_counts.push((1, 10));
-        tile.running_counts.push((2, 5));
         tile.start_ivs.push(OffsetSid::new(50, 3));
-        tile.end_ivs.push(OffsetSid::new(75, 4));
+        tile.start_ivs.push(OffsetSid::new(75, 4));
+        tile.end_ivs.push(OffsetSid::new(100, 5));
 
         // Serialize
         let bytes = rkyv::to_bytes::<Error>(&tile).unwrap();
@@ -284,8 +283,7 @@ mod tests {
         let archived = rkyv::access::<ArchivedTile, Error>(&bytes).unwrap();
 
         assert_eq!(archived.start_coord, 1000);
-        assert_eq!(archived.running_counts.len(), 2);
-        assert_eq!(archived.start_ivs.len(), 1);
+        assert_eq!(archived.start_ivs.len(), 2);
         assert_eq!(archived.end_ivs.len(), 1);
     }
 }
