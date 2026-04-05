@@ -18,10 +18,11 @@ use super::sweep_tiles;
 /// which correspond to row indices in `results`.
 ///
 /// # Deduplication Strategy
-/// Intervals spanning multiple tiles appear in running_counts of each tile they span.
-/// To avoid double-counting, we only count running_counts and end_ivs in the
-/// "first overlap tile" for each query - determined by `query.start >= tile_start`.
-/// start_ivs are always unique to their tile, so no deduplication needed.
+/// Since tile_size is > the max interval size, no database interval can span
+/// an entire tile. Intervals only appear in start_ivs (where they start) and
+/// end_ivs (where they end). To avoid double-counting, we only count end_ivs
+/// in the "first overlap tile" for each query - determined by
+/// `query.start >= tile_start`. start_ivs are always unique to their tile.
 pub fn query_sweep(
     mapped_chunk: &MappedChunk,
     tile_size: u32,
@@ -51,13 +52,8 @@ pub fn query_sweep(
             for (query_idx, query) in active_queries {
                 // Determine if this is the first tile where query overlaps
                 // This is true when query.start falls within [tile_start, tile_end)
-                // Used to avoid double-counting running_counts and end_ivs
+                // Used to avoid double-counting end_ivs
                 let is_first_overlap_tile = query.iv.start >= tile_start;
-
-                // Process running counts only in first overlap tile
-                if is_first_overlap_tile {
-                    process_running_counts(tile, *query_idx, results, mask);
-                }
 
                 // Process start_ivs (intervals starting in this tile) - always unique
                 process_start_ivs(tile, tile_start, query, *query_idx, results, mask);
@@ -69,26 +65,6 @@ pub fn query_sweep(
             }
         },
     );
-}
-
-/// Process running counts from a tile for a query
-/// Called only for the first overlap tile (deduplication handled by caller)
-fn process_running_counts(
-    tile: &ArchivedTile,
-    query_idx: usize,
-    results: &mut DenseMatrix,
-    mask: &mut BitwiseMask,
-) {
-    for entry in tile.running_counts.iter() {
-        let sid: u32 = entry.0.into();
-        let count: u32 = entry.1.into();
-
-        let sid_usize = sid as usize;
-        if sid_usize < results.num_cols() {
-            results.add(query_idx, sid_usize, count);
-            mask.flag(query_idx, sid_usize);
-        }
-    }
 }
 
 /// Process intervals starting in this tile
@@ -232,16 +208,16 @@ mod tests {
     }
 
     #[test]
-    fn test_query_sweep_running_counts() {
+    fn test_query_sweep_crossing_tiles() {
         // Create a chunk with 3 tiles, tile_size = 100
+        // Interval starts in tile 0, ends in tile 2
         let mut tile0 = Tile::new(0);
-        let mut tile1 = Tile::new(100);
-        let mut tile2 = Tile::new(200);
+        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval starts at 50
 
-        // Interval spans all tiles
-        tile0.running_counts.push((0, 1));
-        tile1.running_counts.push((0, 1));
-        tile2.running_counts.push((0, 1));
+        let tile1 = Tile::new(100); // no activity in middle tile
+
+        let mut tile2 = Tile::new(200);
+        tile2.end_ivs.push(OffsetSid::new(50, 0)); // interval ends at 250
 
         let (file, tile_size) = create_test_chunk(vec![tile0, tile1, tile2], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -254,7 +230,7 @@ mod tests {
 
         query_sweep(&mapped, tile_size, &queries, &mut results, &mut mask);
 
-        // Should count only once despite appearing in 3 tiles
+        // Should count the interval once (from start_ivs)
         assert_eq!(results.get(0, 0), 1);
     }
 

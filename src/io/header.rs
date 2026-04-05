@@ -66,17 +66,28 @@ impl LayerConfig {
 
     /// Create default layer configurations for a given maximum coordinate
     /// Layers are based on powers of 2, with tile/chunk sizes scaled accordingly
+    ///
+    /// Key invariant: tile_size > max_interval_size for each layer.
+    /// This guarantees no interval can span an entire tile, eliminating the need
+    /// for running_counts in tiles.
     pub fn default_layers() -> Vec<LayerConfig> {
-        // Each layer handles intervals of size [2^layer_id, 2^(layer_id+1))
-        // Tile size is 2^(layer_id+2) to ensure each interval touches at most a few tiles
-        // Chunk size is 2^(layer_id+10) to balance memory usage
-        (0u8..=20)
-            .map(|layer_id| {
-                let min_size = 1u32 << layer_id;
-                let max_size = 1u32 << (layer_id + 1);
-                let tile_size = 1u32.checked_shl((layer_id + 4) as u32).unwrap_or(1 << 24);
-                let chunk_size = 1u32.checked_shl((layer_id + 12) as u32).unwrap_or(1 << 28);
-                LayerConfig::new(layer_id, min_size, max_size, tile_size, chunk_size)
+        // tile_size(k) = 16e3 * 2^k
+        //      starting at 16k, a coommon convention.
+        // max_size(k) = tile_size(k) / 8
+        //      this could use adjustment; we want ~2k interval events per tile
+        //      to fit in cpu cache.
+        // min_size(k) = max_size(k-1) = max_size / 2;
+        // chunk_size(k) = 250e6 / threads ~= 2^21
+        //      since rykv can read partial-chunks, we can make them as large as possible
+        //      granted that each thread can get their own.
+        //      we will account for 128 cores.
+        (0u8..=15)
+            .map(|k| {
+                let tile_size = 2u32.pow(14 + k as u32);
+                let max_size = tile_size / 8;
+                let min_size = max_size / 2;
+                let chunk_size = 2u32.pow(21).max(1); // ensure chunk_size is at least 1
+                LayerConfig::new(k, min_size, max_size, tile_size, chunk_size)
             })
             .collect()
     }
@@ -213,10 +224,10 @@ mod tests {
         assert!(!layers.is_empty());
 
         // Check first few layers
-        assert_eq!(layers[0].min_size, 1);
-        assert_eq!(layers[0].max_size, 2);
-        assert_eq!(layers[1].min_size, 2);
-        assert_eq!(layers[1].max_size, 4);
+        assert_eq!(layers[0].tile_size, 16_384);
+        assert!(layers[0].max_size < layers[0].tile_size);
+        assert_eq!(layers[1].tile_size, 32_768);
+        assert_eq!(layers[1].max_size, layers[0].max_size * 2);
     }
 
     #[test]

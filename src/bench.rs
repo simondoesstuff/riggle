@@ -24,7 +24,7 @@ impl Default for BedGenConfig {
     fn default() -> Self {
         Self {
             num_intervals: 10_000,
-            genome_size: 100_000_000, // 100Mb
+            genome_size: 250_000_000, // 100Mb
             min_len: 100,
             max_len: 10_000,
             seed: 42,
@@ -122,7 +122,11 @@ pub struct LayerSizeInfo {
 }
 
 /// Analyze index size and structure
-pub fn analyze_index_size(db_path: &Path, input_path: &Path, total_intervals: usize) -> IndexSizeReport {
+pub fn analyze_index_size(
+    db_path: &Path,
+    input_path: &Path,
+    total_intervals: usize,
+) -> IndexSizeReport {
     let input_size = dir_size(input_path);
     let index_size = dir_size(db_path);
 
@@ -142,7 +146,11 @@ pub fn analyze_index_size(db_path: &Path, input_path: &Path, total_intervals: us
                 layer_id,
                 size_bytes: size,
                 num_chunks: chunk_count,
-                avg_chunk_bytes: if chunk_count > 0 { size as f64 / chunk_count as f64 } else { 0.0 },
+                avg_chunk_bytes: if chunk_count > 0 {
+                    size as f64 / chunk_count as f64
+                } else {
+                    0.0
+                },
             });
         }
     }
@@ -221,11 +229,7 @@ impl TimingResult {
 
         println!(
             "{:20} | {:>12} elements | {:>8.3}s | {:>8.2} {}elem/s",
-            self.operation,
-            self.total_elements,
-            self.duration_secs,
-            throughput,
-            unit
+            self.operation, self.total_elements, self.duration_secs, throughput, unit
         );
     }
 }
