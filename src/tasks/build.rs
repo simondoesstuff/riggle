@@ -94,14 +94,16 @@ fn find_bed_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
 }
 
 /// Parse BED files, update header metadata, and return intervals grouped by shard
+///
+/// Performance: File parsing is parallelized using Rayon.
 fn ingest_bed_files(
     bed_files: Vec<PathBuf>,
     start_sid: u32,
     header: &mut MasterHeader,
 ) -> Result<HashMap<String, Vec<TaggedInterval>>, BuildError> {
-    // Parse all files first to collect intervals grouped by shard
+    // Parse all files in parallel to collect intervals grouped by shard
     let parsed_files: Vec<(u32, PathBuf, HashMap<String, Vec<TaggedInterval>>)> = bed_files
-        .into_iter()
+        .into_par_iter()
         .enumerate()
         .map(|(idx, bed_path)| {
             let sid = start_sid + idx as u32;
@@ -187,20 +189,20 @@ fn flush_shard_to_disk(
 }
 
 /// Partition intervals by shard, layer, and write chunks to disk
+///
+/// Performance: Shards are processed in parallel using Rayon.
 fn flush_intervals_to_disk(
     shard_intervals: &HashMap<String, Vec<TaggedInterval>>,
     header: &MasterHeader,
     output_dir: &Path,
 ) -> Result<(), BuildError> {
-    // Process each shard (could parallelize at this level too if desired)
-    for (shard, intervals) in shard_intervals {
-        if intervals.is_empty() {
-            continue;
-        }
-        flush_shard_to_disk(shard, intervals, header, output_dir)?;
-    }
-
-    Ok(())
+    // Process each shard in parallel
+    shard_intervals
+        .par_iter()
+        .filter(|(_, intervals)| !intervals.is_empty())
+        .try_for_each(|(shard, intervals)| {
+            flush_shard_to_disk(shard, intervals, header, output_dir)
+        })
 }
 
 // =============================================================================
