@@ -18,6 +18,7 @@ sprs = "0.11.4"
 thiserror = "2.0"
 voracious_radix_sort = "1.2.0"
 wide = "0.7.33"
+flate2 = "1.1.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

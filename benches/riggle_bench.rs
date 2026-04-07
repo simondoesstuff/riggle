@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use riggle::bench::{
@@ -23,10 +23,10 @@ fn bench_build(c: &mut Criterion) {
 
     // Test configurations: (num_files, intervals_per_file)
     let configs = [
-        (5, 1_000),     // 5k intervals
-        (10, 5_000),    // 50k intervals
-        (20, 10_000),   // 200k intervals
-        (50, 20_000),   // 1M intervals
+        (5, 1_000),   // 5k intervals
+        (10, 5_000),  // 50k intervals
+        (20, 10_000), // 200k intervals
+        (50, 20_000), // 1M intervals
     ];
 
     for (num_files, intervals_per_file) in configs {
@@ -41,7 +41,15 @@ fn bench_build(c: &mut Criterion) {
                     || {
                         let input_dir = TempDir::new().unwrap();
                         let db_dir = TempDir::new().unwrap();
-                        generate_bed_files_parallel(input_dir.path(), nf, ipf, 100, 10_000, 42);
+                        generate_bed_files_parallel(
+                            input_dir.path(),
+                            nf,
+                            ipf,
+                            100,
+                            10_000,
+                            42,
+                            false,
+                        );
                         (input_dir, db_dir)
                     },
                     |(input_dir, db_dir)| {
@@ -68,11 +76,9 @@ fn bench_query(c: &mut Criterion) {
     let db_dir = TempDir::new().unwrap();
 
     // 20 source files with 10k intervals each = 200k total database intervals
-    generate_bed_files_parallel(input_dir.path(), 20, 10_000, 100, 10_000, 42);
-    let build_config = BuildConfig::new(
-        input_dir.path().to_path_buf(),
-        db_dir.path().to_path_buf(),
-    );
+    generate_bed_files_parallel(input_dir.path(), 20, 10_000, 100, 10_000, 42, false);
+    let build_config =
+        BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
     build_database(&build_config).unwrap();
 
     // Test various query sizes
@@ -97,10 +103,7 @@ fn bench_query(c: &mut Criterion) {
                         (query_dir, query_path)
                     },
                     |(_query_dir, query_path)| {
-                        let config = QueryConfig::new(
-                            db_dir.path().to_path_buf(),
-                            query_path,
-                        );
+                        let config = QueryConfig::new(db_dir.path().to_path_buf(), query_path);
                         query_database(&config).unwrap();
                     },
                 );
@@ -127,7 +130,7 @@ fn bench_interval_sizes(c: &mut Criterion) {
         let input_dir = TempDir::new().unwrap();
 
         // Generate 10 files with 5k intervals each (parallel)
-        generate_bed_files_parallel(input_dir.path(), 10, 5_000, min_len, max_len, 42);
+        generate_bed_files_parallel(input_dir.path(), 10, 5_000, min_len, max_len, 42, false);
 
         group.throughput(Throughput::Elements(50_000));
 
@@ -155,9 +158,9 @@ fn bench_query_scaling(c: &mut Criterion) {
 
     // Build databases of increasing size
     let db_sizes = [
-        (10, 5_000),   // 50k intervals
-        (20, 10_000),  // 200k intervals
-        (50, 10_000),  // 500k intervals
+        (10, 5_000),  // 50k intervals
+        (20, 10_000), // 200k intervals
+        (50, 10_000), // 500k intervals
     ];
 
     for (num_files, intervals_per_file) in db_sizes {
@@ -165,11 +168,17 @@ fn bench_query_scaling(c: &mut Criterion) {
         let input_dir = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
 
-        generate_bed_files_parallel(input_dir.path(), num_files, intervals_per_file, 100, 10_000, 42);
-        let build_config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            db_dir.path().to_path_buf(),
+        generate_bed_files_parallel(
+            input_dir.path(),
+            num_files,
+            intervals_per_file,
+            100,
+            10_000,
+            42,
+            false,
         );
+        let build_config =
+            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         build_database(&build_config).unwrap();
 
         // Fixed query size
@@ -185,10 +194,7 @@ fn bench_query_scaling(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("db_intervals", total), |b| {
             b.iter(|| {
-                let config = QueryConfig::new(
-                    db_dir.path().to_path_buf(),
-                    query_path.clone(),
-                );
+                let config = QueryConfig::new(db_dir.path().to_path_buf(), query_path.clone());
                 query_database(&config).unwrap();
             });
         });
@@ -218,12 +224,17 @@ fn bench_index_size(c: &mut Criterion) {
         let input_dir = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
 
-        generate_bed_files_parallel(input_dir.path(), num_files, intervals_per_file, min_len, max_len, 42);
-
-        let config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            db_dir.path().to_path_buf(),
+        generate_bed_files_parallel(
+            input_dir.path(),
+            num_files,
+            intervals_per_file,
+            min_len,
+            max_len,
+            42,
+            false,
         );
+
+        let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
         build_database(&config).unwrap();
 
         let report = analyze_index_size(db_dir.path(), input_dir.path(), total_intervals);
