@@ -8,8 +8,16 @@ use std::path::Path;
 use std::process::Command;
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+
+/// Standard human chromosomes for random selection
+const CHROMOSOMES: &[&str] = &[
+    "chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
+    "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19",
+    "chr20", "chr21", "chr22", "chrX", "chrY",
+];
 
 /// Configuration for synthetic BED file generation
 #[derive(Debug, Clone)]
@@ -58,10 +66,11 @@ pub fn generate_bed_file(path: &Path, config: &BedGenConfig) {
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
     for _ in 0..config.num_intervals {
+        let chrom = CHROMOSOMES.choose(&mut rng).unwrap();
         let len = rng.gen_range(config.min_len..=config.max_len);
         let start = rng.gen_range(0..config.genome_size.saturating_sub(len));
         let end = start + len;
-        writeln!(writer, "chr1\t{}\t{}", start, end).unwrap();
+        writeln!(writer, "{}\t{}\t{}", chrom, start, end).unwrap();
     }
     writer.flush().unwrap();
 }
