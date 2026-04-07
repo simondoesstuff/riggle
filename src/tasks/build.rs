@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use thiserror::Error;
-use tqdm::{Style, tqdm};
 use voracious_radix_sort::RadixSort;
 
 use crate::core::{ChunkID, Interval, LayerID, TaggedInterval};
@@ -117,9 +116,7 @@ fn ingest_bed_files(
     let mut all_shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
 
     // Process each file's intervals
-    for (sid, bed_path, shard_intervals) in
-        tqdm(parsed_files.into_iter()).style(Style::Balloon).desc(Some("Aggregating intervals"))
-    {
+    for (sid, bed_path, shard_intervals) in parsed_files {
         // Compute metadata across all shards for this file
         let interval_count: u32 = shard_intervals.values().map(|v| v.len() as u32).sum();
         let total_bases: u64 = shard_intervals
@@ -199,16 +196,13 @@ fn flush_intervals_to_disk(
     header: &MasterHeader,
     output_dir: &Path,
 ) -> Result<(), BuildError> {
-    // Process each shard sequentially with a progress bar (internal chunking is still parallel)
-    for (shard, intervals) in tqdm(shard_intervals.iter())
-        .style(Style::Balloon)
-        .desc(Some("Flushing shards to disk"))
-    {
-        if !intervals.is_empty() {
-            flush_shard_to_disk(shard, intervals, header, output_dir)?;
-        }
-    }
-    Ok(())
+    // Process each shard in parallel
+    shard_intervals
+        .par_iter()
+        .filter(|(_, intervals)| !intervals.is_empty())
+        .try_for_each(|(shard, intervals)| {
+            flush_shard_to_disk(shard, intervals, header, output_dir)
+        })
 }
 
 // =============================================================================

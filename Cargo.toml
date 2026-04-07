@@ -8,6 +8,7 @@ bitvec = "1.0.1"
 rand = "0.8"
 tempfile = "3.10"
 clap = { version = "4.6.0", features = ["derive"] }
+indicatif = "0.18.4"
 memmap2 = "0.9"
 rayon = "1.11.0"
 rkyv = "0.8.15"
@@ -18,7 +19,6 @@ thiserror = "2.0"
 voracious_radix_sort = "1.2.0"
 wide = "0.7.33"
 flate2 = "1.1.9"
-tqdm = "0.8.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

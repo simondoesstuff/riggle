@@ -1,7 +1,8 @@
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::PathBuf;
-use tqdm::{Style, tqdm};
+use std::time::Duration;
 
 use riggle::bench::{BedGenConfig, TimingResult, generate_bed_file, generate_bed_files_parallel};
 
@@ -48,6 +49,15 @@ fn main() {
 
     println!("Starting BED file generation...");
 
+    // Set up the indicatif spinner
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(120));
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✔"]),
+    );
+
     if cli.num_files == 1 {
         // Single file generation
         if let Some(parent) = cli.output.parent() {
@@ -64,16 +74,13 @@ fn main() {
             seed: cli.seed,
         };
 
+        pb.set_message(format!("Generating single BED file at {:?}...", cli.output));
         let start = std::time::Instant::now();
 
-        for _ in tqdm(0..1)
-            .style(Style::Balloon)
-            .desc(Some(format!("Generating BED file: {:?}", cli.output)))
-        {
-            generate_bed_file(&cli.output, &config);
-        }
+        generate_bed_file(&cli.output, &config);
 
         let duration = start.elapsed().as_secs_f64();
+        pb.finish_and_clear(); // Remove the spinner once done
 
         println!("Successfully generated 1 file at: {:?}", cli.output);
         let timing = TimingResult::new("generate_single_bed", cli.num_intervals, duration);
@@ -82,27 +89,24 @@ fn main() {
         // Parallel generation
         fs::create_dir_all(&cli.output).expect("Failed to create output directory");
 
+        pb.set_message(format!(
+            "Generating {} files in parallel to {:?}...",
+            cli.num_files, cli.output
+        ));
         let start = std::time::Instant::now();
 
-        for _ in tqdm(0..1)
-            .style(Style::Balloon)
-            .desc(Some(format!(
-                "Generating {} files in parallel to {:?}",
-                cli.num_files, cli.output
-            )))
-        {
-            generate_bed_files_parallel(
-                &cli.output,
-                cli.num_files,
-                cli.num_intervals,
-                cli.min_len,
-                cli.max_len,
-                cli.seed,
-                cli.compress,
-            );
-        }
+        generate_bed_files_parallel(
+            &cli.output,
+            cli.num_files,
+            cli.num_intervals,
+            cli.min_len,
+            cli.max_len,
+            cli.seed,
+            cli.compress,
+        );
 
         let duration = start.elapsed().as_secs_f64();
+        pb.finish_and_clear(); // Remove the spinner once done
 
         let total_intervals = cli.num_files * cli.num_intervals;
         println!(
