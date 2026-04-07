@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+use crate::core::{
+    BASE_TILE_SIZE_LOG2, CHUNK_SIZE_LOG2, NUM_LAYERS, TILE_MAX_INTERVAL_RATIO_LOG2,
+};
+
 /// Metadata for a source ID (database entry)
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, SerdeDeserialize)]
 pub struct SidMetadata {
@@ -64,29 +68,25 @@ impl LayerConfig {
         }
     }
 
-    /// Create default layer configurations for a given maximum coordinate
-    /// Layers are based on powers of 2, with tile/chunk sizes scaled accordingly
+    /// Create default layer configurations using centralized constants
+    ///
+    /// Derives all layer parameters from constants in `crate::core`:
+    /// - tile_size[k] = 2^(BASE_TILE_SIZE_LOG2 + k)
+    /// - max_size[k] = tile_size[k] / 2^TILE_MAX_INTERVAL_RATIO_LOG2
+    /// - min_size[k] = max_size[k-1] (0 for layer 0)
+    /// - chunk_size = 2^CHUNK_SIZE_LOG2
     ///
     /// Key invariant: tile_size > max_interval_size for each layer.
     /// This guarantees no interval can span an entire tile, eliminating the need
     /// for running_counts in tiles.
     pub fn default_layers() -> Vec<LayerConfig> {
-        // tile_size(k) = 16e3 * 2^k
-        //      starting at 16k, a coommon convention.
-        // max_size(k) = tile_size(k) / 8
-        //      this could use adjustment; we want ~2k interval events per tile
-        //      to fit in cpu cache.
-        // min_size(k) = max_size(k-1) = max_size / 2;
-        // chunk_size(k) = 250e6 / threads ~= 2^21
-        //      since rykv can read partial-chunks, we can make them as large as possible
-        //      granted that each thread can get their own.
-        //      we will account for 128 cores.
-        (0u8..=15)
+        (0..NUM_LAYERS)
             .map(|k| {
-                let tile_size = 2u32.pow(14 + k as u32);
-                let max_size = tile_size / 8;
-                let min_size = max_size / 2;
-                let chunk_size = 2u32.pow(21).max(1); // ensure chunk_size is at least 1
+                let tile_size = 1u32 << (BASE_TILE_SIZE_LOG2 + k as u32);
+                let max_size = tile_size >> TILE_MAX_INTERVAL_RATIO_LOG2;
+                // min_size = max_size[k-1] for continuity; layer 0 handles all small intervals
+                let min_size = if k == 0 { 0 } else { max_size >> 1 };
+                let chunk_size = 1u32 << CHUNK_SIZE_LOG2;
                 LayerConfig::new(k, min_size, max_size, tile_size, chunk_size)
             })
             .collect()

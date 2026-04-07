@@ -1,6 +1,34 @@
 use rkyv::{Archive, Deserialize, Serialize};
 use voracious_radix_sort::Radixable;
 
+// =============================================================================
+// Centralized Layer Configuration Constants
+// =============================================================================
+// These define the hierarchical tiling structure. All layer computations
+// should derive from these constants to ensure consistency.
+
+/// Base tile size for layer 0: 2^14 = 16,384 bp (common convention)
+pub const BASE_TILE_SIZE_LOG2: u32 = 14;
+
+/// Ratio of tile_size to max_interval_size: 2^3 = 8
+/// Ensures no interval can span an entire tile, eliminating running_counts
+pub const TILE_MAX_INTERVAL_RATIO_LOG2: u32 = 3;
+
+/// Number of layers (0..NUM_LAYERS)
+pub const NUM_LAYERS: u8 = 16;
+
+/// Chunk size (coordinate span): 2^21 = 2,097,152 bp (~2MB)
+/// Sized for good parallelism across 128 cores
+pub const CHUNK_SIZE_LOG2: u32 = 21;
+
+/// Derived: log2 of max interval size for layer 0
+/// max_size[0] = tile_size[0] / ratio = 2^14 / 2^3 = 2^11 = 2048
+pub const LAYER_0_MAX_SIZE_LOG2: u32 = BASE_TILE_SIZE_LOG2 - TILE_MAX_INTERVAL_RATIO_LOG2;
+
+/// Derived: shift value for layer ID computation from interval length
+/// For length `len`, layer = max(0, floor(log2(len)) - LAYER_SHIFT)
+pub const LAYER_SHIFT: u32 = LAYER_0_MAX_SIZE_LOG2 - 1;
+
 /// Basic interval representation with half-open coordinates [start, end)
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Archive, Serialize, Deserialize,
@@ -77,12 +105,20 @@ pub struct LayerID(pub u8);
 
 impl LayerID {
     /// Compute layer ID from interval length
+    ///
+    /// Maps interval length to the appropriate layer based on centralized constants.
+    /// Layer k handles intervals with length in [max_size[k-1], max_size[k])
+    /// where max_size[k] = 2^(LAYER_0_MAX_SIZE_LOG2 + k).
+    ///
+    /// Formula: layer = clamp(floor(log2(len)) - LAYER_SHIFT, 0, NUM_LAYERS-1)
     pub fn from_length(len: u32) -> Self {
         if len == 0 {
             LayerID(0)
         } else {
-            // floor(log2(x))
-            LayerID((32 - len.leading_zeros() - 1) as u8)
+            // floor(log2(len)) = 31 - leading_zeros for non-zero values
+            let log2_len = 31 - len.leading_zeros();
+            let layer = log2_len.saturating_sub(LAYER_SHIFT);
+            LayerID(layer.min(NUM_LAYERS as u32 - 1) as u8)
         }
     }
 }
@@ -233,11 +269,27 @@ mod tests {
 
     #[test]
     fn test_layer_id_from_length() {
+        // With LAYER_SHIFT = 10, layer = max(0, floor(log2(len)) - 10)
+        // Layer 0 handles intervals with length < 2048 (2^11)
+        assert_eq!(LayerID::from_length(0), LayerID(0));
         assert_eq!(LayerID::from_length(1), LayerID(0));
-        assert_eq!(LayerID::from_length(2), LayerID(1));
-        assert_eq!(LayerID::from_length(3), LayerID(1));
-        assert_eq!(LayerID::from_length(4), LayerID(2));
-        assert_eq!(LayerID::from_length(1024), LayerID(10));
+        assert_eq!(LayerID::from_length(1024), LayerID(0)); // log2(1024)=10, 10-10=0
+        assert_eq!(LayerID::from_length(2047), LayerID(0)); // log2(2047)=10, 10-10=0
+
+        // Layer 1 handles [2048, 4096)
+        assert_eq!(LayerID::from_length(2048), LayerID(1)); // log2(2048)=11, 11-10=1
+        assert_eq!(LayerID::from_length(4095), LayerID(1)); // log2(4095)=11, 11-10=1
+
+        // Layer 2 handles [4096, 8192)
+        assert_eq!(LayerID::from_length(4096), LayerID(2)); // log2(4096)=12, 12-10=2
+        assert_eq!(LayerID::from_length(8191), LayerID(2));
+
+        // Higher layers
+        assert_eq!(LayerID::from_length(1 << 20), LayerID(10)); // 1M -> layer 10
+        assert_eq!(LayerID::from_length(1 << 25), LayerID(15)); // 32M -> layer 15 (max)
+
+        // Values beyond max layer are clamped to NUM_LAYERS-1
+        assert_eq!(LayerID::from_length(u32::MAX), LayerID(NUM_LAYERS - 1));
     }
 
     #[test]
