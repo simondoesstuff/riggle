@@ -172,6 +172,7 @@ fn run_build_benchmark(
         min_len,
         max_len,
         42,
+        false,
     );
     let gen_time = gen_start.elapsed();
     TimingResult::new("Data generation", total_intervals, gen_time.as_secs_f64()).print();
@@ -287,6 +288,7 @@ fn run_size_analysis(
         min_len,
         max_len,
         42,
+        false,
     );
     println!("done");
 
@@ -341,6 +343,7 @@ fn run_full_suite(scale: usize) {
             min_len,
             max_len,
             42,
+            false,
         );
 
         // Build
@@ -369,7 +372,15 @@ fn run_full_suite(scale: usize) {
     // Build a reference database
     let input_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
-    generate_bed_files_parallel(input_dir.path(), 100, base_intervals / 100, 100, 10_000, 42);
+    generate_bed_files_parallel(
+        input_dir.path(),
+        100,
+        base_intervals / 100,
+        100,
+        10_000,
+        42,
+        false,
+    );
     let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
     build_database(&config).unwrap();
 

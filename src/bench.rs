@@ -5,6 +5,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::process::Command;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -73,6 +74,7 @@ pub fn generate_bed_files_parallel(
     min_len: u32,
     max_len: u32,
     base_seed: u64,
+    bgzip: bool,
 ) {
     (0..num_files).into_par_iter().for_each(|i| {
         let path = dir.join(format!("source_{}.bed", i));
@@ -81,6 +83,13 @@ pub fn generate_bed_files_parallel(
             .with_size_range(min_len, max_len)
             .with_seed(base_seed + i as u64);
         generate_bed_file(&path, &config);
+
+        if bgzip {
+            let status = Command::new("bgzip").arg("-f").arg(&path).status().unwrap();
+            if !status.success() {
+                panic!("bgzip failed for file: {:?}", path);
+            }
+        }
     });
 }
 
