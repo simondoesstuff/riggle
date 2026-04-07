@@ -463,19 +463,21 @@ mod tests {
 
     #[test]
     fn test_partition_by_layer() {
+        // With centralized constants: layer = max(0, floor(log2(len)) - 10)
+        // Layer 0: len < 2048, Layer 1: [2048, 4096), Layer 2: [4096, 8192), etc.
         let intervals = vec![
-            TaggedInterval::new(0, 10, 0),   // length 10, layer 3
-            TaggedInterval::new(0, 100, 1),  // length 100, layer 6
-            TaggedInterval::new(0, 1000, 2), // length 1000, layer 9
+            TaggedInterval::new(0, 1000, 0),  // length 1000 -> layer 0
+            TaggedInterval::new(0, 3000, 1),  // length 3000 -> layer 1 (2048 <= 3000 < 4096)
+            TaggedInterval::new(0, 5000, 2),  // length 5000 -> layer 2 (4096 <= 5000 < 8192)
         ];
 
         let layers = LayerConfig::default_layers();
         let partitions = partition_by_layer(&intervals, &layers);
 
         // Check intervals are in correct layers
-        assert!(partitions[3].iter().any(|iv| iv.sid == 0));
-        assert!(partitions[6].iter().any(|iv| iv.sid == 1));
-        assert!(partitions[9].iter().any(|iv| iv.sid == 2));
+        assert!(partitions[0].iter().any(|iv| iv.sid == 0));
+        assert!(partitions[1].iter().any(|iv| iv.sid == 1));
+        assert!(partitions[2].iter().any(|iv| iv.sid == 2));
     }
 
     #[test]
