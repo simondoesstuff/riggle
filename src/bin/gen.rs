@@ -41,6 +41,10 @@ pub struct Cli {
     /// Compress using bgzip
     #[arg(short, long, default_value_t = false)]
     pub compress: bool,
+
+    /// Sort output by chromosome and start position
+    #[arg(long, default_value_t = false)]
+    pub sort: bool,
 }
 
 fn main() {
@@ -72,6 +76,7 @@ fn main() {
             min_len: cli.min_len,
             max_len: cli.max_len,
             seed: cli.seed,
+            sort: cli.sort,
         };
 
         pb.set_message(format!("Generating single BED file at {:?}...", cli.output));
@@ -103,6 +108,7 @@ fn main() {
             cli.max_len,
             cli.seed,
             cli.compress,
+            cli.sort,
         );
 
         let duration = start.elapsed().as_secs_f64();

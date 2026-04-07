@@ -173,6 +173,7 @@ fn run_build_benchmark(
         max_len,
         42,
         false,
+        false,
     );
     let gen_time = gen_start.elapsed();
     TimingResult::new("Data generation", total_intervals, gen_time.as_secs_f64()).print();
@@ -289,6 +290,7 @@ fn run_size_analysis(
         max_len,
         42,
         false,
+        false,
     );
     println!("done");
 
@@ -344,6 +346,7 @@ fn run_full_suite(scale: usize) {
             max_len,
             42,
             false,
+            false,
         );
 
         // Build
@@ -379,6 +382,7 @@ fn run_full_suite(scale: usize) {
         100,
         10_000,
         42,
+        false,
         false,
     );
     let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
