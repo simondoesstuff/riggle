@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use thiserror::Error;
-use tqdm::{Style, tqdm};
 
 use crate::core::TaggedInterval;
 use crate::io::{BedParseError, MappedChunk, MasterHeader, parse_bed_file};
@@ -131,10 +130,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let mut all_sparse_matrices: Vec<SparseMatrix> = Vec::new();
 
     // Process each shard that exists in both query and database
-    for (shard, shard_queries) in tqdm(parsed.shard_intervals.into_iter())
-        .style(Style::Balloon)
-        .desc(Some("Processing shards"))
-    {
+    for (shard, shard_queries) in &parsed.shard_intervals {
         // Skip if shard doesn't exist in database
         if !db_shards.contains(shard.as_str()) {
             continue;
@@ -151,7 +147,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         // Compute which chunks to query for this shard
         let chunk_tasks = compute_chunk_tasks_for_shard(
             &config.db_path,
-            &shard,
+            shard,
             &indexed_queries,
             &master_header,
         );

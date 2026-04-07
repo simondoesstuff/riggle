@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use tqdm::{Style, tqdm};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use riggle::io::MasterHeader;
 use riggle::stats::compute_statistics;
@@ -92,35 +92,40 @@ fn main() {
 }
 
 fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Adding files to database...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let config = AddConfig::new(input, db.clone());
-    let mut added_count = 0;
+    let added_count = add_to_database(&config)?;
 
-    for _ in tqdm(0..1)
-        .style(Style::Balloon)
-        .desc(Some("Adding files to database"))
-    {
-        added_count = add_to_database(&config)?;
-    }
-
-    println!(
+    pb.finish_with_message(format!(
         "Added {} source(s) to database at {}",
         added_count,
         db.display()
-    );
+    ));
     Ok(())
 }
 
 fn run_build(input: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Building database...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let config = BuildConfig::new(input, output.clone());
+    build_database(&config)?;
 
-    for _ in tqdm(0..1)
-        .style(Style::Balloon)
-        .desc(Some("Building database"))
-    {
-        build_database(&config)?;
-    }
-
-    println!("Database built at {}", output.display());
+    pb.finish_with_message(format!("Database built at {}", output.display()));
     Ok(())
 }
 
@@ -130,56 +135,46 @@ fn run_query(
     output: PathBuf,
     genome_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Querying database...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let config = QueryConfig::new(db.clone(), query);
-    let mut result = None;
+    let result = query_database(&config)?;
 
-    for _ in tqdm(0..1)
-        .style(Style::Balloon)
-        .desc(Some("Querying database"))
-    {
-        result = Some(query_database(&config)?);
-    }
-    let result = result.unwrap();
+    pb.set_message("Computing statistics...");
 
-    let mut stats = None;
+    // Load master header for database sizes
+    let header_path = db.join("header.json");
+    let header_content = fs::read_to_string(&header_path)?;
+    let master_header: MasterHeader = serde_json::from_str(&header_content)?;
 
-    for _ in tqdm(0..1)
-        .style(Style::Balloon)
-        .desc(Some("Computing statistics"))
-    {
-        // Load master header for database sizes
-        let header_path = db.join("header.json");
-        let header_content = fs::read_to_string(&header_path)?;
-        let master_header: MasterHeader = serde_json::from_str(&header_content)?;
+    // Compute query sizes (assuming uniform for now - could be improved)
+    let query_sizes: Vec<u64> = vec![1000; result.counts.rows()]; // Placeholder
 
-        // Compute query sizes (assuming uniform for now - could be improved)
-        let query_sizes: Vec<u64> = vec![1000; result.counts.rows()]; // Placeholder
+    // Get database sizes
+    let db_sizes: HashMap<u32, u64> = master_header
+        .sid_map
+        .iter()
+        .map(|(k, v)| (*k, v.total_bases))
+        .collect();
 
-        // Get database sizes
-        let db_sizes: HashMap<u32, u64> = master_header
-            .sid_map
-            .iter()
-            .map(|(k, v)| (*k, v.total_bases))
-            .collect();
-
-        stats = Some(compute_statistics(
-            &result.counts,
-            &query_sizes,
-            &db_sizes,
-            genome_size,
-        ));
-    }
-    let stats = stats.unwrap();
+    let stats = compute_statistics(&result.counts, &query_sizes, &db_sizes, genome_size);
 
     // Write results
     let json = stats.to_json()?;
     fs::write(&output, json)?;
 
-    println!(
+    pb.finish_with_message(format!(
         "Results written to {} ({} significant pairs)",
         output.display(),
         stats.results.len()
-    );
+    ));
 
     Ok(())
 }
