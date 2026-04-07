@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::core::TaggedInterval;
-use crate::io::{BedParseError, MappedChunk, MasterHeader, parse_bed_file};
+use crate::io::{BedParseError, MappedChunk, MasterHeader, is_bed_file, parse_bed_file};
 use crate::matrix::{
     BitwiseMask, DenseMatrix, SparseMatrix, condense_to_sparse, merge_sparse, zero_flagged_regions,
 };
@@ -206,7 +206,7 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
         fs::read_dir(path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
+            .filter(|p| is_bed_file(p))
             .collect()
     } else {
         vec![path.to_path_buf()]
