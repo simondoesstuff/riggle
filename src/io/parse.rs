@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use flate2::read::MultiGzDecoder;
 use thiserror::Error;
 
 use crate::core::TaggedInterval;
@@ -121,6 +123,7 @@ fn parse_bed_line<'a>(
 /// Parse a BED file into intervals grouped by shard
 ///
 /// Features:
+/// - Automatically infers and decompresses .gz files based on extension
 /// - Skips comment lines (starting with #)
 /// - Skips empty or whitespace-only lines
 /// - Flexible column detection: first non-integer = shard, first two integers = coords
@@ -129,9 +132,23 @@ fn parse_bed_line<'a>(
 ///
 /// Performance: Only allocates a String once per unique shard (~24 for human genome)
 /// instead of once per line (millions of allocations avoided).
-pub fn parse_bed_file(path: &Path, sid: u32) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
+pub fn parse_bed_file(
+    path: &Path,
+    sid: u32,
+) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+
+    // Check if the file extension is .gz
+    let is_gzipped = path.extension().and_then(OsStr::to_str) == Some("gz");
+
+    // Use Box<dyn BufRead> to dynamically dispatch the reader type
+    // This allows us to use the same iteration logic below
+    let reader: Box<dyn BufRead> = if is_gzipped {
+        Box::new(BufReader::new(MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+
     let mut shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
 
     for (line_idx, line_result) in reader.lines().enumerate() {
@@ -156,7 +173,10 @@ pub fn parse_bed_file(path: &Path, sid: u32) -> Result<HashMap<String, Vec<Tagge
 /// Returns intervals grouped by shard
 ///
 /// Performance: Only allocates a String once per unique shard.
-pub fn parse_bed_string(content: &str, sid: u32) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
+pub fn parse_bed_string(
+    content: &str,
+    sid: u32,
+) -> Result<HashMap<String, Vec<TaggedInterval>>, BedParseError> {
     let mut shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
 
     for (line_idx, line) in content.lines().enumerate() {
@@ -179,7 +199,10 @@ pub fn parse_bed_string(content: &str, sid: u32) -> Result<HashMap<String, Vec<T
 /// Parse BED data from a string, returning a flat vector of intervals (ignores shard)
 /// This is a convenience function for tests that don't need shard information
 #[cfg(test)]
-pub fn parse_bed_string_flat(content: &str, sid: u32) -> Result<Vec<TaggedInterval>, BedParseError> {
+pub fn parse_bed_string_flat(
+    content: &str,
+    sid: u32,
+) -> Result<Vec<TaggedInterval>, BedParseError> {
     let shards = parse_bed_string(content, sid)?;
     Ok(shards.into_values().flatten().collect())
 }
