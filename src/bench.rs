@@ -27,6 +27,7 @@ pub struct BedGenConfig {
     pub min_len: u32,
     pub max_len: u32,
     pub seed: u64,
+    pub sort: bool,
 }
 
 impl Default for BedGenConfig {
@@ -37,6 +38,7 @@ impl Default for BedGenConfig {
             min_len: 100,
             max_len: 10_000,
             seed: 42,
+            sort: false,
         }
     }
 }
@@ -57,6 +59,11 @@ impl BedGenConfig {
         self.seed = seed;
         self
     }
+
+    pub fn with_sort(mut self, sort: bool) -> Self {
+        self.sort = sort;
+        self
+    }
 }
 
 /// Generate a synthetic BED file with random intervals
@@ -65,12 +72,28 @@ pub fn generate_bed_file(path: &Path, config: &BedGenConfig) {
     let file = File::create(path).unwrap();
     let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
-    for _ in 0..config.num_intervals {
-        let chrom = CHROMOSOMES.choose(&mut rng).unwrap();
-        let len = rng.gen_range(config.min_len..=config.max_len);
-        let start = rng.gen_range(0..config.genome_size.saturating_sub(len));
-        let end = start + len;
-        writeln!(writer, "{}\t{}\t{}", chrom, start, end).unwrap();
+    if config.sort {
+        // Collect intervals, sort by (chrom, start), then write
+        let mut intervals: Vec<(&str, u32, u32)> = Vec::with_capacity(config.num_intervals);
+        for _ in 0..config.num_intervals {
+            let chrom = CHROMOSOMES.choose(&mut rng).unwrap();
+            let len = rng.gen_range(config.min_len..=config.max_len);
+            let start = rng.gen_range(0..config.genome_size.saturating_sub(len));
+            let end = start + len;
+            intervals.push((chrom, start, end));
+        }
+        intervals.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+        for (chrom, start, end) in intervals {
+            writeln!(writer, "{}\t{}\t{}", chrom, start, end).unwrap();
+        }
+    } else {
+        for _ in 0..config.num_intervals {
+            let chrom = CHROMOSOMES.choose(&mut rng).unwrap();
+            let len = rng.gen_range(config.min_len..=config.max_len);
+            let start = rng.gen_range(0..config.genome_size.saturating_sub(len));
+            let end = start + len;
+            writeln!(writer, "{}\t{}\t{}", chrom, start, end).unwrap();
+        }
     }
     writer.flush().unwrap();
 }
@@ -84,13 +107,15 @@ pub fn generate_bed_files_parallel(
     max_len: u32,
     base_seed: u64,
     bgzip: bool,
+    sort: bool,
 ) {
     (0..num_files).into_par_iter().for_each(|i| {
         let path = dir.join(format!("source_{}.bed", i));
         let config = BedGenConfig::default()
             .with_intervals(intervals_per_file)
             .with_size_range(min_len, max_len)
-            .with_seed(base_seed + i as u64);
+            .with_seed(base_seed + i as u64)
+            .with_sort(sort);
         generate_bed_file(&path, &config);
 
         if bgzip {
