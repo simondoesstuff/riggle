@@ -9,7 +9,7 @@ use voracious_radix_sort::RadixSort;
 use crate::core::{ChunkID, Interval, LayerID, TaggedInterval};
 use crate::io::{
     BedParseError, ChunkHeader, LayerConfig, MasterHeader, SidMetadata,
-    mmap::MmapError, parse_bed_file, write_chunk,
+    is_bed_file, mmap::MmapError, parse_bed_file, write_chunk,
 };
 use crate::sweep::index_sweep;
 
@@ -83,7 +83,7 @@ fn find_bed_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
     let files: Vec<_> = fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|ext| ext == "bed").unwrap_or(false))
+        .filter(|p| is_bed_file(p))
         .collect();
 
     if files.is_empty() {

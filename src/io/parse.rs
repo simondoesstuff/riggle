@@ -12,6 +12,12 @@ use crate::core::TaggedInterval;
 /// Default shard name when no non-integer column is found
 pub const DEFAULT_SHARD: &str = "default";
 
+/// Check if a path is a BED file (.bed or .bed.gz)
+pub fn is_bed_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.ends_with(".bed") || name.ends_with(".bed.gz")
+}
+
 /// Errors that can occur during BED parsing
 #[derive(Debug, Error)]
 pub enum BedParseError {
