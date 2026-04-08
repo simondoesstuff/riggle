@@ -154,6 +154,7 @@ impl MappedChunk {
     pub fn chunk_id(&self) -> u32 {
         self.header.chunk_id
     }
+
 }
 
 /// Write a chunk to a file
@@ -178,6 +179,175 @@ pub fn write_chunk(path: &Path, header: &ChunkHeader, tiles: &[Tile]) -> Result<
     }
 
     Ok(())
+}
+
+/// Byte size of one archived `TaggedInterval`.
+///
+/// `TaggedInterval` is three `u32` fields (start, end, sid) with no padding —
+/// rkyv archives primitive types at their natural size, so the archived form is
+/// identical in layout and therefore identical in size.  Adding `N` intervals to a
+/// tile grows its serialized byte count by exactly `N * ARCHIVED_INTERVAL_BYTES`.
+const ARCHIVED_INTERVAL_BYTES: usize = std::mem::size_of::<crate::core::TaggedInterval>();
+
+/// Merge new tile data into an existing chunk file in-place.
+///
+/// # Algorithm
+///
+/// Sizes are derived analytically: each additional interval grows the serialized tile
+/// by exactly `ARCHIVED_INTERVAL_BYTES`, so new offsets are computed with no I/O.
+///
+/// After extending the file to the required size, working from the last tile backward
+/// to the first, each tile's old bytes are shifted rightward to their new position via
+/// `copy_within` (memmove semantics), then the old tile is deserialized from that
+/// position, sorted-merged with the corresponding new intervals, and the merged tile
+/// is written back.  Back-to-front ordering ensures each tile's source bytes are
+/// intact when copied.
+///
+/// Finally the header is rewritten with the updated tile offsets (same byte length —
+/// only values change, not the Vec length).
+///
+/// # Errors
+/// Returns an error if the chunk file's tile count does not match `new_tiles`.
+pub fn merge_chunk(path: &Path, new_tiles: &[Tile]) -> Result<(), MmapError> {
+    use memmap2::MmapMut;
+
+    let mapped = MappedChunk::open(path)?;
+    let n_tiles = mapped.num_tiles();
+
+    if n_tiles != new_tiles.len() {
+        return Err(MmapError::InvalidFormat(format!(
+            "tile count mismatch: existing={n_tiles}, new={}",
+            new_tiles.len()
+        )));
+    }
+
+    // Short-circuit when there are no new intervals anywhere.
+    if new_tiles.iter().all(|t| t.is_empty()) {
+        return Ok(());
+    }
+
+    let data_offset = mapped.data_offset;
+    let old_file_len = mapped.mmap.len();
+    let old_header = mapped.header().clone();
+
+    // Compute old and merged tile sizes analytically.
+    // Serialized Tile = fixed base + N * ARCHIVED_INTERVAL_BYTES, so adding M new
+    // intervals grows the tile by exactly M * ARCHIVED_INTERVAL_BYTES.
+    let mut old_sizes: Vec<usize> = Vec::with_capacity(n_tiles);
+    let mut merged_sizes: Vec<usize> = Vec::with_capacity(n_tiles);
+
+    for i in 0..n_tiles {
+        let old_start = data_offset + old_header.tile_offsets[i] as usize;
+        let old_end = if i + 1 < n_tiles {
+            data_offset + old_header.tile_offsets[i + 1] as usize
+        } else {
+            old_file_len
+        };
+        let old_sz = old_end - old_start;
+        old_sizes.push(old_sz);
+        merged_sizes.push(old_sz + new_tiles[i].intervals.len() * ARCHIVED_INTERVAL_BYTES);
+    }
+
+    // Compute new tile offsets (relative to data_offset)
+    let mut new_tile_offsets: Vec<u32> = Vec::with_capacity(n_tiles);
+    let mut cursor = 0u32;
+    for &sz in &merged_sizes {
+        new_tile_offsets.push(cursor);
+        cursor += sz as u32;
+    }
+
+    // Build new header (same structure, only tile_offsets values differ)
+    let mut new_header = old_header.clone();
+    new_header.tile_offsets = new_tile_offsets.clone();
+    let new_header_bytes = rkyv::to_bytes::<RkyvError>(&new_header)
+        .map_err(|e| MmapError::InvalidFormat(format!("header serialize: {e}")))?;
+
+    let old_header_len = data_offset - 4; // 4-byte length prefix not included
+    if new_header_bytes.len() != old_header_len {
+        return Err(MmapError::InvalidFormat(format!(
+            "header size changed: old={old_header_len} new={} (tile count invariant violated)",
+            new_header_bytes.len()
+        )));
+    }
+
+    let new_file_len = data_offset + merged_sizes.iter().sum::<usize>();
+
+    // Drop read-only mmap before resizing
+    drop(mapped);
+
+    // --- Extend file ---
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(path)?;
+        f.set_len(new_file_len as u64)?;
+    }
+
+    // --- Pass 2: shift tiles back-to-front, then overwrite with merged data ---
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+    // Absolute positions
+    let old_abs: Vec<usize> = old_header
+        .tile_offsets
+        .iter()
+        .map(|&off| data_offset + off as usize)
+        .collect();
+    let new_abs: Vec<usize> = new_tile_offsets
+        .iter()
+        .map(|&off| data_offset + off as usize)
+        .collect();
+
+    for i in (0..n_tiles).rev() {
+        let old_start = old_abs[i];
+        let old_sz = old_sizes[i];
+        let new_start = new_abs[i];
+
+        // Shift old bytes rightward to their new position.
+        // copy_within uses memmove semantics, so overlapping ranges are safe.
+        mmap.copy_within(old_start..old_start + old_sz, new_start);
+
+        // Deserialize the (now-shifted) old tile.
+        let old_tile: Tile = {
+            let tile_bytes = &mmap[new_start..new_start + old_sz];
+            let archived = rkyv::access::<ArchivedTile, RkyvError>(tile_bytes)
+                .map_err(|e| MmapError::InvalidFormat(format!("tile access: {e}")))?;
+            rkyv::deserialize::<Tile, RkyvError>(archived)
+                .map_err(|e| MmapError::InvalidFormat(format!("tile deserialize: {e}")))?
+        };
+
+        // Sorted-merge and write merged bytes at the new position.
+        let merged = merge_tile(&old_tile, &new_tiles[i]);
+        let merged_bytes = rkyv::to_bytes::<RkyvError>(&merged)
+            .map_err(|e| MmapError::InvalidFormat(format!("merged tile serialize: {e}")))?;
+        mmap[new_start..new_start + merged_bytes.len()].copy_from_slice(&merged_bytes);
+    }
+
+    // Rewrite header (same offset, same byte length, updated tile_offsets values)
+    mmap[4..4 + new_header_bytes.len()].copy_from_slice(&new_header_bytes);
+
+    mmap.flush()?;
+    Ok(())
+}
+
+/// Sorted merge of two tiles' interval lists (merge-sort style).
+///
+/// Both `old.intervals` and `new_tile.intervals` are sorted by start coordinate.
+/// The result is a new Tile with start_coord from `old` and all intervals merged.
+fn merge_tile(old: &Tile, new_tile: &Tile) -> Tile {
+    let mut out = Tile::new(old.start_coord);
+    let (a, b) = (old.intervals.as_slice(), new_tile.intervals.as_slice());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].iv.start <= b[j].iv.start {
+            out.intervals.push(a[i]);
+            i += 1;
+        } else {
+            out.intervals.push(b[j]);
+            j += 1;
+        }
+    }
+    out.intervals.extend_from_slice(&a[i..]);
+    out.intervals.extend_from_slice(&b[j..]);
+    out
 }
 
 #[cfg(test)]
@@ -229,6 +399,89 @@ mod tests {
         let read_tile1 = mapped.read_tile(1).unwrap();
         assert_eq!(read_tile1.start_coord, 500);
         assert_eq!(read_tile1.intervals.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_chunk_adds_intervals() {
+        use crate::core::TaggedInterval;
+        use crate::sweep::index_sweep;
+
+        // Build an initial chunk: chunk 0 of layer 0, bounds [0, 1000), tile_size 500
+        let chunk_bounds = crate::core::Interval::new(0, 1000);
+        let tile_size = 500u32;
+
+        let initial_intervals = vec![TaggedInterval::new(100, 200, 0)];
+        let initial_tiles = index_sweep(chunk_bounds, tile_size, &initial_intervals);
+
+        let mut header = ChunkHeader::new(0, 0, 0, 1000);
+        let mut offset = 0u32;
+        for tile in &initial_tiles {
+            header.tile_offsets.push(offset);
+            let b = rkyv::to_bytes::<RkyvError>(tile).unwrap();
+            offset += b.len() as u32;
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        write_chunk(file.path(), &header, &initial_tiles).unwrap();
+
+        // Merge new intervals (sid=1, different tile than sid=0)
+        let new_intervals = vec![TaggedInterval::new(600, 700, 1)];
+        let new_tiles = index_sweep(chunk_bounds, tile_size, &new_intervals);
+        merge_chunk(file.path(), &new_tiles).unwrap();
+
+        // Verify: tile 0 has sid=0 interval, tile 1 has sid=1 interval
+        let mapped = MappedChunk::open(file.path()).unwrap();
+        assert_eq!(mapped.num_tiles(), 2);
+
+        let t0 = mapped.read_tile(0).unwrap();
+        assert_eq!(t0.intervals.len(), 1);
+        assert_eq!(t0.intervals[0].sid, 0);
+
+        let t1 = mapped.read_tile(1).unwrap();
+        assert_eq!(t1.intervals.len(), 1);
+        assert_eq!(t1.intervals[0].sid, 1);
+    }
+
+    #[test]
+    fn test_merge_chunk_sorted_merge() {
+        use crate::core::TaggedInterval;
+        use crate::sweep::index_sweep;
+
+        let chunk_bounds = crate::core::Interval::new(0, 1000);
+        let tile_size = 1000u32; // single tile
+
+        // Initial: one interval at 200–300
+        let initial = vec![TaggedInterval::new(200, 300, 0)];
+        let initial_tiles = index_sweep(chunk_bounds, tile_size, &initial);
+
+        let mut header = ChunkHeader::new(0, 0, 0, 1000);
+        let mut offset = 0u32;
+        for tile in &initial_tiles {
+            header.tile_offsets.push(offset);
+            let b = rkyv::to_bytes::<RkyvError>(tile).unwrap();
+            offset += b.len() as u32;
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        write_chunk(file.path(), &header, &initial_tiles).unwrap();
+
+        // Merge: two new intervals interleaved with the existing one
+        let new_intervals = vec![
+            TaggedInterval::new(100, 150, 1), // before existing
+            TaggedInterval::new(400, 500, 2), // after existing
+        ];
+        let new_tiles = index_sweep(chunk_bounds, tile_size, &new_intervals);
+        merge_chunk(file.path(), &new_tiles).unwrap();
+
+        let mapped = MappedChunk::open(file.path()).unwrap();
+        let t = mapped.read_tile(0).unwrap();
+        assert_eq!(t.intervals.len(), 3);
+        // Must be sorted by start coordinate
+        assert!(t.intervals.windows(2).all(|w| w[0].iv.start <= w[1].iv.start));
+        // Correct order: sid=1 (100), sid=0 (200), sid=2 (400)
+        assert_eq!(t.intervals[0].sid, 1);
+        assert_eq!(t.intervals[1].sid, 0);
+        assert_eq!(t.intervals[2].sid, 2);
     }
 
     #[test]

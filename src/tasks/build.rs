@@ -9,7 +9,7 @@ use voracious_radix_sort::RadixSort;
 use crate::core::{ChunkID, Interval, LayerID, TaggedInterval};
 use crate::io::{
     BedParseError, ChunkHeader, LayerConfig, MasterHeader, SidMetadata,
-    is_bed_file, mmap::MmapError, parse_bed_file, write_chunk,
+    is_bed_file, merge_chunk, mmap::MmapError, parse_bed_file, write_chunk,
 };
 use crate::sweep::index_sweep;
 
@@ -47,6 +47,8 @@ pub struct BuildConfig {
     pub output_dir: PathBuf,
     /// Layer configurations (use default if None)
     pub layer_configs: Option<Vec<LayerConfig>>,
+    /// Number of BED files to ingest per batch (None = all at once)
+    pub batch_size: Option<usize>,
 }
 
 impl BuildConfig {
@@ -55,6 +57,7 @@ impl BuildConfig {
             input_dir,
             output_dir,
             layer_configs: None,
+            batch_size: None,
         }
     }
 }
@@ -66,11 +69,17 @@ pub struct AddConfig {
     pub input_dir: PathBuf,
     /// Path to existing database directory
     pub db_dir: PathBuf,
+    /// Number of BED files to ingest per batch (None = all at once)
+    pub batch_size: Option<usize>,
 }
 
 impl AddConfig {
     pub fn new(input_dir: PathBuf, db_dir: PathBuf) -> Self {
-        Self { input_dir, db_dir }
+        Self {
+            input_dir,
+            db_dir,
+            batch_size: None,
+        }
     }
 }
 
@@ -150,86 +159,43 @@ fn ingest_bed_files(
     Ok(all_shards)
 }
 
-/// Partition intervals by layer, sort, and write chunks to disk for a single shard
-fn flush_shard_to_disk(
-    shard: &str,
-    intervals: &[TaggedInterval],
-    header: &MasterHeader,
-    output_dir: &Path,
-) -> Result<(), BuildError> {
-    let shard_dir = output_dir.join(shard);
-    let partitions = partition_by_layer(intervals, &header.layer_configs);
-
-    for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
-        if layer_intervals.is_empty() {
-            continue;
-        }
-
-        let layer_config = &header.layer_configs[layer_id];
-
-        // Sort by start coordinate using radix sort O(n * w)
-        layer_intervals.voracious_sort();
-
-        // Group by chunk - O(n) sequential, but chunk writing below is parallel
-        let chunks = group_by_chunk(&layer_intervals, layer_config);
-
-        // Create layer directory within shard
-        let layer_dir = shard_dir.join(format!("layer_{}", layer_id));
-        fs::create_dir_all(&layer_dir)?;
-
-        // Process chunks in parallel
-        chunks
-            .into_par_iter()
-            .try_for_each(|(chunk_id, chunk_intervals)| {
-                write_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
-            })?;
-    }
-
-    Ok(())
-}
-
-/// Partition intervals by shard, layer, and write chunks to disk
-///
-/// Performance: Shards are processed in parallel using Rayon.
-fn flush_intervals_to_disk(
-    shard_intervals: &HashMap<String, Vec<TaggedInterval>>,
-    header: &MasterHeader,
-    output_dir: &Path,
-) -> Result<(), BuildError> {
-    // Process each shard in parallel
-    shard_intervals
-        .par_iter()
-        .filter(|(_, intervals)| !intervals.is_empty())
-        .try_for_each(|(shard, intervals)| {
-            flush_shard_to_disk(shard, intervals, header, output_dir)
-        })
-}
-
 // =============================================================================
 // Public API
 // =============================================================================
 
-/// Build a database from BED files in a directory
+/// Build a database from BED files in a directory.
+///
+/// Files are processed in batches of `config.batch_size` (default: all at once).
+/// Each batch is ingested into memory, then merged into the on-disk index.
+/// Because `merge_chunk_file` creates missing chunk files from scratch, the first
+/// batch and all subsequent batches go through the same code path.
 pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
     let bed_files = find_bed_files(&config.input_dir)?;
 
-    // Create output directory
     fs::create_dir_all(&config.output_dir)?;
 
-    // Initialize master header
     let mut master_header = MasterHeader::new();
     if let Some(ref configs) = config.layer_configs {
         master_header.layer_configs = configs.clone();
     }
 
-    // Ingest BED files starting from sid 0 (returns grouped by shard)
-    let shard_intervals = ingest_bed_files(bed_files, 0, &mut master_header)?;
+    let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
+    let mut next_sid = 0u32;
 
-    // Write intervals to disk (per shard)
-    flush_intervals_to_disk(&shard_intervals, &master_header, &config.output_dir)?;
+    for batch in bed_files.chunks(batch_size) {
+        let shard_intervals =
+            ingest_bed_files(batch.to_vec(), next_sid, &mut master_header)?;
+        next_sid += batch.len() as u32;
 
-    // Write master header
-    write_master_header(&config.output_dir, &master_header)?;
+        shard_intervals
+            .par_iter()
+            .filter(|(_, intervals)| !intervals.is_empty())
+            .try_for_each(|(shard, intervals)| {
+                merge_shard_to_disk(shard, intervals, &master_header, &config.output_dir)
+            })?;
+
+        write_master_header(&config.output_dir, &master_header)?;
+    }
 
     Ok(())
 }
@@ -309,6 +275,70 @@ fn write_chunk_file(
     Ok(())
 }
 
+/// Merge new intervals into an existing chunk file, or create it if absent.
+///
+/// This is the add-path counterpart to `write_chunk_file`.  It:
+/// 1. Runs `index_sweep` on the incoming sorted intervals to produce new-only tiles.
+/// 2. If the chunk file already exists, delegates to `merge_chunk` which performs
+///    the efficient in-place mmap merge (extend + back-to-front shift + sorted merge).
+/// 3. If the chunk file is absent, falls through to `write_chunk_file` (no old data
+///    to merge).
+fn merge_chunk_file(
+    layer_dir: &Path,
+    chunk_id: u32,
+    config: &LayerConfig,
+    new_intervals: &[TaggedInterval],
+) -> Result<(), BuildError> {
+    let chunk_path = layer_dir.join(format!("chunk_{}.bin", chunk_id));
+
+    if !chunk_path.exists() {
+        return write_chunk_file(layer_dir, chunk_id, config, new_intervals);
+    }
+
+    let chunk_start = chunk_id * config.chunk_size;
+    let chunk_end = chunk_start + config.chunk_size;
+    let chunk_bounds = Interval::new(chunk_start, chunk_end);
+
+    let new_tiles = index_sweep(chunk_bounds, config.tile_size, new_intervals);
+    merge_chunk(&chunk_path, &new_tiles)?;
+    Ok(())
+}
+
+/// Partition and merge intervals into an existing shard on disk.
+///
+/// Identical to `flush_shard_to_disk` except it calls `merge_chunk_file`
+/// instead of `write_chunk_file` so existing chunk data is preserved.
+fn merge_shard_to_disk(
+    shard: &str,
+    intervals: &[TaggedInterval],
+    header: &MasterHeader,
+    db_dir: &Path,
+) -> Result<(), BuildError> {
+    let shard_dir = db_dir.join(shard);
+    let partitions = partition_by_layer(intervals, &header.layer_configs);
+
+    for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
+        if layer_intervals.is_empty() {
+            continue;
+        }
+
+        let layer_config = &header.layer_configs[layer_id];
+        layer_intervals.voracious_sort();
+        let chunks = group_by_chunk(&layer_intervals, layer_config);
+
+        let layer_dir = shard_dir.join(format!("layer_{}", layer_id));
+        fs::create_dir_all(&layer_dir)?;
+
+        chunks
+            .into_par_iter()
+            .try_for_each(|(chunk_id, chunk_intervals)| {
+                merge_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
+            })?;
+    }
+
+    Ok(())
+}
+
 /// Write master header to file
 fn write_master_header(output_dir: &Path, header: &MasterHeader) -> Result<(), BuildError> {
     let header_path = output_dir.join("header.json");
@@ -318,11 +348,10 @@ fn write_master_header(output_dir: &Path, header: &MasterHeader) -> Result<(), B
     Ok(())
 }
 
-/// Add BED files to an existing database
+/// Add BED files to an existing database.
 ///
 /// Returns the number of sources added.
 pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
-    // Load existing master header
     let header_path = config.db_dir.join("header.json");
     if !header_path.exists() {
         return Err(BuildError::DatabaseNotFound(config.db_dir.clone()));
@@ -332,27 +361,32 @@ pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
     let mut master_header: MasterHeader = serde_json::from_str(&header_content)
         .map_err(|e| BuildError::InvalidDatabase(e.to_string()))?;
 
-    // Find new BED files
     let bed_files = find_bed_files(&config.input_dir)?;
     let num_added = bed_files.len();
 
-    // Determine starting sid (max existing + 1)
-    let start_sid = master_header
+    let mut next_sid = master_header
         .sid_map
         .keys()
         .max()
         .map(|&max| max + 1)
         .unwrap_or(0);
 
-    // Ingest BED files (returns grouped by shard)
-    let shard_intervals = ingest_bed_files(bed_files, start_sid, &mut master_header)?;
+    let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
 
-    // Write intervals to disk (per shard)
-    // Note: For simplicity, this rewrites affected chunks rather than merging
-    flush_intervals_to_disk(&shard_intervals, &master_header, &config.db_dir)?;
+    for batch in bed_files.chunks(batch_size) {
+        let shard_intervals =
+            ingest_bed_files(batch.to_vec(), next_sid, &mut master_header)?;
+        next_sid += batch.len() as u32;
 
-    // Update master header
-    write_master_header(&config.db_dir, &master_header)?;
+        shard_intervals
+            .par_iter()
+            .filter(|(_, intervals)| !intervals.is_empty())
+            .try_for_each(|(shard, intervals)| {
+                merge_shard_to_disk(shard, intervals, &master_header, &config.db_dir)
+            })?;
+
+        write_master_header(&config.db_dir, &master_header)?;
+    }
 
     Ok(num_added)
 }
@@ -439,6 +473,46 @@ mod tests {
         // Check shard directories
         assert!(output_dir.path().join("chr1").exists());
         assert!(output_dir.path().join("chr2").exists());
+    }
+
+    #[test]
+    fn test_build_database_batched() {
+        // Verify that batch_size=1 (one file per merge pass) produces the same
+        // result as processing all files at once.
+        let input_dir = TempDir::new().unwrap();
+        let output_dir_batched = TempDir::new().unwrap();
+        let output_dir_bulk = TempDir::new().unwrap();
+
+        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\nchr1\t500\t600\n");
+        create_test_bed(input_dir.path(), "b.bed", "chr1\t150\t250\nchr2\t300\t400\n");
+        create_test_bed(input_dir.path(), "c.bed", "chr1\t700\t800\nchr2\t900\t1000\n");
+
+        let mut batched_config = BuildConfig::new(
+            input_dir.path().to_path_buf(),
+            output_dir_batched.path().to_path_buf(),
+        );
+        batched_config.batch_size = Some(1);
+        build_database(&batched_config).unwrap();
+
+        let bulk_config = BuildConfig::new(
+            input_dir.path().to_path_buf(),
+            output_dir_bulk.path().to_path_buf(),
+        );
+        build_database(&bulk_config).unwrap();
+
+        // Both should have the same header (3 sources, 2 shards)
+        let read_header = |dir: &TempDir| -> MasterHeader {
+            let s = fs::read_to_string(dir.path().join("header.json")).unwrap();
+            serde_json::from_str(&s).unwrap()
+        };
+
+        let h_batched = read_header(&output_dir_batched);
+        let h_bulk = read_header(&output_dir_bulk);
+
+        assert_eq!(h_batched.num_sources(), 3);
+        assert_eq!(h_batched.num_sources(), h_bulk.num_sources());
+        assert_eq!(h_batched.num_shards(), 2);
+        assert_eq!(h_batched.num_shards(), h_bulk.num_shards());
     }
 
     #[test]
