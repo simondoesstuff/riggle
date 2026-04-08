@@ -30,6 +30,10 @@ enum Commands {
         /// Output directory for the database
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Number of BED files to ingest per batch (default: all at once)
+        #[arg(short, long)]
+        batch_size: Option<usize>,
     },
 
     /// Add BED files to an existing database
@@ -41,6 +45,10 @@ enum Commands {
         /// Path to existing database directory
         #[arg(short, long)]
         db: PathBuf,
+
+        /// Number of BED files to ingest per batch (default: all at once)
+        #[arg(short, long)]
+        batch_size: Option<usize>,
     },
 
     /// Query a database with BED file(s)
@@ -74,8 +82,8 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Build { input, output } => run_build(input, output),
-        Commands::Add { input, db } => run_add(input, db),
+        Commands::Build { input, output, batch_size } => run_build(input, output, batch_size),
+        Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
         Commands::Query {
             db,
             query,
@@ -91,7 +99,11 @@ fn main() {
     }
 }
 
-fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn run_add(
+    input: PathBuf,
+    db: PathBuf,
+    batch_size: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -101,7 +113,8 @@ fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>
     pb.set_message("Adding files to database...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let config = AddConfig::new(input, db.clone());
+    let mut config = AddConfig::new(input, db.clone());
+    config.batch_size = batch_size;
     let added_count = add_to_database(&config)?;
 
     pb.finish_with_message(format!(
@@ -112,7 +125,11 @@ fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn run_build(input: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn run_build(
+    input: PathBuf,
+    output: PathBuf,
+    batch_size: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -122,7 +139,8 @@ fn run_build(input: PathBuf, output: PathBuf) -> Result<(), Box<dyn std::error::
     pb.set_message("Building database...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let config = BuildConfig::new(input, output.clone());
+    let mut config = BuildConfig::new(input, output.clone());
+    config.batch_size = batch_size;
     build_database(&config)?;
 
     pb.finish_with_message(format!("Database built at {}", output.display()));
