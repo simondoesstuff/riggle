@@ -191,11 +191,11 @@ mod tests {
 
         // Create some tiles
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push(crate::core::OffsetSid::new(10, 2));
-        tile0.start_ivs.push(crate::core::OffsetSid::new(20, 1));
+        tile0.intervals.push(crate::core::TaggedInterval::new(10, 30, 2));
+        tile0.intervals.push(crate::core::TaggedInterval::new(20, 40, 1));
 
         let mut tile1 = Tile::new(500);
-        tile1.end_ivs.push(crate::core::OffsetSid::new(50, 3));
+        tile1.intervals.push(crate::core::TaggedInterval::new(550, 580, 3));
 
         let tiles = vec![tile0, tile1];
 
@@ -224,11 +224,11 @@ mod tests {
         // Check tile data
         let read_tile0 = mapped.read_tile(0).unwrap();
         assert_eq!(read_tile0.start_coord, 0);
-        assert_eq!(read_tile0.start_ivs.len(), 2);
+        assert_eq!(read_tile0.intervals.len(), 2);
 
         let read_tile1 = mapped.read_tile(1).unwrap();
         assert_eq!(read_tile1.start_coord, 500);
-        assert_eq!(read_tile1.end_ivs.len(), 1);
+        assert_eq!(read_tile1.intervals.len(), 1);
     }
 
     #[test]
