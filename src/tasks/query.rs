@@ -64,9 +64,7 @@ impl QueryConfig {
 pub struct QuerySource {
     /// File name
     pub name: String,
-    /// Starting row index in results matrix
-    pub start_idx: usize,
-    /// Number of intervals
+    /// Number of intervals in this file
     pub count: usize,
 }
 
@@ -188,14 +186,14 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
 /// Parsed query result with shard grouping
 struct ParsedQueries {
-    /// Intervals grouped by shard, with global indices preserved
-    /// Each entry is (global_index, interval)
+    /// Intervals grouped by shard, each tagged with the file SID (row in results matrix)
+    /// Each entry is (file_sid, interval)
     shard_intervals: HashMap<String, Vec<(usize, TaggedInterval)>>,
     /// Query source metadata
     query_sources: Vec<QuerySource>,
-    /// Flat list of query names (for result indexing)
+    /// Query file names (one per file, indexed by file SID)
     query_names: Vec<String>,
-    /// Total number of query intervals
+    /// Total number of query files
     total_count: usize,
 }
 
@@ -221,11 +219,11 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
         });
     }
 
-    // First pass: collect all intervals with global indices
+    // Collect intervals per file, tagging each interval with the file's SID
     let mut shard_intervals: HashMap<String, Vec<(usize, TaggedInterval)>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
-    let mut global_idx = 0;
+    let mut file_sid = 0usize;
 
     for bed_path in bed_files {
         let file_shards = parse_bed_file(&bed_path, 0)?;
@@ -242,32 +240,29 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "query".to_string());
 
-        query_names.extend((0..file_count).map(|i| format!("{}:{}", name, i)));
+        query_names.push(name.clone());
         query_sources.push(QuerySource {
             name,
-            start_idx: global_idx,
             count: file_count,
         });
 
-        // Merge into global shard map with global indices
+        // Tag all intervals from this file with the file SID (shared row index)
         for (shard, intervals) in file_shards {
             let indexed: Vec<(usize, TaggedInterval)> = intervals
                 .into_iter()
-                .map(|iv| {
-                    let idx = global_idx;
-                    global_idx += 1;
-                    (idx, iv)
-                })
+                .map(|iv| (file_sid, iv))
                 .collect();
             shard_intervals.entry(shard).or_default().extend(indexed);
         }
+
+        file_sid += 1;
     }
 
     Ok(ParsedQueries {
         shard_intervals,
         query_sources,
         query_names,
-        total_count: global_idx,
+        total_count: file_sid,
     })
 }
 
@@ -512,8 +507,8 @@ mod tests {
 
         let result = query_database(&query_config).unwrap();
 
-        // Should have 2 query intervals
-        assert_eq!(result.counts.rows(), 2);
+        // Should have 1 row (1 query file, regardless of interval count)
+        assert_eq!(result.counts.rows(), 1);
     }
 
     #[test]
@@ -539,7 +534,7 @@ mod tests {
 
         let result = query_database(&query_config).unwrap();
 
-        // Should have 1 query interval but no overlaps
+        // Should have 1 row (1 query file) but no overlaps (shard missing from db)
         assert_eq!(result.counts.rows(), 1);
     }
 
@@ -608,12 +603,12 @@ mod tests {
 
         let result = query_database(&query_config).unwrap();
 
-        // Should have 3 total query intervals (1 from query1, 2 from query2)
-        assert_eq!(result.counts.rows(), 3);
+        // Should have 2 rows (2 query files), regardless of interval count
+        assert_eq!(result.counts.rows(), 2);
         assert_eq!(result.query_sources.len(), 2);
 
-        // Check source metadata
-        let total_count: usize = result.query_sources.iter().map(|s| s.count).sum();
-        assert_eq!(total_count, 3);
+        // Interval counts per file are still tracked in QuerySource.count
+        let total_intervals: usize = result.query_sources.iter().map(|s| s.count).sum();
+        assert_eq!(total_intervals, 3);
     }
 }
