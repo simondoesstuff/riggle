@@ -18,8 +18,7 @@ Riggle is a statistical interval intersection engine for genomic data. It indexe
 - **Layers**: Partition intervals by size (log2 of length). Each interval goes to exactly ONE layer.
 - **Chunks**: Fixed-size genomic territories within a layer. O(1) lookup via `chunk_id = coord / chunk_size`.
 - **Tiles**: Subdivisions within chunks (Many tiles per chunk). Tile size > max interval size for layer.
-  - `start_ivs`: intervals starting in tile - Vec<OffsetSid>, SORTED by offset via radix sort
-  - `end_ivs`: intervals ending in tile - Vec<OffsetSid>, SORTED by offset via radix sort
+  - `intervals`: `Vec<TaggedInterval>`, SORTED by start coordinate via radix sort
   - No `running_counts` needed: tile_size >= max_interval guarantees no interval spans a tile
 
 ### Key Files
@@ -69,16 +68,9 @@ database/
 - If no non-integer column → uses `"default"` as shard
 - Returns `HashMap<String, Vec<TaggedInterval>>` grouped by shard
 
-### Offset Storage (FIXED)
-
-- `start_ivs` and `end_ivs` use `OffsetSid` struct (offset: u32, sid: u32)
-- `OffsetSid` implements `Radixable<u32>` for O(n) sorting by offset
-- Previously used u16 for offset which caused silent truncation for large tiles (>65535)
-- Tile sizes can exceed 65535 for layers > 11
-
 ### Binary Search in Tiles
 
-- `start_ivs` and `end_ivs` are sorted by offset at index time (in `index_sweep`)
+- `intervals` are sorted by start coordinate at index time (in `index_sweep`)
 - Query uses `partition_point()` for O(log n) lookup to initiate iteration
 
 ### O(1) Chunk Lookup
@@ -89,10 +81,8 @@ database/
 
 ### Deduplication (FIXED)
 
-- Uses tile position logic: `is_first_overlap_tile = query.iv.start >= tile_start`
-- Only counts end_ivs in the first overlap tile (where query starts)
-- start_ivs always counted (unique to their tile by definition)
-- O(1) determination instead of O(N) seen.contains()
+- Overlap between query (Q) and database (D) intervals is counted once if `max(Q.start, D.start)` falls within the current tile's bounds.
+- This ensures each unique overlap is counted exactly once, regardless of how many tiles Q or D span.
 
 ### Thread-Local Buffers (FIXED)
 
@@ -135,14 +125,14 @@ Query accepts either a single BED file or a directory of BED files:
 
 ### From docs/\_critiques.md
 
-1. ✅ u16 truncation bug - Changed to u32 for tile offsets
+1. ✅ u16 truncation bug - Removed `OffsetSid` and now store `TaggedInterval` directly.
 2. ✅ O(N) deduplication - Uses tile position logic (`is_first_overlap_tile`)
 3. ✅ Thread-local buffer reuse - Uses `thread_local!` for DenseMatrix/BitwiseMask
 4. ✅ O(N log N) sparse construction - Builds CsMat directly in O(nnz)
 
 ### From Code TODOs
 
-5. ✅ Radix sort for tile intervals - Uses voracious_radix_sort with OffsetSid wrapper
+5. ✅ Radix sort for tile intervals - Uses voracious_radix_sort with `TaggedInterval` directly
 6. ✅ Radix sort for build pipeline - TaggedInterval implements Radixable for O(n) layer sorting
 7. ✅ Pre-allocation in build pipeline - Exact capacity via two-pass
 8. ✅ Add command - Incremental database updates

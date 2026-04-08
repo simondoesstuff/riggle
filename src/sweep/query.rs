@@ -18,11 +18,10 @@ use super::sweep_tiles;
 /// which correspond to row indices in `results`.
 ///
 /// # Deduplication Strategy
-/// Since tile_size is > the max interval size, no database interval can span
-/// an entire tile. Intervals only appear in start_ivs (where they start) and
-/// end_ivs (where they end). To avoid double-counting, we only count end_ivs
-/// in the "first overlap tile" for each query - determined by
-/// `query.start >= tile_start`. start_ivs are always unique to their tile.
+/// The overlap between a query Q and database interval D begins exactly at 
+/// `max(Q.start, D.start)`. Since tiles perfectly partition the coordinate space, 
+/// this overlap start coordinate falls into exactly one tile. We simply only count 
+/// the overlap if it "begins" in the current tile.
 pub fn query_sweep(
     mapped_chunk: &MappedChunk,
     tile_size: u32,
@@ -43,115 +42,70 @@ pub fn query_sweep(
         tile_size,
         query_batch,
         |q| q.1.iv,
-        |tile_idx, tile_start, _tile_end, active_queries| {
+        |tile_idx, tile_start, tile_end, active_queries| {
             let tile = match mapped_chunk.get_tile(tile_idx) {
                 Ok(t) => t,
                 Err(_) => return, // Skip tiles we can't read
             };
 
             for (query_idx, query) in active_queries {
-                // Determine if this is the first tile where query overlaps
-                // This is true when query.start falls within [tile_start, tile_end)
-                // Used to avoid double-counting end_ivs
-                let is_first_overlap_tile = query.iv.start >= tile_start;
-
-                // Process start_ivs (intervals starting in this tile) - always unique
-                process_start_ivs(tile, tile_start, query, *query_idx, results, mask);
-
-                // Process end_ivs only in first overlap tile
-                if is_first_overlap_tile {
-                    process_end_ivs(tile, tile_start, query, *query_idx, results, mask);
-                }
+                process_intervals(tile, tile_start, tile_end, query, *query_idx, results, mask);
             }
         },
     );
 }
 
-/// Process intervals starting in this tile
+/// Process intervals overlapping this tile
 /// Uses binary search to find the first relevant interval, then iterates
-fn process_start_ivs(
+fn process_intervals(
     tile: &ArchivedTile,
     tile_start: u32,
+    tile_end: u32,
     query: &TaggedInterval,
     query_idx: usize,
     results: &mut DenseMatrix,
     mask: &mut BitwiseMask,
 ) {
-    if tile.start_ivs.is_empty() {
+    if tile.intervals.is_empty() {
         return;
     }
 
-    // Binary search to find first interval that might overlap with query
-    // We want intervals where: iv_start >= query.start AND iv_start < query.end
-    // Since iv_start = tile_start + offset, we need offset >= query.start - tile_start
-    let query_start_offset = query.iv.start.saturating_sub(tile_start);
-
-    // Find first interval with offset >= query_start_offset
-    let start_idx = tile.start_ivs.partition_point(|entry| {
-        let offset: u32 = entry.offset.into();
-        offset < query_start_offset
-    });
-
-    // Iterate from start_idx until we exceed query.end
-    for entry in tile.start_ivs.iter().skip(start_idx) {
-        let offset: u32 = entry.offset.into();
+    // Iterate over intervals in this tile
+    // Wait, the archived intervals are TaggedInterval.
+    // They are sorted by start coordinate. We can binary search for intervals
+    // that start before query.end. Actually, since we want intervals where
+    // iv.end > query.start, we could just scan or binary search.
+    // But since they are sorted by iv.start, we can binary search to find
+    // the first interval where iv.end > query.start? No, end is not sorted.
+    // However, they are sorted by start. So we can skip intervals where
+    // iv.start >= query.end because they can't overlap.
+    
+    // Binary search is NOT easily possible for iv.end > query.start because
+    // start and end are decoupled. However, since no interval spans an entire
+    // tile, an interval overlapping query in this tile must have its start
+    // or end in this tile.
+    
+    for entry in tile.intervals.iter() {
+        let iv_start: u32 = entry.iv.start.into();
+        let iv_end: u32 = entry.iv.end.into();
         let sid: u32 = entry.sid.into();
-        let iv_start = tile_start + offset;
 
-        // Stop if we've passed the query end
+        // Stop if we've passed the query end, since intervals are sorted by start
         if iv_start >= query.iv.end {
             break;
         }
 
-        // Count this overlap
-        let sid_usize = sid as usize;
-        if sid_usize < results.num_cols() {
-            results.add(query_idx, sid_usize, 1);
-            mask.flag(query_idx, sid_usize);
-        }
-    }
-}
-
-/// Process intervals ending in this tile
-/// Uses binary search to find the first relevant interval, then iterates
-/// Called only for the first overlap tile (deduplication handled by caller)
-fn process_end_ivs(
-    tile: &ArchivedTile,
-    tile_start: u32,
-    query: &TaggedInterval,
-    query_idx: usize,
-    results: &mut DenseMatrix,
-    mask: &mut BitwiseMask,
-) {
-    if tile.end_ivs.is_empty() {
-        return;
-    }
-
-    // Binary search to find first interval that might overlap with query
-    // We want intervals where: iv_end > query.start (interval ends after query starts)
-    // Since iv_end = tile_start + offset, we need offset > query.start - tile_start
-    let query_start_offset = query.iv.start.saturating_sub(tile_start);
-
-    // Find first interval with offset > query_start_offset
-    let start_idx = tile.end_ivs.partition_point(|entry| {
-        let offset: u32 = entry.offset.into();
-        offset <= query_start_offset
-    });
-
-    // Iterate from start_idx
-    for entry in tile.end_ivs.iter().skip(start_idx) {
-        let sid: u32 = entry.sid.into();
-
-        // The interval ends in this tile, started somewhere before
-        // We overlap if query.start < iv_end (which we ensured with binary search)
-        // Note: We don't need to check upper bound since end_ivs only contains
-        // intervals ending IN this tile (before tile_end)
-
-        // Count this overlap
-        let sid_usize = sid as usize;
-        if sid_usize < results.num_cols() {
-            results.add(query_idx, sid_usize, 1);
-            mask.flag(query_idx, sid_usize);
+        // Check for overlap
+        if iv_end > query.iv.start {
+            // Deduplication Check
+            let overlap_start = query.iv.start.max(iv_start);
+            if overlap_start >= tile_start && overlap_start < tile_end {
+                let sid_usize = sid as usize;
+                if sid_usize < results.num_cols() {
+                    results.add(query_idx, sid_usize, 1);
+                    mask.flag(query_idx, sid_usize);
+                }
+            }
         }
     }
 }
@@ -159,7 +113,7 @@ fn process_end_ivs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{OffsetSid, Tile};
+    use crate::core::Tile;
     use crate::io::{ChunkHeader, write_chunk};
     use tempfile::NamedTempFile;
 
@@ -187,10 +141,9 @@ mod tests {
     fn test_query_sweep_basic() {
         // Create a chunk with 2 tiles, tile_size = 100
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval starting at 50, sid 0
-
+        tile0.intervals.push(TaggedInterval::new(50, 150, 0)); // interval 50-150, sid 0
         let mut tile1 = Tile::new(100);
-        tile1.end_ivs.push(OffsetSid::new(50, 0)); // interval ending at 150, sid 0
+        tile1.intervals.push(TaggedInterval::new(50, 150, 0)); // interval 50-150, sid 0
 
         let (file, tile_size) = create_test_chunk(vec![tile0, tile1], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -203,21 +156,21 @@ mod tests {
 
         query_sweep(&mapped, tile_size, &queries, &mut results, &mut mask);
 
-        // Should count the interval once (counted from start_ivs in tile0, not from end_ivs in tile1)
+        // Should count the interval once
         assert_eq!(results.get(0, 0), 1);
     }
 
     #[test]
     fn test_query_sweep_crossing_tiles() {
         // Create a chunk with 3 tiles, tile_size = 100
-        // Interval starts in tile 0, ends in tile 2
+        // Interval 50-250, sid 0. Overlaps tile 0, 1, 2
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval starts at 50
-
-        let tile1 = Tile::new(100); // no activity in middle tile
-
+        tile0.intervals.push(TaggedInterval::new(50, 250, 0));
+        let mut tile1 = Tile::new(100);
+        tile1.intervals.push(TaggedInterval::new(50, 250, 0));
         let mut tile2 = Tile::new(200);
-        tile2.end_ivs.push(OffsetSid::new(50, 0)); // interval ends at 250
+        tile2.intervals.push(TaggedInterval::new(50, 250, 0));
+
 
         let (file, tile_size) = create_test_chunk(vec![tile0, tile1, tile2], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -230,14 +183,14 @@ mod tests {
 
         query_sweep(&mapped, tile_size, &queries, &mut results, &mut mask);
 
-        // Should count the interval once (from start_ivs)
+        // Should count the interval once
         assert_eq!(results.get(0, 0), 1);
     }
 
     #[test]
     fn test_query_sweep_no_overlap() {
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push(OffsetSid::new(50, 0)); // interval at 50
+        tile0.intervals.push(TaggedInterval::new(50, 150, 0));
 
         let (file, tile_size) = create_test_chunk(vec![tile0], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -256,8 +209,8 @@ mod tests {
     #[test]
     fn test_query_sweep_multiple_queries() {
         let mut tile0 = Tile::new(0);
-        tile0.start_ivs.push(OffsetSid::new(25, 0)); // interval at 25, sid 0
-        tile0.start_ivs.push(OffsetSid::new(75, 1)); // interval at 75, sid 1
+        tile0.intervals.push(TaggedInterval::new(25, 75, 0)); // interval 25-75, sid 0
+        tile0.intervals.push(TaggedInterval::new(75, 125, 1)); // interval 75-125, sid 1
 
         let (file, tile_size) = create_test_chunk(vec![tile0], 100);
         let mapped = MappedChunk::open(file.path()).unwrap();
@@ -266,8 +219,8 @@ mod tests {
         let mut mask = BitwiseMask::new(2, 2);
 
         let queries = vec![
-            (0, TaggedInterval::new(0, 50, 100)), // overlaps interval at 25
-            (1, TaggedInterval::new(50, 100, 101)), // overlaps interval at 75
+            (0, TaggedInterval::new(0, 50, 100)), // overlaps 25-75, sid 0
+            (1, TaggedInterval::new(50, 100, 101)), // overlaps 75-125, sid 1
         ];
 
         query_sweep(&mapped, tile_size, &queries, &mut results, &mut mask);

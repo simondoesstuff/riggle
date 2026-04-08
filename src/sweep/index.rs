@@ -1,6 +1,6 @@
 use voracious_radix_sort::RadixSort;
 
-use crate::core::{OffsetSid, TaggedInterval, Tile};
+use crate::core::{TaggedInterval, Tile};
 
 use super::sweep_tiles;
 
@@ -43,33 +43,21 @@ pub fn index_sweep(
         tile_size,
         active_batch,
         |iv| iv.iv,
-        |tile_idx, tile_start, tile_end, active_items| {
+        |tile_idx, _tile_start, _tile_end, active_items| {
             let tile = &mut tiles[tile_idx];
-            let tile_end = tile_end.min(chunk_bounds.end);
 
             for iv in active_items {
-                // Classify the interval's relationship to this tile
-                // Since tile_size > max_interval_size, no interval can span a tile
-                let starts_in_tile = iv.iv.start >= tile_start && iv.iv.start < tile_end;
-                let ends_in_tile = iv.iv.end > tile_start && iv.iv.end <= tile_end;
-
-                if starts_in_tile {
-                    let offset = iv.iv.start - tile_start;
-                    tile.start_ivs.push(OffsetSid::new(offset, iv.sid));
-                }
-                if ends_in_tile {
-                    let offset = iv.iv.end - tile_start;
-                    tile.end_ivs.push(OffsetSid::new(offset, iv.sid));
-                }
+                // The sweep_tiles function already provides us with the items
+                // that overlap the current tile. We just need to push them.
+                tile.intervals.push(*iv);
             }
         },
     );
 
-    // Sort interval lists by offset for binary search during query
+    // Sort interval lists by start coordinate for binary search during query
     // Uses radix sort O(n * w) where w is word size, vs O(n log n) for comparison sort
     for tile in &mut tiles {
-        tile.start_ivs.voracious_sort();
-        tile.end_ivs.voracious_sort();
+        tile.intervals.voracious_sort();
     }
 
     tiles
@@ -94,14 +82,12 @@ mod tests {
         let intervals = vec![TaggedInterval::new(150, 250, 1)];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Interval 150-250 should:
-        // - Start in tile 1 (100-200) at offset 50
-        // - End in tile 2 (200-300) at offset 50
-        assert_eq!(tiles[1].start_ivs.len(), 1);
-        assert_eq!(tiles[1].start_ivs[0], OffsetSid::new(50, 1)); // offset 50 from tile start
+        // Interval 150-250 should overlap tile 1 (100-200) and tile 2 (200-300)
+        assert_eq!(tiles[1].intervals.len(), 1);
+        assert_eq!(tiles[1].intervals[0], TaggedInterval::new(150, 250, 1));
 
-        assert_eq!(tiles[2].end_ivs.len(), 1);
-        assert_eq!(tiles[2].end_ivs[0], OffsetSid::new(50, 1)); // offset 50 from tile start
+        assert_eq!(tiles[2].intervals.len(), 1);
+        assert_eq!(tiles[2].intervals[0], TaggedInterval::new(150, 250, 1));
     }
 
     #[test]
@@ -111,31 +97,26 @@ mod tests {
         let intervals = vec![TaggedInterval::new(50, 150, 1)];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Interval 50-150:
-        // - Tile 0 (0-100): starts at offset 50
-        // - Tile 1 (100-200): ends at offset 50
+        // Interval 50-150 overlaps tile 0 and tile 1
+        assert_eq!(tiles[0].intervals.len(), 1);
+        assert_eq!(tiles[0].intervals[0], TaggedInterval::new(50, 150, 1));
 
-        assert_eq!(tiles[0].start_ivs.len(), 1); // starts at offset 50
-        assert_eq!(tiles[0].start_ivs[0], OffsetSid::new(50, 1));
-
-        assert_eq!(tiles[1].end_ivs.len(), 1); // ends at offset 50
-        assert_eq!(tiles[1].end_ivs[0], OffsetSid::new(50, 1));
+        assert_eq!(tiles[1].intervals.len(), 1);
+        assert_eq!(tiles[1].intervals[0], TaggedInterval::new(50, 150, 1));
     }
 
     #[test]
     fn test_index_sweep_multiple_intervals_same_sid() {
         let bounds = Interval::new(0, 300);
-        // Two intervals from same sid, both start and end in same tiles
+        // Two intervals from same sid, both overlap same tiles
         let intervals = vec![
             TaggedInterval::new(50, 150, 1),
             TaggedInterval::new(60, 160, 1),
         ];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Tile 0: both intervals start
-        assert_eq!(tiles[0].start_ivs.len(), 2);
-        // Tile 1: both intervals end
-        assert_eq!(tiles[1].end_ivs.len(), 2);
+        assert_eq!(tiles[0].intervals.len(), 2);
+        assert_eq!(tiles[1].intervals.len(), 2);
     }
 
     #[test]
@@ -147,10 +128,9 @@ mod tests {
         ];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Tile 0: both intervals start
-        assert_eq!(tiles[0].start_ivs.len(), 2);
-        assert!(tiles[0].start_ivs.iter().any(|e| e.sid == 1));
-        assert!(tiles[0].start_ivs.iter().any(|e| e.sid == 2));
+        assert_eq!(tiles[0].intervals.len(), 2);
+        assert!(tiles[0].intervals.iter().any(|e| e.sid == 1));
+        assert!(tiles[0].intervals.iter().any(|e| e.sid == 2));
     }
 
     #[test]
@@ -163,9 +143,8 @@ mod tests {
         // Tile 0 (0-100): no overlap (end is 100, exclusive)
         assert!(tiles[0].is_empty());
 
-        // Tile 1 (100-200): starts and ends in this tile
-        assert_eq!(tiles[1].start_ivs.len(), 1);
-        assert_eq!(tiles[1].end_ivs.len(), 1);
+        // Tile 1 (100-200): overlaps
+        assert_eq!(tiles[1].intervals.len(), 1);
     }
 
     #[test]
@@ -175,11 +154,9 @@ mod tests {
         let intervals = vec![TaggedInterval::new(50, 51, 1)];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Single tile, interval starts and ends in it
-        assert_eq!(tiles[0].start_ivs.len(), 1);
-        assert_eq!(tiles[0].start_ivs[0], OffsetSid::new(50, 1));
-        assert_eq!(tiles[0].end_ivs.len(), 1);
-        assert_eq!(tiles[0].end_ivs[0], OffsetSid::new(51, 1));
+        // Single tile
+        assert_eq!(tiles[0].intervals.len(), 1);
+        assert_eq!(tiles[0].intervals[0], TaggedInterval::new(50, 51, 1));
     }
 
     #[test]
@@ -193,22 +170,19 @@ mod tests {
         ];
         let tiles = index_sweep(bounds, 100, &intervals);
 
-        // Tile 0 (0-100): interval 1 starts and ends
-        assert_eq!(tiles[0].start_ivs.len(), 1);
-        assert_eq!(tiles[0].end_ivs.len(), 1);
+        // Tile 0 (0-100): interval 1
+        assert_eq!(tiles[0].intervals.len(), 1);
 
-        // Tile 1 (100-200): interval 2 starts and ends
-        assert_eq!(tiles[1].start_ivs.len(), 1);
-        assert_eq!(tiles[1].end_ivs.len(), 1);
+        // Tile 1 (100-200): interval 2
+        assert_eq!(tiles[1].intervals.len(), 1);
 
-        // Tile 2 (200-300): interval 3 starts
-        assert_eq!(tiles[2].start_ivs.len(), 1);
+        // Tile 2 (200-300): interval 3
+        assert_eq!(tiles[2].intervals.len(), 1);
 
-        // Tile 3 (300-400): interval 3 ends
-        assert_eq!(tiles[3].end_ivs.len(), 1);
+        // Tile 3 (300-400): interval 3 overlaps
+        assert_eq!(tiles[3].intervals.len(), 1);
 
-        // Tile 4 (400-500): interval 4 starts and ends
-        assert_eq!(tiles[4].start_ivs.len(), 1);
-        assert_eq!(tiles[4].end_ivs.len(), 1);
+        // Tile 4 (400-500): interval 4
+        assert_eq!(tiles[4].intervals.len(), 1);
     }
 }

@@ -35,8 +35,7 @@ This flexible parsing supports standard BED (chrom, start, end) as well as coord
 Tiles track the _state_ of intervals relative to the tile boundaries. Data is serialized using a zero-copy framework (e.g., `rkyv`).
 
 - **`start_coord`:** The absolute genomic coordinate where this tile begins.
-- **`start_ivs`:** `[(start_offset, database_sid)]`. Intervals that begin within this tile.
-- **`end_ivs`:** `[(end_offset, database_sid)]`. Intervals that terminate within this tile.
+- **`intervals`:** `[(start, end, sid)]`. Intervals that intersect with this tile, sorted by their start coordinate.
 
 **Key Invariant:** Tile size is set to 4× the maximum interval size for each layer. This guarantees no interval can completely span a tile, eliminating the need for `running_counts` and simplifying both indexing and query logic.
 
@@ -56,7 +55,7 @@ Intervals are parsed from BED files and grouped by shard (chromosome). Each shar
 **Phase 2: Reduce & Write (The Sweep)**
 
 - A worker thread takes a `Chunk` and its sorted `[(interval, sid)]` list.
-- It performs the **Riggle Scan** (detailed below) to construct the `start_ivs` and `end_ivs` for each tile.
+- It performs the **Riggle Scan** (detailed below) to construct the `intervals` array for each tile.
 - The tile is serialized to disk at `{shard}/layer_{id}/chunk_{id}.bin`, updating the Chunk Header.
 
 ## 4. Query Pipeline (`ChunkQuery`)
@@ -109,38 +108,21 @@ _Goal: Translate a stream of intervals into tile-specific state arrays._
 
 For the current Tile $T$, and for each active interval $I$ identified relative to the head pointer:
 
-1. **Check Start:** If $I.start \ge T.start$ AND $I.start < T.end$:
-
-   - Push `(I.start - T.start, I.sid)` to $T$`.start_ivs`.
-
-2. **Check End:** If $I.end > T.start$ AND $I.end \le T.end$:
-
-   - Push `(I.end - T.start, I.sid)` to $T$`.end_ivs`.
+- **Check Intersection:** If $I.start < T.end$ AND $I.end > T.start$:
+  - Push `(I.start, I.end, I.sid)` to $T$`.intervals`.
 
 _Note: Since tile_size ≥ 4× max_interval_size, no interval can span an entire tile. Each interval will have at least one endpoint (start or end) within a tile, never both outside._
-
-_Note: Because $I$ is duplicated across chunk boundaries prior to this step, an interval that crosses from Chunk A to Chunk B will correctly register an `end_ivs` event in Chunk A and a `start_ivs` event in Chunk B if it terminates/begins within those boundary tiles._
 
 ### Variant B: Querying (`ChunkQuery` Scan)
 
 _Goal: Calculate exact intersection counts while strictly preventing double-counting of duplicated database intervals._
 
-We can guarantee no duplication without hashes or bit masks with a simple logical rule, borrowed from IGD. Each database interval appears exactly once in `start_ivs` (where it starts) and once in `end_ivs` (where it ends). We only count `end_ivs` in the "first overlap tile" for each query to avoid double-counting.
+We can guarantee no duplication without hashes or bit masks with a simple logical rule. The overlap between a query $Q$ and database interval $D$ begins exactly at `max(Q.start, D.start)`. Since tiles perfectly partition the coordinate space, this overlap start coordinate falls into exactly one tile. We simply only count the overlap if it "begins" in the current tile.
 
 For the current Tile $T$, we evaluate the active query intervals. For a given active query $Q$:
 
-**1. Process Sub-Tile Starts ($T$.`start_ivs`)**
+For each $D \in T$`.intervals`:
 
-For each $D_{start} \in T$`.start_ivs`:
-
-- If $Q$ overlaps $D_{start}$ (i.e., $Q.start < D.start$ AND $Q.end > D.start$):
-  - Increment `results[Q.sid][D.sid]`.
-  - _No deduplication check needed:_ Because we are intersecting exactly on the database interval's start coordinate, it is impossible for this specific intersection to have been counted in a previous tile.
-
-**2. Process Sub-Tile Ends ($T$.`end_ivs`)**
-
-For each $D_{end} \in T$`.end_ivs`:
-
-- If $Q$ overlaps $D_{end}$ (i.e., $Q.start < D.end$ AND $Q.end > D.end$):
-  - _IGD Deduplication Check:_ We only count this if the intersection _began_ in this tile. If $Q$ crosses the left boundary of $T$ ($Q.start < T.start$), this intersection was already counted by the `start_ivs` evaluation in a previous tile.
-  - If $Q.start \ge T.start$, increment `results[Q.sid][D.sid]`.
+- If $Q$ overlaps $D$ (i.e., $Q.start < D.end$ AND $Q.end > D.start$):
+  - _Deduplication Check:_ We only count this if the intersection _began_ in this tile. The intersection begins at $S = \max(Q.start, D.start)$.
+  - If $S \ge T.start$ AND $S < T.end$, increment `results[Q.sid][D.sid]`.
