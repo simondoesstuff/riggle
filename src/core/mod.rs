@@ -149,50 +149,12 @@ impl TileID {
     }
 }
 
-/// Offset-Sid pair for tile interval lists
-/// Wrapper struct to enable radix sorting by offset
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
-#[repr(C)]
-pub struct OffsetSid {
-    pub offset: u32,
-    pub sid: u32,
-}
 
-impl OffsetSid {
-    #[inline]
-    pub fn new(offset: u32, sid: u32) -> Self {
-        Self { offset, sid }
-    }
-}
-
-impl From<(u32, u32)> for OffsetSid {
-    #[inline]
-    fn from((offset, sid): (u32, u32)) -> Self {
-        Self { offset, sid }
-    }
-}
-
-impl From<OffsetSid> for (u32, u32) {
-    #[inline]
-    fn from(os: OffsetSid) -> Self {
-        (os.offset, os.sid)
-    }
-}
-
-// Implement Radixable to enable O(n) radix sorting by offset
-impl Radixable<u32> for OffsetSid {
-    type Key = u32;
-
-    #[inline]
-    fn key(&self) -> Self::Key {
-        self.offset
-    }
-}
 
 /// Tile structure - the leaf node in the index
 /// Contains intervals that touch this tile, organized for efficient querying.
 ///
-/// INVARIANT: `start_ivs` and `end_ivs` are sorted by offset
+/// INVARIANT: `intervals` are sorted by start coordinate
 /// to enable binary search during query. This sorting is performed by `index_sweep`.
 ///
 /// NOTE: tile_size is set larger than the max interval size for each layer. This guarantees
@@ -201,26 +163,22 @@ impl Radixable<u32> for OffsetSid {
 pub struct Tile {
     /// Start coordinate of this tile
     pub start_coord: u32,
-    /// Intervals starting within this tile
-    /// SORTED by offset for binary search via radix sort
-    pub start_ivs: Vec<OffsetSid>,
-    /// Intervals ending within this tile
-    /// SORTED by offset for binary search via radix sort
-    pub end_ivs: Vec<OffsetSid>,
+    /// Intervals that overlap with this tile
+    /// SORTED by start coordinate for binary search via radix sort
+    pub intervals: Vec<TaggedInterval>,
 }
 
 impl Tile {
     pub fn new(start_coord: u32) -> Self {
         Self {
             start_coord,
-            start_ivs: Vec::new(),
-            end_ivs: Vec::new(),
+            intervals: Vec::new(),
         }
     }
 
     /// Check if the tile is empty (no intervals touch it)
     pub fn is_empty(&self) -> bool {
-        self.start_ivs.is_empty() && self.end_ivs.is_empty()
+        self.intervals.is_empty()
     }
 }
 
@@ -315,7 +273,7 @@ mod tests {
         assert!(empty.is_empty());
 
         let mut non_empty = Tile::new(0);
-        non_empty.start_ivs.push(OffsetSid::new(50, 1));
+        non_empty.intervals.push(TaggedInterval::new(50, 60, 1));
         assert!(!non_empty.is_empty());
     }
 
@@ -324,9 +282,8 @@ mod tests {
         use rkyv::rancor::Error;
 
         let mut tile = Tile::new(1000);
-        tile.start_ivs.push(OffsetSid::new(50, 3));
-        tile.start_ivs.push(OffsetSid::new(75, 4));
-        tile.end_ivs.push(OffsetSid::new(100, 5));
+        tile.intervals.push(TaggedInterval::new(1050, 1100, 3));
+        tile.intervals.push(TaggedInterval::new(1075, 1150, 4));
 
         // Serialize
         let bytes = rkyv::to_bytes::<Error>(&tile).unwrap();
@@ -335,7 +292,6 @@ mod tests {
         let archived = rkyv::access::<ArchivedTile, Error>(&bytes).unwrap();
 
         assert_eq!(archived.start_coord, 1000);
-        assert_eq!(archived.start_ivs.len(), 2);
-        assert_eq!(archived.end_ivs.len(), 1);
+        assert_eq!(archived.intervals.len(), 2);
     }
 }
