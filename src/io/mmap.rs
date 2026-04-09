@@ -114,6 +114,7 @@ impl MappedChunk {
             self.mmap.len()
         };
 
+        // TODO: this will never happen, make this a debug assert
         if end > self.mmap.len() {
             return Err(MmapError::InvalidFormat(format!(
                 "Tile {} extends beyond file",
@@ -154,7 +155,6 @@ impl MappedChunk {
     pub fn chunk_id(&self) -> u32 {
         self.header.chunk_id
     }
-
 }
 
 /// Write a chunk to a file
@@ -282,7 +282,10 @@ pub fn merge_chunk(path: &Path, new_tiles: &[Tile]) -> Result<(), MmapError> {
     }
 
     // --- Pass 2: shift tiles back-to-front, then overwrite with merged data ---
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
     // Absolute positions
@@ -361,11 +364,17 @@ mod tests {
 
         // Create some tiles
         let mut tile0 = Tile::new(0);
-        tile0.intervals.push(crate::core::TaggedInterval::new(10, 30, 2));
-        tile0.intervals.push(crate::core::TaggedInterval::new(20, 40, 1));
+        tile0
+            .intervals
+            .push(crate::core::TaggedInterval::new(10, 30, 2));
+        tile0
+            .intervals
+            .push(crate::core::TaggedInterval::new(20, 40, 1));
 
         let mut tile1 = Tile::new(500);
-        tile1.intervals.push(crate::core::TaggedInterval::new(550, 580, 3));
+        tile1
+            .intervals
+            .push(crate::core::TaggedInterval::new(550, 580, 3));
 
         let tiles = vec![tile0, tile1];
 
@@ -477,7 +486,11 @@ mod tests {
         let t = mapped.read_tile(0).unwrap();
         assert_eq!(t.intervals.len(), 3);
         // Must be sorted by start coordinate
-        assert!(t.intervals.windows(2).all(|w| w[0].iv.start <= w[1].iv.start));
+        assert!(
+            t.intervals
+                .windows(2)
+                .all(|w| w[0].iv.start <= w[1].iv.start)
+        );
         // Correct order: sid=1 (100), sid=0 (200), sid=2 (400)
         assert_eq!(t.intervals[0].sid, 1);
         assert_eq!(t.intervals[1].sid, 0);
