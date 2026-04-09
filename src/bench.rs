@@ -60,6 +60,11 @@ impl BedGenConfig {
         self
     }
 
+    pub fn with_genome_size(mut self, genome_size: u32) -> Self {
+        self.genome_size = genome_size;
+        self
+    }
+
     pub fn with_sort(mut self, sort: bool) -> Self {
         self.sort = sort;
         self
@@ -103,6 +108,7 @@ pub fn generate_bed_files_parallel(
     dir: &Path,
     num_files: usize,
     intervals_per_file: usize,
+    genome_size: u32,
     min_len: u32,
     max_len: u32,
     base_seed: u64,
@@ -113,6 +119,7 @@ pub fn generate_bed_files_parallel(
         let path = dir.join(format!("source_{}.bed", i));
         let config = BedGenConfig::default()
             .with_intervals(intervals_per_file)
+            .with_genome_size(genome_size)
             .with_size_range(min_len, max_len)
             .with_seed(base_seed + i as u64)
             .with_sort(sort);

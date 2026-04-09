@@ -22,7 +22,7 @@ pub struct Cli {
     #[arg(short = 'n', long, default_value_t = 10_000)]
     pub num_intervals: usize,
 
-    /// Genome size (Note: fixed to 250Mb in parallel generation due to function signature)
+    /// Genome size
     #[arg(short = 'g', long, default_value_t = 250_000_000)]
     pub genome_size: u32,
 
@@ -104,6 +104,7 @@ fn main() {
             &cli.output,
             cli.num_files,
             cli.num_intervals,
+            cli.genome_size,
             cli.min_len,
             cli.max_len,
             cli.seed,
