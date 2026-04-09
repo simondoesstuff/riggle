@@ -155,13 +155,12 @@ pub struct IndexSizeReport {
     pub layer_breakdown: Vec<LayerSizeInfo>,
 }
 
-/// Size information for a single layer
+/// Size information for a single layer across all shards
 #[derive(Debug, Clone)]
 pub struct LayerSizeInfo {
     pub layer_id: u8,
     pub size_bytes: u64,
-    pub num_chunks: usize,
-    pub avg_chunk_bytes: f64,
+    pub num_files: usize,
 }
 
 /// Analyze index size and structure
@@ -173,30 +172,42 @@ pub fn analyze_index_size(
     let input_size = dir_size(input_path);
     let index_size = dir_size(db_path);
 
-    let mut layer_breakdown = Vec::new();
+    // Collect per-layer stats by scanning shard subdirectories for layer_*.bin files.
+    let mut layer_map: std::collections::HashMap<u8, (u64, usize)> =
+        std::collections::HashMap::new();
 
-    for entry in fs::read_dir(db_path).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if path.is_dir() && name.starts_with("layer_") {
-            let layer_id: u8 = name.strip_prefix("layer_").unwrap().parse().unwrap_or(0);
-            let size = dir_size(&path);
-            let chunk_count = fs::read_dir(&path).map(|d| d.count()).unwrap_or(0);
-
-            layer_breakdown.push(LayerSizeInfo {
-                layer_id,
-                size_bytes: size,
-                num_chunks: chunk_count,
-                avg_chunk_bytes: if chunk_count > 0 {
-                    size as f64 / chunk_count as f64
-                } else {
-                    0.0
-                },
-            });
+    if let Ok(shards) = fs::read_dir(db_path) {
+        for entry in shards.filter_map(|e| e.ok()) {
+            let shard_path = entry.path();
+            if !shard_path.is_dir() {
+                continue;
+            }
+            if let Ok(files) = fs::read_dir(&shard_path) {
+                for fentry in files.filter_map(|e| e.ok()) {
+                    let fname = fentry.file_name().to_string_lossy().to_string();
+                    if let Some(rest) = fname.strip_prefix("layer_") {
+                        if let Some(id_str) = rest.strip_suffix(".bin") {
+                            if let Ok(layer_id) = id_str.parse::<u8>() {
+                                let size = fentry.metadata().map(|m| m.len()).unwrap_or(0);
+                                let entry = layer_map.entry(layer_id).or_insert((0, 0));
+                                entry.0 += size;
+                                entry.1 += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+
+    let mut layer_breakdown: Vec<LayerSizeInfo> = layer_map
+        .into_iter()
+        .map(|(layer_id, (size_bytes, num_files))| LayerSizeInfo {
+            layer_id,
+            size_bytes,
+            num_files,
+        })
+        .collect();
 
     layer_breakdown.sort_by_key(|l| l.layer_id);
 
@@ -227,11 +238,10 @@ impl IndexSizeReport {
         println!("\nLayer Breakdown:");
         for layer in &self.layer_breakdown {
             println!(
-                "  layer_{:<2} | {:>8.2} MB | {:>5} chunks | {:>8.2} KB/chunk avg",
+                "  layer_{:<2} | {:>8.2} MB | {:>5} shards",
                 layer.layer_id,
                 layer.size_bytes as f64 / 1_000_000.0,
-                layer.num_chunks,
-                layer.avg_chunk_bytes / 1000.0
+                layer.num_files,
             );
         }
         println!(

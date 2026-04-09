@@ -1,626 +1,303 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rayon::prelude::*;
 use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
-use crate::core::{ChunkID, Interval, LayerID, TaggedInterval};
+use crate::core::Interval;
 use crate::io::{
-    BedParseError, ChunkHeader, LayerConfig, MasterHeader, SidMetadata,
-    is_bed_file, merge_chunk, mmap::MmapError, parse_bed_file, write_chunk,
+    BedParseError, LayerConfig, LayerError, Meta, MetaError, SidEntry, extend_layer, is_bed_file,
+    parse_bed_file, write_layer,
 };
-use crate::sweep::index_sweep;
 
-/// Errors that can occur during database build
+/// Errors from the add / build pipeline
 #[derive(Debug, Error)]
-pub enum BuildError {
+pub enum AddError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
     #[error("BED parse error: {0}")]
     BedParse(#[from] BedParseError),
-
-    #[error("No input files found")]
-    NoInputFiles,
-
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-
-    #[error("Database not found at {0}")]
-    DatabaseNotFound(PathBuf),
-
-    #[error("Invalid database: {0}")]
-    InvalidDatabase(String),
-
-    #[error("Chunk write error: {0}")]
-    ChunkWrite(#[from] MmapError),
+    #[error("Meta error: {0}")]
+    Meta(#[from] MetaError),
+    #[error("Layer error: {0}")]
+    Layer(#[from] LayerError),
+    #[error("Input path not found: {0}")]
+    InputNotFound(PathBuf),
+    #[error("No BED files found in {0}")]
+    NoBedFiles(PathBuf),
 }
 
-/// Configuration for database build
-#[derive(Debug, Clone)]
-pub struct BuildConfig {
-    /// Input directory containing BED files
-    pub input_dir: PathBuf,
-    /// Output directory for database
-    pub output_dir: PathBuf,
-    /// Layer configurations (use default if None)
-    pub layer_configs: Option<Vec<LayerConfig>>,
-    /// Number of BED files to ingest per batch (None = all at once)
-    pub batch_size: Option<usize>,
-}
-
-impl BuildConfig {
-    pub fn new(input_dir: PathBuf, output_dir: PathBuf) -> Self {
-        Self {
-            input_dir,
-            output_dir,
-            layer_configs: None,
-            batch_size: None,
-        }
-    }
-}
-
-/// Configuration for adding files to existing database
+/// Configuration for `add_to_database`.
 #[derive(Debug, Clone)]
 pub struct AddConfig {
-    /// Input directory containing BED files to add
-    pub input_dir: PathBuf,
-    /// Path to existing database directory
-    pub db_dir: PathBuf,
-    /// Number of BED files to ingest per batch (None = all at once)
-    pub batch_size: Option<usize>,
+    /// Directory containing BED files to ingest
+    pub input_path: PathBuf,
+    /// Database directory (created if it does not exist)
+    pub db_path: PathBuf,
+    /// Layer configuration — used only when creating a new database.
+    /// If `None` and the database is new, defaults to `LayerConfig::default_genomic()`.
+    pub layer_config: Option<LayerConfig>,
 }
 
 impl AddConfig {
-    pub fn new(input_dir: PathBuf, db_dir: PathBuf) -> Self {
+    pub fn new(input_path: PathBuf, db_path: PathBuf) -> Self {
         Self {
-            input_dir,
-            db_dir,
-            batch_size: None,
+            input_path,
+            db_path,
+            layer_config: None,
         }
     }
 }
 
-// =============================================================================
-// Shared Pipeline Helpers
-// =============================================================================
+/// Ingest a batch of BED files into the database.
+///
+/// If the database does not yet exist it is created.  If it already exists the
+/// new intervals are merged into the existing layer files.
+///
+/// ### Pipeline
+///
+/// 1. Load or create `meta.json`.
+/// 2. Collect BED files from `config.input_path`.
+/// 3. Parse all files in parallel, tagging each with a new D_SID.
+/// 4. Partition intervals into `(shard, layer_idx)` buckets.
+/// 5. Sort each bucket by `start` using voracious radix sort.
+/// 6. Write new buckets / merge into existing layer files (parallel per bucket).
+/// 7. Update `meta.json`.
+pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
+    if !config.input_path.exists() {
+        return Err(AddError::InputNotFound(config.input_path.clone()));
+    }
 
-/// Find all BED files in a directory
-fn find_bed_files(dir: &Path) -> Result<Vec<PathBuf>, BuildError> {
-    let files: Vec<_> = fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| is_bed_file(p))
+    // Collect BED files
+    let bed_files: Vec<PathBuf> = if config.input_path.is_dir() {
+        fs::read_dir(&config.input_path)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| is_bed_file(p))
+            .collect()
+    } else if is_bed_file(&config.input_path) {
+        vec![config.input_path.clone()]
+    } else {
+        return Err(AddError::NoBedFiles(config.input_path.clone()));
+    };
+
+    if bed_files.is_empty() {
+        return Err(AddError::NoBedFiles(config.input_path.clone()));
+    }
+
+    // Load or create database
+    fs::create_dir_all(&config.db_path)?;
+    let meta_path = config.db_path.join("meta.json");
+    let mut meta = if meta_path.exists() {
+        Meta::load(&config.db_path)?
+    } else {
+        let layer_config = config
+            .layer_config
+            .clone()
+            .unwrap_or_else(LayerConfig::default_genomic);
+        Meta::new(layer_config)
+    };
+
+    let layer_config = meta.layer_config.clone();
+    let next_sid = meta.next_sid();
+
+    // Parse all files in parallel.
+    // Each file is assigned a unique D_SID starting from `next_sid`.
+    let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>), AddError>> =
+        bed_files
+            .par_iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let sid = next_sid + i as u32;
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("file_{}", sid));
+                let shards = parse_bed_file(path, sid)?;
+                Ok((sid, name, shards))
+            })
+            .collect();
+
+    // Partition all intervals into (shard, layer_idx) buckets.
+    // key: (shard_name, layer_idx) → Vec<Interval>
+    let mut buckets: HashMap<(String, usize), Vec<Interval>> = HashMap::new();
+    let mut new_sids: Vec<(u32, String)> = Vec::new();
+
+    for result in parse_results {
+        let (sid, name, shard_map) = result?;
+        new_sids.push((sid, name));
+        for (shard, intervals) in shard_map {
+            for iv in intervals {
+                let layer = layer_config.layer_for_size(iv.size());
+                buckets
+                    .entry((shard.clone(), layer))
+                    .or_default()
+                    .push(iv);
+            }
+        }
+    }
+
+    // Sort each bucket by start coordinate using voracious radix sort.
+    // Collect into a vec for parallel iteration.
+    let mut bucket_vec: Vec<((String, usize), Vec<Interval>)> = buckets.into_iter().collect();
+    bucket_vec.par_iter_mut().for_each(|(_, ivs)| {
+        ivs.voracious_sort();
+    });
+
+    // Determine which shards and layers are newly used.
+    let mut max_layer_used = meta.num_layers.saturating_sub(1);
+
+    // Write / merge each bucket into the database (parallel across buckets).
+    let write_errors: Vec<AddError> = bucket_vec
+        .par_iter()
+        .filter_map(|((shard, layer_idx), sorted_ivs)| {
+            if sorted_ivs.is_empty() {
+                return None;
+            }
+            let shard_dir = config.db_path.join(shard);
+            if let Err(e) = fs::create_dir_all(&shard_dir) {
+                return Some(AddError::Io(e));
+            }
+            let layer_path = shard_dir.join(format!("layer_{}.bin", layer_idx));
+            let result = if layer_path.exists() {
+                extend_layer(&layer_path, sorted_ivs)
+            } else {
+                write_layer(&layer_path, sorted_ivs)
+            };
+            result.err().map(AddError::Layer)
+        })
         .collect();
 
-    if files.is_empty() {
-        return Err(BuildError::NoInputFiles);
+    if let Some(err) = write_errors.into_iter().next() {
+        return Err(err);
     }
 
-    Ok(files)
-}
+    // Update meta: add new SID entries, shards, num_layers.
+    for (sid, name) in new_sids {
+        meta.sid_map.insert(sid, SidEntry { name });
+    }
 
-/// Parse BED files, update header metadata, and return intervals grouped by shard
-///
-/// Performance: File parsing is parallelized using Rayon.
-fn ingest_bed_files(
-    bed_files: Vec<PathBuf>,
-    start_sid: u32,
-    header: &mut MasterHeader,
-) -> Result<HashMap<String, Vec<TaggedInterval>>, BuildError> {
-    // Parse all files in parallel to collect intervals grouped by shard
-    let parsed_files: Vec<(u32, PathBuf, HashMap<String, Vec<TaggedInterval>>)> = bed_files
-        .into_par_iter()
-        .enumerate()
-        .map(|(idx, bed_path)| {
-            let sid = start_sid + idx as u32;
-            let shard_intervals = parse_bed_file(&bed_path, sid)?;
-            Ok((sid, bed_path, shard_intervals))
-        })
-        .collect::<Result<Vec<_>, BedParseError>>()?;
-
-    // Global shard map to aggregate across files
-    let mut all_shards: HashMap<String, Vec<TaggedInterval>> = HashMap::new();
-
-    // Process each file's intervals
-    for (sid, bed_path, shard_intervals) in parsed_files {
-        // Compute metadata across all shards for this file
-        let interval_count: u32 = shard_intervals.values().map(|v| v.len() as u32).sum();
-        let total_bases: u64 = shard_intervals
-            .values()
-            .flat_map(|v| v.iter())
-            .map(|iv| iv.iv.len() as u64)
-            .sum();
-        let name = bed_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("source_{}", sid));
-
-        header.add_source(sid, SidMetadata::new(name, interval_count, total_bases));
-
-        // Process each shard's intervals
-        for (shard, intervals) in shard_intervals {
-            // Update shard max coordinate
-            for iv in &intervals {
-                header.update_shard_max_coord(&shard, iv.iv.end);
-                header.update_max_coord(iv.iv.end); // Keep global max for backwards compat
-            }
-
-            // Add shard to header
-            header.add_shard(shard.clone());
-
-            // Aggregate intervals by shard
-            all_shards.entry(shard).or_default().extend(intervals);
+    for (shard, layer_idx) in bucket_vec.iter().map(|((s, l), _)| (s, *l)) {
+        if !meta.shards.contains(shard) {
+            meta.shards.push(shard.clone());
+        }
+        if layer_idx > max_layer_used {
+            max_layer_used = layer_idx;
         }
     }
 
-    Ok(all_shards)
-}
-
-// =============================================================================
-// Public API
-// =============================================================================
-
-/// Build a database from BED files in a directory.
-///
-/// Files are processed in batches of `config.batch_size` (default: all at once).
-/// Each batch is ingested into memory, then merged into the on-disk index.
-/// Because `merge_chunk_file` creates missing chunk files from scratch, the first
-/// batch and all subsequent batches go through the same code path.
-pub fn build_database(config: &BuildConfig) -> Result<(), BuildError> {
-    let bed_files = find_bed_files(&config.input_dir)?;
-
-    fs::create_dir_all(&config.output_dir)?;
-
-    let mut master_header = MasterHeader::new();
-    if let Some(ref configs) = config.layer_configs {
-        master_header.layer_configs = configs.clone();
-    }
-
-    let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
-    let mut next_sid = 0u32;
-
-    for batch in bed_files.chunks(batch_size) {
-        let shard_intervals =
-            ingest_bed_files(batch.to_vec(), next_sid, &mut master_header)?;
-        next_sid += batch.len() as u32;
-
-        shard_intervals
-            .par_iter()
-            .filter(|(_, intervals)| !intervals.is_empty())
-            .try_for_each(|(shard, intervals)| {
-                merge_shard_to_disk(shard, intervals, &master_header, &config.output_dir)
-            })?;
-
-        write_master_header(&config.output_dir, &master_header)?;
-    }
+    meta.num_layers = max_layer_used + 1;
+    meta.save(&config.db_path)?;
 
     Ok(())
-}
-
-/// Partition intervals by layer based on their size.
-///
-/// IMPORTANT: Each interval is assigned to exactly ONE layer based on its length.
-/// The layer is determined by log2(length), so intervals of similar sizes are grouped.
-/// An interval may span multiple tiles and chunks within its layer, but never
-/// crosses layer boundaries. This is critical for the query algorithm's correctness.
-fn partition_by_layer(
-    intervals: &[TaggedInterval],
-    layer_configs: &[LayerConfig],
-) -> Vec<Vec<TaggedInterval>> {
-    let mut partitions: Vec<Vec<TaggedInterval>> = vec![Vec::new(); layer_configs.len()];
-
-    for iv in intervals {
-        // Assign to exactly one layer based on interval length
-        let layer_id = LayerID::from_length(iv.iv.len());
-        let layer_idx = (layer_id.0 as usize).min(partitions.len() - 1);
-        partitions[layer_idx].push(*iv);
-    }
-
-    partitions
-}
-
-/// Group intervals by chunk, duplicating boundary-crossers
-fn group_by_chunk(
-    intervals: &[TaggedInterval],
-    config: &LayerConfig,
-) -> HashMap<u32, Vec<TaggedInterval>> {
-    let mut chunks: HashMap<u32, Vec<TaggedInterval>> = HashMap::new();
-
-    for iv in intervals {
-        let start_chunk = ChunkID::from_coord(iv.iv.start, config.chunk_size);
-        let end_chunk = ChunkID::from_coord(iv.iv.end.saturating_sub(1), config.chunk_size);
-
-        // Add to all chunks the interval touches
-        for chunk_id in start_chunk.0..=end_chunk.0 {
-            chunks.entry(chunk_id).or_default().push(*iv);
-        }
-    }
-
-    chunks
-}
-
-/// Write a chunk file
-fn write_chunk_file(
-    layer_dir: &Path,
-    chunk_id: u32,
-    config: &LayerConfig,
-    intervals: &[TaggedInterval],
-) -> Result<(), BuildError> {
-    let chunk_start = chunk_id * config.chunk_size;
-    let chunk_end = chunk_start + config.chunk_size;
-    let chunk_bounds = Interval::new(chunk_start, chunk_end);
-
-    // Build tiles using sweep algorithm
-    let tiles = index_sweep(chunk_bounds, config.tile_size, intervals);
-
-    // Create header with tile offsets
-    let mut header = ChunkHeader::new(config.layer_id, chunk_id, chunk_start, chunk_end);
-
-    // Calculate tile offsets for header
-    let mut offset = 0u32;
-    for tile in &tiles {
-        header.tile_offsets.push(offset);
-        let tile_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(tile)
-            .map_err(|e| BuildError::Serialization(e.to_string()))?;
-        offset += tile_bytes.len() as u32;
-    }
-
-    // Write to file using consolidated write_chunk from io module
-    let chunk_path = layer_dir.join(format!("chunk_{}.bin", chunk_id));
-    write_chunk(&chunk_path, &header, &tiles)?;
-
-    Ok(())
-}
-
-/// Merge new intervals into an existing chunk file, or create it if absent.
-///
-/// This is the add-path counterpart to `write_chunk_file`.  It:
-/// 1. Runs `index_sweep` on the incoming sorted intervals to produce new-only tiles.
-/// 2. If the chunk file already exists, delegates to `merge_chunk` which performs
-///    the efficient in-place mmap merge (extend + back-to-front shift + sorted merge).
-/// 3. If the chunk file is absent, falls through to `write_chunk_file` (no old data
-///    to merge).
-fn merge_chunk_file(
-    layer_dir: &Path,
-    chunk_id: u32,
-    config: &LayerConfig,
-    new_intervals: &[TaggedInterval],
-) -> Result<(), BuildError> {
-    let chunk_path = layer_dir.join(format!("chunk_{}.bin", chunk_id));
-
-    if !chunk_path.exists() {
-        return write_chunk_file(layer_dir, chunk_id, config, new_intervals);
-    }
-
-    let chunk_start = chunk_id * config.chunk_size;
-    let chunk_end = chunk_start + config.chunk_size;
-    let chunk_bounds = Interval::new(chunk_start, chunk_end);
-
-    let new_tiles = index_sweep(chunk_bounds, config.tile_size, new_intervals);
-    merge_chunk(&chunk_path, &new_tiles)?;
-    Ok(())
-}
-
-/// Partition and merge intervals into an existing shard on disk.
-///
-/// Identical to `flush_shard_to_disk` except it calls `merge_chunk_file`
-/// instead of `write_chunk_file` so existing chunk data is preserved.
-fn merge_shard_to_disk(
-    shard: &str,
-    intervals: &[TaggedInterval],
-    header: &MasterHeader,
-    db_dir: &Path,
-) -> Result<(), BuildError> {
-    let shard_dir = db_dir.join(shard);
-    let partitions = partition_by_layer(intervals, &header.layer_configs);
-
-    for (layer_id, mut layer_intervals) in partitions.into_iter().enumerate() {
-        if layer_intervals.is_empty() {
-            continue;
-        }
-
-        let layer_config = &header.layer_configs[layer_id];
-        layer_intervals.voracious_sort();
-        let chunks = group_by_chunk(&layer_intervals, layer_config);
-
-        let layer_dir = shard_dir.join(format!("layer_{}", layer_id));
-        fs::create_dir_all(&layer_dir)?;
-
-        chunks
-            .into_par_iter()
-            .try_for_each(|(chunk_id, chunk_intervals)| {
-                merge_chunk_file(&layer_dir, chunk_id, layer_config, &chunk_intervals)
-            })?;
-    }
-
-    Ok(())
-}
-
-/// Write master header to file
-fn write_master_header(output_dir: &Path, header: &MasterHeader) -> Result<(), BuildError> {
-    let header_path = output_dir.join("header.json");
-    let json = serde_json::to_string_pretty(header)
-        .map_err(|e| BuildError::Serialization(e.to_string()))?;
-    fs::write(header_path, json)?;
-    Ok(())
-}
-
-/// Add BED files to an existing database.
-///
-/// Returns the number of sources added.
-pub fn add_to_database(config: &AddConfig) -> Result<usize, BuildError> {
-    let header_path = config.db_dir.join("header.json");
-    if !header_path.exists() {
-        return Err(BuildError::DatabaseNotFound(config.db_dir.clone()));
-    }
-
-    let header_content = fs::read_to_string(&header_path)?;
-    let mut master_header: MasterHeader = serde_json::from_str(&header_content)
-        .map_err(|e| BuildError::InvalidDatabase(e.to_string()))?;
-
-    let bed_files = find_bed_files(&config.input_dir)?;
-    let num_added = bed_files.len();
-
-    let mut next_sid = master_header
-        .sid_map
-        .keys()
-        .max()
-        .map(|&max| max + 1)
-        .unwrap_or(0);
-
-    let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
-
-    for batch in bed_files.chunks(batch_size) {
-        let shard_intervals =
-            ingest_bed_files(batch.to_vec(), next_sid, &mut master_header)?;
-        next_sid += batch.len() as u32;
-
-        shard_intervals
-            .par_iter()
-            .filter(|(_, intervals)| !intervals.is_empty())
-            .try_for_each(|(shard, intervals)| {
-                merge_shard_to_disk(shard, intervals, &master_header, &config.db_dir)
-            })?;
-
-        write_master_header(&config.db_dir, &master_header)?;
-    }
-
-    Ok(num_added)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write as IoWrite;
+    use crate::io::{MappedLayer, Meta};
+    use std::io::Write;
     use tempfile::TempDir;
 
-    fn create_test_bed(dir: &Path, name: &str, content: &str) {
+    fn write_bed(dir: &std::path::Path, name: &str, content: &str) {
         let path = dir.join(name);
-        let mut file = File::create(path).unwrap();
-        file.write_all(content.as_bytes()).unwrap();
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
     }
 
     #[test]
-    fn test_build_database_basic() {
-        let input_dir = TempDir::new().unwrap();
-        let output_dir = TempDir::new().unwrap();
+    fn test_add_creates_database() {
+        let input = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
 
-        // Create test BED files
-        create_test_bed(
-            input_dir.path(),
+        write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
+
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
+
+        assert!(db.path().join("meta.json").exists());
+        let meta = Meta::load(db.path()).unwrap();
+        assert_eq!(meta.sid_map.len(), 1);
+        assert!(meta.shards.contains(&"chr1".to_string()));
+    }
+
+    #[test]
+    fn test_add_twice_accumulates_sids() {
+        let input1 = TempDir::new().unwrap();
+        let input2 = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        write_bed(input1.path(), "a.bed", "chr1\t100\t200\n");
+        write_bed(input2.path(), "b.bed", "chr1\t300\t400\n");
+
+        add_to_database(&AddConfig::new(
+            input1.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
+        add_to_database(&AddConfig::new(
+            input2.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
+
+        let meta = Meta::load(db.path()).unwrap();
+        assert_eq!(meta.sid_map.len(), 2);
+        assert!(meta.sid_map.contains_key(&0));
+        assert!(meta.sid_map.contains_key(&1));
+    }
+
+    #[test]
+    fn test_add_layer_file_sorted() {
+        let input = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        // Two files with interleaved coords — merged layer must be sorted
+        write_bed(input.path(), "a.bed", "chr1\t300\t400\nchr1\t100\t200\n");
+        write_bed(input.path(), "b.bed", "chr1\t150\t250\nchr1\t350\t450\n");
+
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
+
+        let meta = Meta::load(db.path()).unwrap();
+        // All these intervals have size 100, which falls in layer 0 (size < 128)
+        let layer_path = db.path().join("chr1").join("layer_0.bin");
+        assert!(layer_path.exists());
+        let mapped = MappedLayer::open(&layer_path).unwrap();
+        let ivs = mapped.intervals();
+        for w in ivs.windows(2) {
+            assert!(w[0].start <= w[1].start);
+        }
+    }
+
+    #[test]
+    fn test_add_multi_shard() {
+        let input = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        write_bed(
+            input.path(),
             "a.bed",
-            "chr1\t100\t200\nchr1\t300\t400\n",
-        );
-        create_test_bed(
-            input_dir.path(),
-            "b.bed",
-            "chr1\t150\t250\nchr1\t350\t450\n",
+            "chr1\t100\t200\nchr2\t300\t400\n",
         );
 
-        let config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            output_dir.path().to_path_buf(),
-        );
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
-        build_database(&config).unwrap();
-
-        // Check that master header was created
-        let header_path = output_dir.path().join("header.json");
-        assert!(header_path.exists());
-
-        // Read and verify header
-        let header_content = fs::read_to_string(&header_path).unwrap();
-        let header: MasterHeader = serde_json::from_str(&header_content).unwrap();
-        assert_eq!(header.num_sources(), 2);
-        assert_eq!(header.num_shards(), 1);
-        assert!(header.shards.contains(&"chr1".to_string()));
-
-        // Check shard directory was created
-        assert!(output_dir.path().join("chr1").exists());
-    }
-
-    #[test]
-    fn test_build_database_multi_shard() {
-        let input_dir = TempDir::new().unwrap();
-        let output_dir = TempDir::new().unwrap();
-
-        // Create test BED file with multiple chromosomes
-        create_test_bed(
-            input_dir.path(),
-            "a.bed",
-            "chr1\t100\t200\nchr2\t300\t400\nchr1\t500\t600\n",
-        );
-
-        let config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            output_dir.path().to_path_buf(),
-        );
-
-        build_database(&config).unwrap();
-
-        let header_path = output_dir.path().join("header.json");
-        let header: MasterHeader =
-            serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
-
-        assert_eq!(header.num_shards(), 2);
-        assert!(header.shards.contains(&"chr1".to_string()));
-        assert!(header.shards.contains(&"chr2".to_string()));
-
-        // Check shard directories
-        assert!(output_dir.path().join("chr1").exists());
-        assert!(output_dir.path().join("chr2").exists());
-    }
-
-    #[test]
-    fn test_build_database_batched() {
-        // Verify that batch_size=1 (one file per merge pass) produces the same
-        // result as processing all files at once.
-        let input_dir = TempDir::new().unwrap();
-        let output_dir_batched = TempDir::new().unwrap();
-        let output_dir_bulk = TempDir::new().unwrap();
-
-        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\nchr1\t500\t600\n");
-        create_test_bed(input_dir.path(), "b.bed", "chr1\t150\t250\nchr2\t300\t400\n");
-        create_test_bed(input_dir.path(), "c.bed", "chr1\t700\t800\nchr2\t900\t1000\n");
-
-        let mut batched_config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            output_dir_batched.path().to_path_buf(),
-        );
-        batched_config.batch_size = Some(1);
-        build_database(&batched_config).unwrap();
-
-        let bulk_config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            output_dir_bulk.path().to_path_buf(),
-        );
-        build_database(&bulk_config).unwrap();
-
-        // Both should have the same header (3 sources, 2 shards)
-        let read_header = |dir: &TempDir| -> MasterHeader {
-            let s = fs::read_to_string(dir.path().join("header.json")).unwrap();
-            serde_json::from_str(&s).unwrap()
-        };
-
-        let h_batched = read_header(&output_dir_batched);
-        let h_bulk = read_header(&output_dir_bulk);
-
-        assert_eq!(h_batched.num_sources(), 3);
-        assert_eq!(h_batched.num_sources(), h_bulk.num_sources());
-        assert_eq!(h_batched.num_shards(), 2);
-        assert_eq!(h_batched.num_shards(), h_bulk.num_shards());
-    }
-
-    #[test]
-    fn test_build_database_no_files() {
-        let input_dir = TempDir::new().unwrap();
-        let output_dir = TempDir::new().unwrap();
-
-        let config = BuildConfig::new(
-            input_dir.path().to_path_buf(),
-            output_dir.path().to_path_buf(),
-        );
-
-        let result = build_database(&config);
-        assert!(matches!(result, Err(BuildError::NoInputFiles)));
-    }
-
-    #[test]
-    fn test_partition_by_layer() {
-        // With centralized constants: layer = max(0, floor(log2(len)) - 10)
-        // Layer 0: len < 2048, Layer 1: [2048, 4096), Layer 2: [4096, 8192), etc.
-        let intervals = vec![
-            TaggedInterval::new(0, 1000, 0),  // length 1000 -> layer 0
-            TaggedInterval::new(0, 3000, 1),  // length 3000 -> layer 1 (2048 <= 3000 < 4096)
-            TaggedInterval::new(0, 5000, 2),  // length 5000 -> layer 2 (4096 <= 5000 < 8192)
-        ];
-
-        let layers = LayerConfig::default_layers();
-        let partitions = partition_by_layer(&intervals, &layers);
-
-        // Check intervals are in correct layers
-        assert!(partitions[0].iter().any(|iv| iv.sid == 0));
-        assert!(partitions[1].iter().any(|iv| iv.sid == 1));
-        assert!(partitions[2].iter().any(|iv| iv.sid == 2));
-    }
-
-    #[test]
-    fn test_group_by_chunk() {
-        let config = LayerConfig::new(0, 1, 2, 100, 1000);
-        let intervals = vec![
-            TaggedInterval::new(100, 200, 0),   // chunk 0
-            TaggedInterval::new(900, 1100, 1),  // crosses chunks 0 and 1
-            TaggedInterval::new(2000, 2100, 2), // chunk 2
-        ];
-
-        let chunks = group_by_chunk(&intervals, &config);
-
-        assert!(chunks.get(&0).unwrap().iter().any(|iv| iv.sid == 0));
-        assert!(chunks.get(&0).unwrap().iter().any(|iv| iv.sid == 1));
-        assert!(chunks.get(&1).unwrap().iter().any(|iv| iv.sid == 1));
-        assert!(chunks.get(&2).unwrap().iter().any(|iv| iv.sid == 2));
-    }
-
-    #[test]
-    fn test_add_to_database() {
-        let input_dir = TempDir::new().unwrap();
-        let add_dir = TempDir::new().unwrap();
-        let db_dir = TempDir::new().unwrap();
-
-        // Create initial database
-        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\n");
-
-        let build_config =
-            BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
-        build_database(&build_config).unwrap();
-
-        // Verify initial state
-        let header_path = db_dir.path().join("header.json");
-        let initial_header: MasterHeader =
-            serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
-        assert_eq!(initial_header.num_sources(), 1);
-        assert_eq!(initial_header.num_shards(), 1);
-
-        // Add new files (including a new shard)
-        create_test_bed(add_dir.path(), "b.bed", "chr1\t300\t400\n");
-        create_test_bed(add_dir.path(), "c.bed", "chr2\t500\t600\n");
-
-        let add_config = AddConfig::new(add_dir.path().to_path_buf(), db_dir.path().to_path_buf());
-        let added = add_to_database(&add_config).unwrap();
-
-        assert_eq!(added, 2);
-
-        // Verify updated state
-        let updated_header: MasterHeader =
-            serde_json::from_str(&fs::read_to_string(&header_path).unwrap()).unwrap();
-        assert_eq!(updated_header.num_sources(), 3);
-        assert_eq!(updated_header.num_shards(), 2);
-
-        // Check sids are sequential
-        assert!(updated_header.sid_map.contains_key(&0)); // original
-        assert!(updated_header.sid_map.contains_key(&1)); // added
-        assert!(updated_header.sid_map.contains_key(&2)); // added
-
-        // Check shard directories
-        assert!(db_dir.path().join("chr1").exists());
-        assert!(db_dir.path().join("chr2").exists());
-    }
-
-    #[test]
-    fn test_add_to_nonexistent_database() {
-        let input_dir = TempDir::new().unwrap();
-        create_test_bed(input_dir.path(), "a.bed", "chr1\t100\t200\n");
-
-        let config = AddConfig::new(
-            input_dir.path().to_path_buf(),
-            PathBuf::from("/nonexistent/db"),
-        );
-
-        let result = add_to_database(&config);
-        assert!(matches!(result, Err(BuildError::DatabaseNotFound(_))));
+        let meta = Meta::load(db.path()).unwrap();
+        assert_eq!(meta.shards.len(), 2);
+        assert!(db.path().join("chr1").exists());
+        assert!(db.path().join("chr2").exists());
     }
 }

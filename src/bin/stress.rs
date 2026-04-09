@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use riggle::bench::{
     BedGenConfig, TimingResult, analyze_index_size, generate_bed_file, generate_bed_files_parallel,
 };
-use riggle::tasks::{BuildConfig, QueryConfig, build_database, query_database};
+use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "stress")]
@@ -191,8 +191,8 @@ fn run_build_benchmark(
 
     println!("\nBuilding database...");
     let build_start = Instant::now();
-    let config = BuildConfig::new(input_dir.path().to_path_buf(), db_path.clone());
-    build_database(&config).unwrap();
+    let config = AddConfig::new(input_dir.path().to_path_buf(), db_path.clone());
+    add_to_database(&config).unwrap();
     let build_time = build_start.elapsed();
 
     let result = TimingResult::new("Database build", total_intervals, build_time.as_secs_f64());
@@ -296,8 +296,8 @@ fn run_size_analysis(
 
     print!("Building index... ");
     std::io::Write::flush(&mut std::io::stdout()).unwrap();
-    let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
-    build_database(&config).unwrap();
+    let config = AddConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+    add_to_database(&config).unwrap();
     println!("done");
     println!();
 
@@ -351,8 +351,8 @@ fn run_full_suite(scale: usize) {
 
         // Build
         let start = Instant::now();
-        let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
-        build_database(&config).unwrap();
+        let config = AddConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+        add_to_database(&config).unwrap();
         let elapsed = start.elapsed();
 
         let report = analyze_index_size(db_dir.path(), input_dir.path(), base_intervals);
@@ -385,8 +385,8 @@ fn run_full_suite(scale: usize) {
         false,
         false,
     );
-    let config = BuildConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
-    build_database(&config).unwrap();
+    let config = AddConfig::new(input_dir.path().to_path_buf(), db_dir.path().to_path_buf());
+    add_to_database(&config).unwrap();
 
     let query_sizes = [1_000, 10_000, 100_000];
 
