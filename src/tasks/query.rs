@@ -8,15 +8,13 @@ use thiserror::Error;
 
 use crate::core::TaggedInterval;
 use crate::io::{BedParseError, MappedChunk, MasterHeader, is_bed_file, parse_bed_file};
-use crate::matrix::{
-    BitwiseMask, DenseMatrix, SparseMatrix, condense_to_sparse, merge_sparse, zero_flagged_regions,
-};
+use crate::matrix::{DenseMatrix, SparseMatrix, condense_to_sparse_no_mask};
 use crate::sweep::query_sweep;
 
-// Thread-local buffer for query accumulation
-// Reuses DenseMatrix and BitwiseMask across chunk tasks on the same thread
+// Thread-local scratch buffer for the sweep.
+// Reused across chunk tasks on the same thread to avoid repeated allocations.
 thread_local! {
-    static THREAD_LOCAL_BUFFER: RefCell<Option<(DenseMatrix, BitwiseMask)>> = const { RefCell::new(None) };
+    static THREAD_LOCAL_BUFFER: RefCell<Option<DenseMatrix>> = const { RefCell::new(None) };
 }
 
 /// Errors that can occur during query
@@ -124,8 +122,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let db_shards: std::collections::HashSet<&str> =
         master_header.shards.iter().map(|s| s.as_str()).collect();
 
-    // Collect all sparse matrices from all shards
-    let mut all_sparse_matrices: Vec<SparseMatrix> = Vec::new();
+    // Single accumulator across all shards — at most one dense matrix is live
+    // per shard at a time, so peak memory is O(threads × matrix_size).
+    let mut accumulator = DenseMatrix::new(num_queries, num_sources);
 
     // Process each shard that exists in both query and database
     for (shard, shard_queries) in &parsed.shard_intervals {
@@ -150,8 +149,10 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             &master_header,
         );
 
-        // Process chunks in parallel
-        let shard_matrices: Vec<SparseMatrix> = chunk_tasks
+        // Tree-reduce chunks within this shard in parallel.
+        // Rayon's reduce_with pairs adjacent results in a tree, so at most
+        // O(threads) matrices are live at any moment — not O(chunks).
+        let shard_result = chunk_tasks
             .par_iter()
             .filter_map(|(layer_id, _chunk_id, path)| {
                 process_chunk(
@@ -164,13 +165,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 )
                 .ok()
             })
-            .collect();
+            .reduce_with(|mut a, b| {
+                a.add_dense(&b);
+                a
+            });
 
-        all_sparse_matrices.extend(shard_matrices);
+        // Fold the shard result into the cross-shard accumulator immediately,
+        // dropping the shard matrix before the next shard is processed.
+        if let Some(shard_dense) = shard_result {
+            accumulator.add_dense(&shard_dense);
+        }
     }
 
-    // Merge all sparse matrices from all shards
-    let final_counts = tree_reduce_sparse(all_sparse_matrices, num_queries, num_sources);
+    // One sparse conversion at the very end.
+    let final_counts = condense_to_sparse_no_mask(&accumulator, num_queries, num_sources);
 
     Ok(QueryResult {
         counts: final_counts,
@@ -320,7 +328,11 @@ fn chunk_path(db_path: &Path, shard: &str, layer_id: u8, chunk_id: u32) -> PathB
         .join(format!("chunk_{}.bin", chunk_id))
 }
 
-/// Process a single chunk using thread-local buffer reuse
+/// Process a single chunk, returning an owned DenseMatrix of intersection counts.
+///
+/// Uses a thread-local scratch buffer to avoid per-chunk allocation.
+/// After the sweep, the filled matrix is cloned for return and the scratch
+/// buffer is zeroed for reuse on the next chunk processed by this thread.
 fn process_chunk(
     path: &Path,
     layer_id: u8,
@@ -328,7 +340,7 @@ fn process_chunk(
     indexed_queries: &[(usize, TaggedInterval)],
     num_queries: usize,
     num_sources: usize,
-) -> Result<SparseMatrix, QueryError> {
+) -> Result<DenseMatrix, QueryError> {
     let mapped = MappedChunk::open(path)?;
 
     // Filter queries that intersect this chunk
@@ -342,10 +354,7 @@ fn process_chunk(
         .collect();
 
     if relevant_queries.is_empty() {
-        return Ok(sprs::CsMat::empty(
-            sprs::CompressedStorage::CSR,
-            num_sources,
-        ));
+        return Ok(DenseMatrix::new(num_queries, num_sources));
     }
 
     // Get tile size from layer config
@@ -355,77 +364,28 @@ fn process_chunk(
         .map(|c| c.tile_size)
         .unwrap_or(1024);
 
-    // Use thread-local buffer (reused across chunks on same thread)
+    // Use thread-local scratch buffer (reused across chunks on the same thread)
     THREAD_LOCAL_BUFFER.with(|cell| {
         let mut borrow = cell.borrow_mut();
 
-        // Initialize or resize buffers as needed
-        let (dense, mask) = borrow.get_or_insert_with(|| {
-            (
-                DenseMatrix::new(num_queries, num_sources),
-                BitwiseMask::new(num_queries, num_sources),
-            )
-        });
+        // Initialize or resize as needed
+        let scratch = borrow.get_or_insert_with(|| DenseMatrix::new(num_queries, num_sources));
 
-        // Resize if dimensions changed (only reallocates if larger)
-        if dense.num_rows() != num_queries || dense.num_cols() != num_sources {
-            dense.resize_and_zero(num_queries, num_sources);
-            mask.resize_and_clear(num_queries, num_sources);
+        if scratch.num_rows() != num_queries || scratch.num_cols() != num_sources {
+            scratch.resize_and_zero(num_queries, num_sources);
         }
 
-        // Run query sweep
-        query_sweep(&mapped, tile_size, &relevant_queries, dense, mask);
+        // Run the sweep-line query
+        query_sweep(&mapped, tile_size, &relevant_queries, scratch);
 
-        // Condense to sparse result
-        let result = condense_to_sparse(dense, mask);
-
-        // Clear only flagged regions for next use (more efficient than zeroing all)
-        zero_flagged_regions(dense, mask);
-        mask.clear_all();
+        // Clone the result, then zero the scratch buffer for the next chunk.
+        let result = scratch.clone();
+        scratch.resize_and_zero(num_queries, num_sources);
 
         Ok(result)
     })
 }
 
-/// Tree-reduce sparse matrices
-fn tree_reduce_sparse(
-    matrices: Vec<SparseMatrix>,
-    num_queries: usize,
-    num_sources: usize,
-) -> SparseMatrix {
-    if matrices.is_empty() {
-        // Return properly sized empty matrix
-        return sprs::CsMat::new(
-            (num_queries, num_sources),
-            vec![0; num_queries + 1],
-            Vec::new(),
-            Vec::new(),
-        );
-    }
-
-    if matrices.len() == 1 {
-        return matrices.into_iter().next().unwrap();
-    }
-
-    // Parallel tree reduction
-    let mut current = matrices;
-
-    while current.len() > 1 {
-        let pairs: Vec<_> = current
-            .chunks(2)
-            .map(|chunk| {
-                if chunk.len() == 2 {
-                    merge_sparse(&chunk[0], &chunk[1])
-                } else {
-                    chunk[0].clone()
-                }
-            })
-            .collect();
-        current = pairs;
-    }
-
-    current.into_iter().next().unwrap()
-}
 
 #[cfg(test)]
 mod tests {
@@ -553,23 +513,27 @@ mod tests {
     }
 
     #[test]
-    fn test_tree_reduce_sparse() {
-        use crate::matrix::{BitwiseMask, DenseMatrix};
+    fn test_dense_fold_and_sparse_conversion() {
+        let matrices: Vec<DenseMatrix> = (1u32..=5)
+            .map(|i| {
+                let mut d = DenseMatrix::new(2, 3);
+                d.set(0, 0, i);
+                d
+            })
+            .collect();
 
-        let mut matrices = Vec::new();
+        let folded = matrices
+            .into_iter()
+            .fold(DenseMatrix::new(2, 3), |mut acc, m| {
+                acc.add_dense(&m);
+                acc
+            });
 
-        for i in 0..5 {
-            let mut dense = DenseMatrix::new(2, 3);
-            let mut mask = BitwiseMask::new(2, 3);
-            dense.set(0, 0, i + 1);
-            mask.flag(0, 0);
-            matrices.push(condense_to_sparse(&dense, &mask));
-        }
+        let sparse = condense_to_sparse_no_mask(&folded, 2, 3);
 
-        let result = tree_reduce_sparse(matrices, 2, 3);
-
-        // Should sum to 1+2+3+4+5 = 15
-        assert_eq!(result.get(0, 0), Some(&15));
+        // 1+2+3+4+5 = 15
+        assert_eq!(sparse.get(0, 0), Some(&15));
+        assert_eq!(sparse.get(1, 0), None);
     }
 
     #[test]

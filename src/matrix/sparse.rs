@@ -2,6 +2,30 @@ use sprs::CsMat;
 
 use super::dense::{BitwiseMask, DenseMatrix};
 
+/// Convert a dense matrix to sparse format by scanning for non-zero values.
+///
+/// Unlike `condense_to_sparse`, no bitmask is required.  Used once at the end
+/// of the query pipeline after all chunk matrices have been folded together.
+pub fn condense_to_sparse_no_mask(dense: &DenseMatrix, num_rows: usize, num_cols: usize) -> SparseMatrix {
+    let mut indptr = Vec::with_capacity(num_rows + 1);
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+
+    indptr.push(0);
+    for row in 0..num_rows {
+        let row_slice = dense.row(row);
+        for (col, &val) in row_slice.iter().enumerate() {
+            if val > 0 {
+                indices.push(col);
+                data.push(val);
+            }
+        }
+        indptr.push(indices.len());
+    }
+
+    CsMat::new((num_rows, num_cols), indptr, indices, data)
+}
+
 /// Sparse matrix type alias using CSR format
 pub type SparseMatrix = CsMat<u32>;
 
