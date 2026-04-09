@@ -1,15 +1,10 @@
-use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use indicatif::{ProgressBar, ProgressStyle};
 
-use riggle::io::MasterHeader;
+use riggle::io::Meta;
 use riggle::stats::compute_statistics;
-use riggle::tasks::{
-    AddConfig, BuildConfig, QueryConfig, add_to_database, build_database, query_database,
-};
+use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "riggle")]
@@ -21,34 +16,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build a database from BED files
-    Build {
-        /// Input directory containing BED files
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output directory for the database
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Number of BED files to ingest per batch (default: all at once)
-        #[arg(short, long)]
-        batch_size: Option<usize>,
-    },
-
-    /// Add BED files to an existing database
+    /// Add BED files to the database (creates the database if it does not exist)
     Add {
         /// Input directory containing BED files to add
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Path to existing database directory
+        /// Path to database directory
         #[arg(short, long)]
         db: PathBuf,
-
-        /// Number of BED files to ingest per batch (default: all at once)
-        #[arg(short, long)]
-        batch_size: Option<usize>,
     },
 
     /// Query a database with BED file(s)
@@ -70,7 +46,7 @@ enum Commands {
         genome_size: u64,
     },
 
-    /// Show database information
+    /// Print database summary (shards, sources, layers)
     Info {
         /// Path to the database directory
         #[arg(short, long)]
@@ -82,8 +58,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Build { input, output, batch_size } => run_build(input, output, batch_size),
-        Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
+        Commands::Add { input, db } => run_add(input, db),
         Commands::Query {
             db,
             query,
@@ -99,51 +74,9 @@ fn main() {
     }
 }
 
-fn run_add(
-    input: PathBuf,
-    db: PathBuf,
-    batch_size: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Adding files to database...");
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let mut config = AddConfig::new(input, db.clone());
-    config.batch_size = batch_size;
-    let added_count = add_to_database(&config)?;
-
-    pb.finish_with_message(format!(
-        "Added {} source(s) to database at {}",
-        added_count,
-        db.display()
-    ));
-    Ok(())
-}
-
-fn run_build(
-    input: PathBuf,
-    output: PathBuf,
-    batch_size: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Building database...");
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let mut config = BuildConfig::new(input, output.clone());
-    config.batch_size = batch_size;
-    build_database(&config)?;
-
-    pb.finish_with_message(format!("Database built at {}", output.display()));
+fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let config = AddConfig::new(input, db);
+    add_to_database(&config)?;
     Ok(())
 }
 
@@ -153,81 +86,59 @@ fn run_query(
     output: PathBuf,
     genome_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message("Querying database...");
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let config = QueryConfig::new(db.clone(), query);
+    let config = QueryConfig::new(db, query);
     let result = query_database(&config)?;
 
-    pb.set_message("Computing statistics...");
-
-    // Load master header for database sizes
-    let header_path = db.join("header.json");
-    let header_content = fs::read_to_string(&header_path)?;
-    let master_header: MasterHeader = serde_json::from_str(&header_content)?;
-
-    // Compute query sizes (assuming uniform for now - could be improved)
-    let query_sizes: Vec<u64> = vec![1000; result.counts.rows()]; // Placeholder
-
-    // Get database sizes
-    let db_sizes: HashMap<u32, u64> = master_header
-        .sid_map
+    // Compute sizes for Fisher's exact test
+    let query_sizes: Vec<u64> = result
+        .query_sources
         .iter()
-        .map(|(k, v)| (*k, v.total_bases))
+        .map(|s| s.count as u64)
+        .collect();
+
+    let db_sizes: std::collections::HashMap<u32, u64> = result
+        .db_sources
+        .iter()
+        .map(|(k, _)| {
+            // Count intervals per D_SID from the sparse matrix column sums
+            let col_sum: u32 = result
+                .counts
+                .outer_iterator()
+                .map(|row| row.get(*k as usize).copied().unwrap_or(0))
+                .sum();
+            (*k, col_sum as u64)
+        })
         .collect();
 
     let stats = compute_statistics(&result.counts, &query_sizes, &db_sizes, genome_size);
+    let json = serde_json::to_string_pretty(&stats)?;
+    std::fs::write(&output, json)?;
 
-    // Write results
-    let json = stats.to_json()?;
-    fs::write(&output, json)?;
-
-    pb.finish_with_message(format!(
-        "Results written to {} ({} significant pairs)",
-        output.display(),
-        stats.results.len()
-    ));
+    println!(
+        "Query complete: {} query files × {} database sources → {}",
+        result.query_sources.len(),
+        result.db_sources.len(),
+        output.display()
+    );
 
     Ok(())
 }
 
 fn run_info(db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let header_path = db.join("header.json");
-    let header_content = fs::read_to_string(&header_path)?;
-    let header: MasterHeader = serde_json::from_str(&header_content)?;
+    let meta = Meta::load(&db)?;
 
     println!("Database: {}", db.display());
-    println!("Sources: {}", header.num_sources());
-    println!("Shards: {}", header.num_shards());
-    println!("Layers: {}", header.layer_configs.len());
-    println!();
-
-    // Show shards
-    if !header.shards.is_empty() {
-        println!("Shards:");
-        for shard in &header.shards {
-            let max_coord = header.shard_max_coords.get(shard).copied().unwrap_or(0);
-            println!("  {} (max coord: {})", shard, max_coord);
-        }
-        println!();
-    }
-
-    println!("Source files:");
-
-    let mut sources: Vec<_> = header.sid_map.iter().collect();
-    sources.sort_by_key(|(k, _)| *k);
-
-    for (sid, meta) in sources {
-        println!(
-            "  [{}] {} - {} intervals, {} bp",
-            sid, meta.name, meta.interval_count, meta.total_bases
-        );
+    println!(
+        "Layer config: min_size={}, growth_factor={}",
+        meta.layer_config.min_size, meta.layer_config.growth_factor
+    );
+    println!("Layers used: {}", meta.num_layers);
+    println!("Shards ({}): {}", meta.shards.len(), meta.shards.join(", "));
+    println!("\nSources ({}):", meta.sid_map.len());
+    let mut sids: Vec<u32> = meta.sid_map.keys().copied().collect();
+    sids.sort();
+    for sid in sids {
+        println!("  SID {:4}: {}", sid, meta.sid_map[&sid].name);
     }
 
     Ok(())
