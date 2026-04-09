@@ -142,12 +142,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         indexed_queries.sort_by_key(|(_, iv)| iv.iv.start);
 
         // Compute which chunks to query for this shard
-        let chunk_tasks = compute_chunk_tasks_for_shard(
-            &config.db_path,
-            shard,
-            &indexed_queries,
-            &master_header,
-        );
+        let chunk_tasks =
+            compute_chunk_tasks_for_shard(&config.db_path, shard, &indexed_queries, &master_header);
 
         // Tree-reduce chunks within this shard in parallel.
         // Rayon's reduce_with pairs adjacent results in a tree, so at most
@@ -234,6 +230,10 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
     let mut file_sid = 0usize;
 
     for bed_path in bed_files {
+        // TODO: we yield intervals as (usize, TaggedInterval) which is (usize, (iv, u32))
+        // the point of the second item in the inner tuple is to be the query SID. Why are we
+        // making it a zero and using the outer tuple to store the query SID?
+        // Simplify -- only need TaggedInterval.
         let file_shards = parse_bed_file(&bed_path, 0)?;
 
         // Count total intervals in this file
@@ -256,10 +256,8 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
 
         // Tag all intervals from this file with the file SID (shared row index)
         for (shard, intervals) in file_shards {
-            let indexed: Vec<(usize, TaggedInterval)> = intervals
-                .into_iter()
-                .map(|iv| (file_sid, iv))
-                .collect();
+            let indexed: Vec<(usize, TaggedInterval)> =
+                intervals.into_iter().map(|iv| (file_sid, iv)).collect();
             shard_intervals.entry(shard).or_default().extend(indexed);
         }
 
@@ -385,7 +383,6 @@ fn process_chunk(
         Ok(result)
     })
 }
-
 
 #[cfg(test)]
 mod tests {
