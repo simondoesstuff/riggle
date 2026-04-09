@@ -1,6 +1,8 @@
+## Riggle Technical Specification: Query Architecture
+
 ### System Architecture Overview
 
-It leverages bounded exponential layers for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, dense matrix SIMD accumulation for zero-allocation scaling, and a fast-forward heuristic to bypass dead space.
+Riggle's query engine computes dense intersection statistics across entire sets without allocating intermediate overlapping intervals. It leverages massive bounded exponential layer memmaps for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, dense matrix SIMD accumulation for zero-allocation scaling, and a binary-search fast-forward heuristic to aggressively bypass dead space.
 
 ---
 
@@ -8,41 +10,43 @@ It leverages bounded exponential layers for optimal disk I/O, a single-pass dual
 
 **1.1. Storage Engine (Disk / OS Page Cache)**
 
-- **Database ($D$):** Partitioned into massive Memory-Mapped (memmap) chunks. Within each chunk, data is split into **Exponential Layers**.
-  - _Constraint:_ Every interval in Layer $K$ has length $L \le T_k$ (the max length for that layer).
-  - _Layout:_ Flat, contiguous array of structs: `(start: u32, end: u32, D_sid: u32)`. Strictly sorted by `start`.
+- **Database ($D$):** Partitioned into distinct coordinate spaces (shards) and divided into **Exponential Layers**. There are no chunks or tiles. Each layer is a single, giant memory-mapped file.
+  - _Constraint:_ Every interval in Layer $K$ has length $L \le \text{layerSize}$ (the maximum length boundary for that layer).
+  - _Layout:_ Flat, contiguous array of universally formatted structs: `(start: u32, end: u32, D_sid: u32)`. Strictly sorted by `start`.
 - **Queries ($Q$):** Fully loaded into RAM as a flat array.
   - _Layout:_ `(start: u32, end: u32, Q_sid: u32)`. Strictly sorted by `start`.
 
 **1.2. Execution Engine (Thread-Local RAM)**
 
 - **`Active_D` (The Shield):** An Implicit Min-Heap ordered by `end` coordinate. Guards against density spikes and tracks when database intervals expire.
-- **`Active_Q` (The Ring):** An Implicit Min-Heap or ring buffer (if sufficiently few queries), ordered by `end` coordinate. Tracks active query intervals. (Low depth expected).
+- **`Active_Q` (The Ring):** An Implicit Min-Heap or ring buffer ordered by `end` coordinate. Tracks active query intervals (low depth expected).
 - **`overlapsFrame` (The Delta State):** A dense 1D array `[D_sids]u32` representing the current frequency of all active database tracks at the exact sweep line coordinate.
 - **`results` (The Accumulator):** A dense 2D matrix `[Q_sids][D_sids]u32` pre-allocated per thread.
 
 ---
 
-### 2. The Core Execution Loop (Single-Threaded Chunk Processing)
+### 2. The Core Execution Loop (Single-Threaded Block Processing)
 
-This loop is executed independently by each thread over a specific memmap chunk and a specific exponential layer.
+This loop is executed independently by each thread over a designated block of query intervals against a specific exponential layer memmap.
 
 #### 2.1. The Fast-Forward Escapement (Sparsity Heuristic)
 
-Before advancing the sweep line, the engine checks for batch congestion.
+Because threads map over query blocks rather than DB chunks, a thread's assigned queries may start deep within the chromosome. To avoid scanning millions of irrelevant database intervals, the engine utilizes a distance-based fast-forward.
 
 ```text
-LOOP START:
-    IF not nextTile.exists() or nextTile().len():
+LOOP START (Check Dead Space):
+    IF D_cursor.start < (next_Q.start - layerSize):
+        // We are in a dead zone. The current DB interval cannot possibly overlap the next Query.
         1. CLEAR Active_D heap.
         2. ZERO out overlapsFrame.
-        3. Jump to next active tile. BINARY SEARCH in-chunk tiles for first index where tileEnd < nextQueryStart.
-        5. current_tile = nextActiveTile
+        3. BINARY SEARCH the layer memmap for the first D index where:
+           D.start >= (next_Q.start - layerSize)
+        4. D_cursor = found_index
 ```
 
 #### 2.2. The Sweep Line State Machine
 
-The sweep line advances to time $T$, defined as the minimum coordinate among the next four potential events: `D_cursor.start`, `Q_cursor.start`, `peek(Active_D).end`, `peek(Active_Q).end`.
+Once aligned, the sweep line advances to time $T$, defined as the minimum coordinate among the next four potential events: `D_cursor.start`, `Q_cursor.start`, `peek(Active_D).end`, `peek(Active_Q).end`.
 
 Events are processed strictly in this order to handle boundary conditions (Ends process before Starts at the exact same coordinate):
 
@@ -75,18 +79,20 @@ Events are processed strictly in this order to handle boundary conditions (Ends 
 
 ### 3. Parallel Aggregation & Output
 
-To scale to 128+ cores without memory bandwidth starvation, the engine uses a map-reduce pipeline.
+To scale across massive core counts without memory bandwidth starvation or lock contention, the engine uses a query-partitioned map-reduce pipeline.
 
-**Phase 1: Map (Chunk Processing)**
+**Phase 1: Map (Query Block Processing)**
 
-- A work-stealing scheduler (e.g., Rayon) assigns memmap chunks to idle threads.
-- Each thread runs the Core Execution Loop (Section 2) using entirely thread-local data structures, generating a local, fully populated `results` dense matrix. No locks, no atomics, zero false sharing.
+- The global flat array of query intervals ($Q$) is partitioned into evenly sized continuous blocks.
+- A work-stealing scheduler (e.g., Rayon) assigns these query blocks to idle threads.
+- Each thread runs the Core Execution Loop against the layer memmap. Due to the fast-forward heuristic, the thread instantly skips irrelevant memmap space and seeks to the region relevant to its assigned query block.
+- Each thread generates a local, fully populated `results` dense matrix. No locks, no atomics, zero false sharing.
 
 **Phase 2: Reduce (Parallel Tree Merge)**
 
-- As threads finish their chunks, the scheduler dynamically pairs them.
+- As threads finish their blocks, the scheduler dynamically pairs them.
 - Idle threads take two thread-local `results` matrices and perform a SIMD vectorized matrix addition: `Matrix_A += Matrix_B`.
-- This folds $N$ matrices into 1 final global results matrix in $O(\log(\text{threads}))$ steps.
+- This folds $N$ thread-local matrices into 1 final global results matrix in $O(\log(\text{threads}))$ steps.
 
 **Phase 3: Sparse Export**
 
