@@ -2,7 +2,7 @@ use bitvec::prelude::*;
 
 /// Dense row-major matrix for accumulating intersection counts
 /// Layout: row i = query i, column j = database source j
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DenseMatrix {
     data: Vec<u32>,
     num_rows: usize,
@@ -68,6 +68,22 @@ impl DenseMatrix {
     /// Get raw data slice
     pub fn as_slice(&self) -> &[u32] {
         &self.data
+    }
+
+    /// Zero all elements
+    pub fn zero_all(&mut self) {
+        self.data.fill(0);
+    }
+
+    /// Add another matrix element-wise (in-place)
+    ///
+    /// SIMD-friendly: the compiler will vectorize this loop automatically.
+    pub fn add_dense(&mut self, other: &DenseMatrix) {
+        debug_assert_eq!(self.num_rows, other.num_rows);
+        debug_assert_eq!(self.num_cols, other.num_cols);
+        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a += b;
+        }
     }
 
     /// Resize and zero the matrix (only reallocates if larger)
