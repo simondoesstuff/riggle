@@ -1,99 +1,87 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::core::TaggedInterval;
-use crate::io::MappedChunk;
+use crate::core::Interval;
 use crate::matrix::DenseMatrix;
 
-/// Query sweep over a mapped chunk to count intersections.
+/// Single-pass dual-active-set sweep over a flat sorted layer.
 ///
-/// Implements a single-pass dual-active-set sweep line:
+/// Counts set-level intersections between a query block and a database layer
+/// without allocating any intermediate result intervals.
 ///
-/// - **Active_D** (min-heap by end): tracks active database intervals.
-/// - **Active_Q** (min-heap by end): tracks active query intervals.
-/// - **overlaps_frame**: 1-D array `[D_sids] u32` — current count of active DB
-///   intervals per source ID at the sweep line.
+/// ### Inputs
 ///
-/// At each event time T (the minimum of all upcoming starts/ends), four event
-/// types are processed in strict order (ends before starts, D before Q at the
-/// same coordinate):
+/// - `db_layer`: flat sorted `&[Interval]` from a `MappedLayer`. Every
+///   interval is present exactly once, so no deduplication is needed.
+/// - `layer_max_size`: the exclusive upper bound on interval sizes in this
+///   layer (`LayerConfig::layer_max_size(K)`). Used for the fast-forward
+///   heuristic.
+/// - `query_block`: sorted `&[Interval]` where `sid` is the row index in
+///   `results` (Q_SID).
+/// - `results`: `[Q_sids][D_sids]` dense accumulator, mutated in place.
 ///
-/// 1. **D ends**: pop expired DB intervals, decrement `overlaps_frame[sid]`.
-/// 2. **Q ends**: pop expired query intervals.
-/// 3. **D starts**: push DB interval to Active_D, increment `overlaps_frame[sid]`,
-///    then forward-match against all currently active queries
-///    (`results[q_idx][sid] += 1`).
-/// 4. **Q starts**: push query to Active_Q, then catch-up by adding the entire
-///    `overlaps_frame` row into `results[q_idx]` (SIMD vector addition).
+/// ### Algorithm
 ///
-/// **Fast-forward heuristic**: when Active_Q is empty, D intervals that start
-/// and end before the next query start are skipped entirely.  D intervals that
-/// start before but end after the next query start are added directly to
-/// `overlaps_frame` so the catch-up step in Event 4 accounts for them.
+/// At each step, the sweep advances to time `T = min(next D end, next Q end,
+/// next D start, next Q start)` and processes exactly one event:
 ///
-/// **Deduplication**: each DB interval is extracted from its canonical tile
-/// (the first tile it appears in within this chunk), so every interval is seen
-/// exactly once regardless of how many tiles it spans.
+/// 1. **D ends** — pop from `active_d`; decrement `overlaps_frame[d_sid]`.
+/// 2. **Q ends** — pop from `active_q`.
+/// 3. **D starts** — push to `active_d`; increment `overlaps_frame[d_sid]`;
+///    forward-match against every active Q: `results[q_sid][d_sid] += 1`.
+/// 4. **Q starts** — push to `active_q`; catch-up via SIMD-friendly loop:
+///    `results[q_sid] += overlaps_frame`.
+///
+/// ### Fast-forward heuristic
+///
+/// When `active_q` is empty and the next D interval cannot possibly overlap
+/// the next Q interval (i.e. `d.start + layer_max_size < q.start`), the
+/// entire D dead zone is skipped via binary search.
 pub fn query_sweep(
-    chunk: &MappedChunk,
-    tile_size: u32,
-    query_batch: &[(usize, TaggedInterval)], // (query_idx, interval), sorted by start
+    db_layer: &[Interval],
+    layer_max_size: u32,
+    query_block: &[Interval],
     results: &mut DenseMatrix,
 ) {
-    // TODO: unclear why query_batch is (usize, TaggedInterval) when the query SID is in the TaggedInterval.
-    // I am going to use the TaggedInterval SID instead of the outer tuple SID -- to be adjusted elsewhere
-    // in the codebase later.
-    let queries = query_batch.iter().map(|(_, iv)| iv).collect::<Vec<_>>();
-
-    if queries.is_empty() || chunk.num_tiles() == 0 {
+    if query_block.is_empty() || db_layer.is_empty() {
         return;
     }
 
-    let num_tiles = chunk.num_tiles();
-    let num_sources = results.num_cols();
+    let num_d_sids = results.num_cols();
+    let mut overlaps_frame = vec![0u32; num_d_sids];
 
-    // Sweep-line state
-    let mut overlaps_frame = vec![0u32; num_sources];
-    // Min-heap by end: Reverse((end, start, sid))
-    let mut active_d: BinaryHeap<Reverse<(u32, u32, u32)>> = BinaryHeap::new();
     // Min-heap by end: Reverse((end, sid))
+    let mut active_d: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
     let mut active_q: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
 
-    // Iteration tracking
-    let mut active_tile_idx = 0usize;
-    let mut d_idx = 0usize;
+    let mut d_cursor = 0usize;
+    let mut q_cursor = 0usize;
 
-    for next_query in queries.iter() {
-        // select tile
-        // allows jumps due to large gaps between query intervals
-
-        let min_tile_idx = (next_query.iv.start / tile_size) as usize;
-
-        if active_tile_idx < min_tile_idx {
-            // move tile, wrap database cursor
-            d_idx = 0;
-            active_tile_idx = min_tile_idx;
-            continue;
+    loop {
+        // ----------------------------------------------------------------
+        // Fast-forward: skip dead zone when no queries are active
+        // ----------------------------------------------------------------
+        if active_q.is_empty() && q_cursor < query_block.len() && d_cursor < db_layer.len() {
+            let next_q_start = query_block[q_cursor].start;
+            // Any D interval starting before (next_q_start - layer_max_size) has
+            // end <= start + layer_max_size < next_q_start, so it can never overlap.
+            let dead_zone_end = next_q_start.saturating_sub(layer_max_size);
+            if db_layer[d_cursor].start < dead_zone_end {
+                // Clear any stale active_d state (all those intervals are expired).
+                active_d.clear();
+                overlaps_frame.fill(0);
+                // Binary search for the first D whose start is within reach.
+                d_cursor = db_layer.partition_point(|d| d.start < dead_zone_end);
+                if d_cursor >= db_layer.len() {
+                    break; // No more DB intervals can overlap any query
+                }
+            }
         }
-
-        // TODO: confirm this repeated get_tile isn't incurring
-        // unnecessary overhead
-        let active_tile = &chunk.get_tile(active_tile_idx).unwrap().intervals;
-
-        if d_idx >= active_tile.len() {
-            active_tile_idx = (active_tile_idx + 1).min(num_tiles - 1);
-            continue;
-        }
-
-        // advance the cursor
 
         let next_d_end = active_d.peek().map(|x| x.0.0).unwrap_or(u32::MAX);
         let next_q_end = active_q.peek().map(|x| x.0.0).unwrap_or(u32::MAX);
-        let next_d_start = active_tile
-            .get(d_idx)
-            .map(|x| x.iv.start.to_native())
-            .unwrap_or(u32::MAX);
-        let next_q_start = next_query.iv.start;
+        let next_d_start = db_layer.get(d_cursor).map(|d| d.start).unwrap_or(u32::MAX);
+        let next_q_start = query_block.get(q_cursor).map(|q| q.start).unwrap_or(u32::MAX);
 
         let cursor = next_d_end
             .min(next_q_end)
@@ -101,62 +89,59 @@ pub fn query_sweep(
             .min(next_q_start);
 
         if cursor == u32::MAX {
-            break; // we've exhausted a stream
+            break;
         }
 
-        // event-based state machine
-
-        // D ends
-        // clean up the frame
+        // ----------------------------------------------------------------
+        // Event 1: D ends — remove expired DB interval, decrement frame
+        // ----------------------------------------------------------------
         if cursor == next_d_end {
-            let Reverse((_d_end, _d_start, d_sid)) = active_d.pop().unwrap();
+            let Reverse((_, d_sid)) = active_d.pop().unwrap();
             overlaps_frame[d_sid as usize] -= 1;
             continue;
         }
 
-        // Q ends
+        // ----------------------------------------------------------------
+        // Event 2: Q ends — remove expired query interval
+        // ----------------------------------------------------------------
         if cursor == next_q_end {
-            active_q.pop().unwrap();
+            active_q.pop();
             continue;
         }
 
-        // D starts
-        // update active query SIDs
+        // ----------------------------------------------------------------
+        // Event 3: D starts — add to active set, forward-match active queries
+        // ----------------------------------------------------------------
         if cursor == next_d_start {
-            let d_start = active_tile[d_idx].iv.start.to_native();
-            let d_end = active_tile[d_idx].iv.end.to_native();
-            let d_sid = active_tile[d_idx].sid.to_native();
+            let d = db_layer[d_cursor];
+            active_d.push(Reverse((d.end, d.sid)));
+            overlaps_frame[d.sid as usize] += 1;
 
-            active_d.push(Reverse((d_end, d_start, d_sid)));
-            overlaps_frame[d_sid as usize] += 1;
-
-            // forward-match against active queries
+            // Forward match: every already-active query overlaps this new D.
             for Reverse((q_end, q_sid)) in active_q.iter() {
-                if *q_end > d_start {
-                    results.add(*q_sid as usize, d_sid as usize, 1);
+                if *q_end > d.start {
+                    results.add(*q_sid as usize, d.sid as usize, 1);
                 }
             }
 
-            d_idx += 1;
+            d_cursor += 1;
             continue;
         }
 
-        // Q starts
-        // update active database SIDs
+        // ----------------------------------------------------------------
+        // Event 4: Q starts — catch up with current overlaps_frame (SIMD)
+        // ----------------------------------------------------------------
         if cursor == next_q_start {
-            let q_end = next_query.iv.end;
-            let q_sid = next_query.sid;
+            let q = query_block[q_cursor];
+            active_q.push(Reverse((q.end, q.sid)));
 
-            active_q.push(Reverse((q_end, q_sid)));
-
-            // catch-up with the frame
-            let row = results.row_mut(q_sid as usize);
-
-            // The compiler should auto-vectorize this loop into AVX/SSE block additions
+            // SIMD-friendly: compiler auto-vectorizes this loop (AVX/SSE).
+            let row = results.row_mut(q.sid as usize);
             for (d_sid, &count) in overlaps_frame.iter().enumerate() {
                 row[d_sid] += count;
             }
 
+            q_cursor += 1;
             continue;
         }
     }
@@ -165,110 +150,116 @@ pub fn query_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Tile;
-    use crate::io::{ChunkHeader, write_chunk};
-    use tempfile::NamedTempFile;
 
-    fn create_test_chunk(tiles: Vec<Tile>, tile_size: u32) -> (NamedTempFile, u32) {
-        let mut header = ChunkHeader::new(0, 0, 0, tiles.len() as u32 * tile_size);
-
-        let tile_bytes: Vec<_> = tiles
-            .iter()
-            .map(|t| rkyv::to_bytes::<rkyv::rancor::Error>(t).unwrap())
-            .collect();
-
-        let mut offset = 0u32;
-        for bytes in &tile_bytes {
-            header.tile_offsets.push(offset);
-            offset += bytes.len() as u32;
-        }
-
-        let file = NamedTempFile::new().unwrap();
-        write_chunk(file.path(), &header, &tiles).unwrap();
-        (file, tile_size)
+    fn iv(start: u32, end: u32, sid: u32) -> Interval {
+        Interval::new(start, end, sid)
     }
 
     #[test]
-    fn test_query_sweep_basic() {
-        // Interval 50-150 appears in both tiles; should be counted exactly once.
-        let mut tile0 = Tile::new(0);
-        tile0.intervals.push(TaggedInterval::new(50, 150, 0));
-        let mut tile1 = Tile::new(100);
-        tile1.intervals.push(TaggedInterval::new(50, 150, 0));
-
-        let (file, tile_size) = create_test_chunk(vec![tile0, tile1], 100);
-        let mapped = MappedChunk::open(file.path()).unwrap();
-
+    fn test_basic_overlap() {
+        let db = vec![iv(50, 150, 0)];
+        let query = vec![iv(40, 160, 0)];
         let mut results = DenseMatrix::new(1, 1);
-        let queries = vec![(0, TaggedInterval::new(40, 160, 100))];
-
-        query_sweep(&mapped, tile_size, &queries, &mut results);
-
+        query_sweep(&db, 200, &query, &mut results);
         assert_eq!(results.get(0, 0), 1);
     }
 
     #[test]
-    fn test_query_sweep_crossing_tiles() {
-        // Interval 50-250 spans three tiles; deduplication must yield count of 1.
-        let mut tile0 = Tile::new(0);
-        tile0.intervals.push(TaggedInterval::new(50, 250, 0));
-        let mut tile1 = Tile::new(100);
-        tile1.intervals.push(TaggedInterval::new(50, 250, 0));
-        let mut tile2 = Tile::new(200);
-        tile2.intervals.push(TaggedInterval::new(50, 250, 0));
-
-        let (file, tile_size) = create_test_chunk(vec![tile0, tile1, tile2], 100);
-        let mapped = MappedChunk::open(file.path()).unwrap();
-
+    fn test_no_overlap() {
+        let db = vec![iv(50, 100, 0)];
+        let query = vec![iv(200, 300, 0)];
         let mut results = DenseMatrix::new(1, 1);
-        let queries = vec![(0, TaggedInterval::new(0, 300, 100))];
-
-        query_sweep(&mapped, tile_size, &queries, &mut results);
-
-        assert_eq!(results.get(0, 0), 1);
-    }
-
-    #[test]
-    fn test_query_sweep_no_overlap() {
-        let mut tile0 = Tile::new(0);
-        tile0.intervals.push(TaggedInterval::new(50, 150, 0));
-
-        let (file, tile_size) = create_test_chunk(vec![tile0], 100);
-        let mapped = MappedChunk::open(file.path()).unwrap();
-
-        let mut results = DenseMatrix::new(1, 1);
-        let queries = vec![(0, TaggedInterval::new(200, 300, 100))];
-
-        query_sweep(&mapped, tile_size, &queries, &mut results);
-
+        query_sweep(&db, 200, &query, &mut results);
         assert_eq!(results.get(0, 0), 0);
     }
 
     #[test]
-    fn test_query_sweep_multiple_queries() {
-        let mut tile0 = Tile::new(0);
-        tile0.intervals.push(TaggedInterval::new(25, 75, 0)); // sid 0
-        tile0.intervals.push(TaggedInterval::new(75, 125, 1)); // sid 1
-
-        let (file, tile_size) = create_test_chunk(vec![tile0], 100);
-        let mapped = MappedChunk::open(file.path()).unwrap();
-
+    fn test_multiple_queries_and_db() {
+        // D0=[25,75), D1=[75,125)
+        let db = vec![iv(25, 75, 0), iv(75, 125, 1)];
+        // Q0=[0,50), Q1=[50,100)
+        let query = vec![iv(0, 50, 0), iv(50, 100, 1)];
         let mut results = DenseMatrix::new(2, 2);
+        query_sweep(&db, 200, &query, &mut results);
 
-        let queries = vec![
-            (0, TaggedInterval::new(0, 50, 100)),   // Q0 = [0, 50)
-            (1, TaggedInterval::new(50, 100, 101)), // Q1 = [50, 100)
-        ];
-
-        query_sweep(&mapped, tile_size, &queries, &mut results);
-
-        // Q0=[0,50) ∩ D0=[25,75) = [25,50) → count 1
+        // Q0=[0,50) ∩ D0=[25,75) → overlap at [25,50) → count 1
         assert_eq!(results.get(0, 0), 1);
-        // Q0=[0,50) ∩ D1=[75,125): 50 ≤ 75, no overlap
+        // Q0=[0,50) ∩ D1=[75,125) → 50 ≤ 75, no overlap
         assert_eq!(results.get(0, 1), 0);
-        // Q1=[50,100) ∩ D0=[25,75) = [50,75) → count 1
+        // Q1=[50,100) ∩ D0=[25,75) → overlap at [50,75) → count 1
         assert_eq!(results.get(1, 0), 1);
-        // Q1=[50,100) ∩ D1=[75,125) = [75,100) → count 1
+        // Q1=[50,100) ∩ D1=[75,125) → overlap at [75,100) → count 1
         assert_eq!(results.get(1, 1), 1);
+    }
+
+    #[test]
+    fn test_fast_forward_skips_dead_zone() {
+        // DB has intervals at 0-50 and 10000-10050
+        // Query is only at 10000-10100
+        // Fast-forward must skip the 0-50 interval
+        let db = vec![iv(0, 50, 0), iv(10_000, 10_050, 1)];
+        let query = vec![iv(10_000, 10_100, 0)];
+        let mut results = DenseMatrix::new(1, 2);
+        // layer_max_size = 100 (intervals <= 100 in this layer)
+        query_sweep(&db, 100, &query, &mut results);
+
+        // D0=[0,50) is in dead zone for Q=[10000,...) with layer_max=100
+        assert_eq!(results.get(0, 0), 0); // no overlap with D0
+        assert_eq!(results.get(0, 1), 1); // overlap with D1
+    }
+
+    #[test]
+    fn test_fast_forward_same_result_as_naive() {
+        // Construct a scenario with a large gap; the fast-forward path and the
+        // naive path (with a tiny layer_max_size that never triggers) must agree.
+        let db: Vec<Interval> = (0..100)
+            .map(|i| iv(i * 10, i * 10 + 5, i % 3))
+            .chain((0..10).map(|i| iv(100_000 + i * 10, 100_000 + i * 10 + 5, i % 3)))
+            .collect();
+        let query = vec![iv(100_000, 100_050, 0), iv(100_060, 100_100, 1)];
+
+        let mut fast = DenseMatrix::new(2, 3);
+        let mut naive = DenseMatrix::new(2, 3);
+
+        query_sweep(&db, 10, &query, &mut fast);     // triggers fast-forward
+        query_sweep(&db, u32::MAX, &query, &mut naive); // no fast-forward
+
+        for r in 0..2 {
+            for c in 0..3 {
+                assert_eq!(
+                    fast.get(r, c),
+                    naive.get(r, c),
+                    "mismatch at ({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_touching_intervals_not_overlapping() {
+        // Intervals that touch at a boundary: [0,50) and [50,100) do NOT overlap.
+        let db = vec![iv(0, 50, 0)];
+        let query = vec![iv(50, 100, 0)];
+        let mut results = DenseMatrix::new(1, 1);
+        query_sweep(&db, 200, &query, &mut results);
+        assert_eq!(results.get(0, 0), 0);
+    }
+
+    #[test]
+    fn test_empty_db() {
+        let db: Vec<Interval> = vec![];
+        let query = vec![iv(0, 100, 0)];
+        let mut results = DenseMatrix::new(1, 1);
+        query_sweep(&db, 200, &query, &mut results);
+        assert_eq!(results.get(0, 0), 0);
+    }
+
+    #[test]
+    fn test_empty_query() {
+        let db = vec![iv(0, 100, 0)];
+        let query: Vec<Interval> = vec![];
+        let mut results = DenseMatrix::new(1, 1);
+        query_sweep(&db, 200, &query, &mut results);
+        assert_eq!(results.get(0, 0), 0);
     }
 }
