@@ -1,91 +1,62 @@
-## Riggle Technical Specification
+## Riggle Technical Specification: System Overview
 
 ## 1. Core Paradigm
 
-Riggle is a statistical interval intersection engine focused on **set-level analysis**. It prioritizes memory-bandwidth and zero-copy access. Riggle does not return individual overlapping intervals; instead, it rapidly computes intersection counts across sets to power downstream statistical analysis.
+Riggle is a domain-agnostic, statistical interval intersection engine focused strictly on **set-level analysis**. While capable of handling genomic data, Riggle is generalized for any 1D coordinate system. It prioritizes memory-bandwidth and zero-copy access to rapidly compute intersection counts across sets, powering downstream statistical analysis. Riggle is not concerned with returning individual overlapping intervals or calculating internal interval densities.
 
-In Riggle, everything is a **SetID (SID)**:
+### The Universal Primitive
 
-- **Database SID:** Represents a set of intervals (e.g., a specific ChIP-seq experiment).
-- **Query SID:** Represents a set of query intervals.
-- **The Goal:** Compute an intersection matrix where each cell is the count of overlaps between a specific Query SID and a Database SID.
+Everywhere in the Riggle codebase, an interval is universally represented as a simple, flat tuple: **`(start, end, sid)`**.
+
+The meaning of the SetID (`sid`) depends entirely on the operational context:
+
+- **Index Time (Database SID / D_SID):** The `sid` represents a distinct indexed item or target feature set in the database.
+- **Query Time (Query SID / Q_SID):** The `sid` represents a specific input query set being compared against the database.
+
+**Input & Output:**
+
+- **Inputs:** Both index and query operations ingest a **batch** of interval files. An interval file is a TSV containing `start` and `end` coordinates, and optionally a `shard` column (a discrete coordinate space or partition identifier).
+- **The Goal:** The ultimate output of a query is a statistical intersection matrix. The matrix represents Query SIDs by Database SIDs, populating each cell with overlap counts and computed statistics.
 
 ---
 
 ## 2. Data Hierarchy & Memory Layout
 
-The database is sharded by chromosome/contig. Each shard is distributed across **layers** (exponentially bounded interval sizes) and **chunks** (memory-mapped files representing fixed genomic territories).
+The database is heavily simplified for contiguous memory access. It is partitioned first by **shard** (a distinct coordinate space), and then divided into **layers** based on exponentially bounded interval sizes.
 
-### A. Master Header (Global Metadata)
+### A. The Layer (The Memmap)
 
-- **SID Map:** `database_sid -> metadata`.
-- **Layer Configurations:** Defines exponential tiling bounds and chunk sizes per layer.
-- **Shards:** List of shard names and their maximum coordinates.
+Chunks and tiles do not exist in this architecture. A layer is a **single, giant memory-mapped file**.
 
-### B. Chunk Layout (The Memmap)
+- **Structure:** It contains a flat, tightly packed array of intervals.
+- **Interval Tuple:** Every entry is strictly a `(start, end, sid)` tuple.
+- **Ordering:** Intervals within the memmap are strictly sorted by their `start` coordinate.
 
-A chunk is a memory-mapped file consisting of **rkyv blocks** (referred to as **tiles**).
+### B. Global Metadata (`meta.json`)
 
-- **Chunk Header:** `tile_id -> byte_offset`. Provides $O(1)$ routing.
-- **Tile Data:** Tightly packed, serialized byte arrays.
+Instead of per-layer headers, the entire index is governed by a single `meta.json` file. This file contains only the essential global context:
 
-### C. Tile Composition (The Leaf Node)
-
-Tiles track the state of intervals relative to tile boundaries.
-
-- **`start_coord`:** The absolute genomic coordinate where this tile begins.
-- **`intervals`:** `[(start, end, sid)]`. Sorted by start coordinate.
+- **SID Map:** A mapping of `D_SID -> metadata`, storing the system context or identity of each indexed set.
+- **Layer Configuration:** The exponential scaling rules for the index, defined simply by a `min_size` and a `growth_factor` (represented as a `u32`).
 
 ---
 
-## 3. Indexing & Chunk Updates
+## 3. High-Level Indexing Pipeline
 
-### Phase 1: Map & Sort (per shard)
+The indexer processes a batch of interval TSV files into the memmap structure through a highly parallelized pipeline:
 
-Intervals are partitioned into exponential layers based on size and sorted by `start` coordinate. Intervals are then grouped by target `Chunk`.
-
-### Phase 2: The Update Sweep (`ChunkWrite`)
-
-To update an existing chunk without the memory spike of loading the entire file, Riggle uses a **Shift-and-Sync** strategy:
-
-1.  **In-Memory Delta:** Form an in-memory chunk containing only the _new_ intervals.
-2.  **Offset Calculation:** Calculate the new byte offsets for every tile in the chunk (existing + new).
-3.  **Memmap Extension:** Extend the existing memory-mapped file on disk to accommodate the new size.
-4.  **Back-to-Front Shift:** Move existing tiles to their new offsets starting from the end of the file. This prevents overwriting data before it is moved.
-5.  **Synchronous Write:** Write the new tiles into the vacated gaps and update the header.
+1.  **Parse & Split:** The batched TSVs are parsed in parallel. Intervals are partitioned into their appropriate shards and layers based on their size and coordinate space.
+2.  **Sort:** Intervals within each partition are sorted by their `start` coordinate.
+3.  **Memmap Write:** The sorted `(start, end, sid)` tuples are written directly to their corresponding layer's giant memmap. During this index phase, the `sid` attached to each interval corresponds to its original **Database SID**.
 
 ---
 
-## 4. Query Pipeline
+## 4. High-Level Query Pipeline
 
-### Phase 1: High-Level Set Preparation
+Queries operate strictly at the set level to generate the final statistical matrix:
 
-Queries are handled strictly at the **set level**.
-
-1.  **Flattening:** A batch of query sets is flattened into a list of **intervals**.
-2.  **Tagging:** Each interval is paired with its original **Query SID**. This allows the engine to operate on raw intervals for speed while preserving the ability to remap results back to the original sets for statistical accumulation.
-
-### Phase 2: The General Form
-
-The query algorithm follows a **parallel tree map-reduce** strategy over chunks.
-
-1.  **Parallel Map:** Queries are dispatched across layers and chunks.
-2.  **Deferred Statistics:** The map phase omits the generation of dense matrices for interval densities. Instead, it yields raw intersection counts per SID pair.
-3.  **Tree Reduce:** Results are aggregated across tiles, chunks, layers, and shards. Statistical tests (e.g., Fisher’s Exact) are deferred until all layers have yielded their final set-level counts.
-
----
-
-## The Riggle Scan Algorithm (Index Time)
-
-The core of Riggle's indexing is a one-dimensional sweep-line algorithm. Because both the tiles and input intervals are strictly sorted, we resolve spatial relationships in a single forward pass.
-
-### The Universal State
-
-The indexing thread tracks active intervals via slice manipulation:
-
-1.  **The Head Pointer:** Points to the first interval intersecting current tile $T$.
-2.  **In-Place Pruning:** As the sweep moves forward, intervals that end before the current tile starts are logically dropped.
-3.  **Tile Intersection:** For each tile $T$, Riggle identifies intervals $I$ where $I.start < T.end$ and $I.end > T.start$.
-4.  **Serialization:** These intervals are pushed to $T.intervals$ and serialized using `rkyv`.
-
-_**Note**: Because tile_size $\ge$ max_interval_size for a given layer, no interval can span an entire tile without having at least one endpoint within it._
+1.  **Batch Preparation (Flatten & Tag):** A batch of query interval files is ingested and flattened. Each query interval is tagged with its originating **Query SID**, forming the standard `(start, end, sid)` tuple. This uniform structure allows Riggle to execute raw interval mathematics at maximum speed while preserving the mapping necessary to accumulate set-level statistics.
+2.  **Parallel Map-Reduce:**
+    - **Map:** The `(start, end, sid)` query intervals are dispatched in parallel across the relevant shards and layer memmaps to compute raw intersection counts.
+    - **Reduce:** Results are aggregated across the engine.
+3.  **Matrix Generation:** The pipeline culminates in a matrix mapping Query SIDs to Database SIDs, containing the final aggregated overlap counts and the requested statistical tests.
