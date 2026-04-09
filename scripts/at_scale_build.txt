@@ -1,0 +1,162 @@
+
+❯ ./scripts/at_scale_build.sh -f 100 -n 1000
+RUN: files=100, records=1000, timeout=300s
+cargo run --release --bin gen -- -f 100 -n 1000 --sort -c -o data/at_scale_bench_beds
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running `target/release/gen -f 100 -n 1000 --sort -c -o data/at_scale_bench_beds`
+Starting BED file generation...
+Successfully generated 100 files in "data/at_scale_bench_beds"
+generate_parallel_beds |       100000 elements |    0.182s |   548.94 Kelem/s
+
+         ================= Native (Riggle) =================
+cargo run --release --bin riggle -- build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx`
+  Database built at data/at_scale_bench_riggle_idx
+real    0m2.611s
+user    0m0.389s
+sys     0m16.106s
+45M     data/at_scale_bench_riggle_idx
+
+         ================= IGD =================
+Create igd from data/at_scale_bench_beds/*:
+..........nCtgs, nRegions, nTiles: 24    130984  366140
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  100000     5054.443
+
+real    0m18.525s
+user    0m0.374s
+sys     0m12.239s
+3.6M    data/at_scale_bench_igd_idx
+
+         ================= Giggle =================
+Indexed 100000 intervals.
+
+real    0m0.244s
+user    0m0.202s
+sys     0m0.032s
+3.1M    data/at_scale_bench_giggle_idx
+
+riggle on  main [?] is 📦 v0.1.0 via 🦀 v1.91.0 via ❄️  impure (nix-shell-env) took 22s
+❯ ./scripts/at_scale_build.sh -f 100 -n 10000
+RUN: files=100, records=10000, timeout=300s
+cargo run --release --bin gen -- -f 100 -n 10000 --sort -c -o data/at_scale_bench_beds
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target/release/gen -f 100 -n 10000 --sort -c -o data/at_scale_bench_beds`
+Starting BED file generation...
+Successfully generated 100 files in "data/at_scale_bench_beds"
+generate_parallel_beds |      1000000 elements |    0.311s |     3.21 Melem/s
+
+         ================= Native (Riggle) =================
+cargo run --release --bin riggle -- build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx`
+  Database built at data/at_scale_bench_riggle_idx
+real    0m2.715s
+user    0m0.781s
+sys     0m16.142s
+54M     data/at_scale_bench_riggle_idx
+
+         ================= IGD =================
+Create igd from data/at_scale_bench_beds/*:
+..........nCtgs, nRegions, nTiles: 24    1308251         366211
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  1000000     5050.603
+
+real    1m29.093s
+user    0m1.517s
+sys     0m42.180s
+22M     data/at_scale_bench_igd_idx
+
+         ================= Giggle =================
+Indexed 1000000 intervals.
+
+real    0m2.255s
+user    0m1.973s
+sys     0m0.167s
+32M     data/at_scale_bench_giggle_idx
+
+riggle on  main [?] is 📦 v0.1.0 via 🦀 v1.91.0 via ❄️  impure (nix-shell-env) took 1m35s
+❯ ./scripts/at_scale_build.sh -f 100 -n 100000
+RUN: files=100, records=100000, timeout=300s
+cargo run --release --bin gen -- -f 100 -n 100000 --sort -c -o data/at_scale_bench_beds
+    Finished `release` profile [optimized] target(s) in 0.22s
+     Running `target/release/gen -f 100 -n 100000 --sort -c -o data/at_scale_bench_beds`
+Starting BED file generation...
+Successfully generated 100 files in "data/at_scale_bench_beds"
+generate_parallel_beds |     10000000 elements |    1.578s |     6.34 Melem/s
+
+         ================= Native (Riggle) =================
+cargo run --release --bin riggle -- build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx`
+  Database built at data/at_scale_bench_riggle_idx
+real    0m3.020s
+user    0m3.272s
+sys     0m13.672s
+192M    data/at_scale_bench_riggle_idx
+
+         ================= IGD =================
+Create igd from data/at_scale_bench_beds/*:
+..........nCtgs, nRegions, nTiles: 24    13083909        366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  10000000     5051.062
+
+real    1m34.143s
+user    0m4.506s
+sys     0m43.737s
+209M    data/at_scale_bench_igd_idx
+
+         ================= Giggle =================
+Indexed 10000000 intervals.
+
+real    0m23.514s
+user    0m21.523s
+sys     0m1.537s
+324M    data/at_scale_bench_giggle_idx
+
+riggle on  main [?] is 📦 v0.1.0 via 🦀 v1.91.0 via ❄️  impure (nix-shell-env) took 2m3s
+❯ ./scripts/at_scale_build.sh -f 100 -n 1000000 -t 1200
+RUN: files=100, records=1000000, timeout=1200s
+cargo run --release --bin gen -- -f 100 -n 1000000 --sort -c -o data/at_scale_bench_beds
+    Finished `release` profile [optimized] target(s) in 0.22s
+     Running `target/release/gen -f 100 -n 1000000 --sort -c -o data/at_scale_bench_beds`
+Starting BED file generation...
+Successfully generated 100 files in "data/at_scale_bench_beds"
+generate_parallel_beds |    100000000 elements |   14.846s |     6.74 Melem/s
+
+         ================= Native (Riggle) =================
+cargo run --release --bin riggle -- build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running `target/release/riggle build -i data/at_scale_bench_beds -o data/at_scale_bench_riggle_idx`
+  Database built at data/at_scale_bench_riggle_idx
+real    0m11.425s
+user    0m27.145s
+sys     0m26.705s
+1.6G    data/at_scale_bench_riggle_idx
+
+         ================= IGD =================
+Create igd from data/at_scale_bench_beds/*:
+..........nCtgs, nRegions, nTiles: 24    130816852       366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  100000000     5050.370
+
+real    2m20.475s
+user    0m25.062s
+sys     0m59.020s
+2.0G    data/at_scale_bench_igd_idx
+
+         ================= Giggle =================
+Indexed 100000000 intervals.
+
+real    5m24.595s
+user    4m37.995s
+sys     0m42.108s
+3.5G    data/at_scale_bench_giggle_idx
+
+riggle on  main [?] is 📦 v0.1.0 via 🦀 v1.91.0 via ❄️  impure (nix-shell-env) took 8m13s
+
