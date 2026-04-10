@@ -6,7 +6,6 @@
 //!
 //! Parallelism via rayon; per-chromosome coordinate sort via voracious_radix_sort.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -17,6 +16,7 @@ use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use rayon::prelude::*;
+use riggle::bench::nat_cmp;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -109,54 +109,6 @@ fn parse_coords(line: &str) -> Option<(&str, u32, u32)> {
     match (chr, start, end) {
         (Some(c), Some(s), Some(e)) => Some((c, s, e)),
         _ => None,
-    }
-}
-
-// ── Natural sort ─────────────────────────────────────────────────────────────
-
-/// Parse a leading run of ASCII digits into a u64 and return the remainder.
-fn parse_u64(s: &[u8]) -> (u64, &[u8]) {
-    let mut n: u64 = 0;
-    let mut i = 0;
-    while i < s.len() && s[i].is_ascii_digit() {
-        n = n.saturating_mul(10).saturating_add((s[i] - b'0') as u64);
-        i += 1;
-    }
-    (n, &s[i..])
-}
-
-/// Compare two strings with embedded integers sorted numerically.
-/// "chr2" < "chr10" < "chrX" under this ordering.
-fn nat_cmp(a: &str, b: &str) -> Ordering {
-    let mut a = a.as_bytes();
-    let mut b = b.as_bytes();
-    loop {
-        match (a.first(), b.first()) {
-            (None, None) => return Ordering::Equal,
-            (None, _) => return Ordering::Less,
-            (_, None) => return Ordering::Greater,
-            (Some(&ac), Some(&bc)) => {
-                if ac.is_ascii_digit() && bc.is_ascii_digit() {
-                    let (an, ar) = parse_u64(a);
-                    let (bn, br) = parse_u64(b);
-                    match an.cmp(&bn) {
-                        Ordering::Equal => {
-                            a = ar;
-                            b = br;
-                        }
-                        other => return other,
-                    }
-                } else {
-                    match ac.cmp(&bc) {
-                        Ordering::Equal => {
-                            a = &a[1..];
-                            b = &b[1..];
-                        }
-                        other => return other,
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -294,6 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
 
     #[test]
     fn test_parse_coords_basic() {
