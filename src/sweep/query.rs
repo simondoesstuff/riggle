@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use bitvec::prelude::*;
+
 use crate::core::Interval;
 use crate::matrix::DenseMatrix;
 
@@ -25,12 +27,15 @@ use crate::matrix::DenseMatrix;
 /// At each step, the sweep advances to time `T = min(next D end, next Q end,
 /// next D start, next Q start)` and processes exactly one event:
 ///
-/// 1. **D ends** — pop from `active_d`; decrement `overlaps_frame[d_sid]`.
+/// 1. **D ends** — pop from `active_d`; decrement `overlaps_frame[d_sid]`;
+///    if it hits zero, clear `active_mask[d_sid]`.
 /// 2. **Q ends** — pop from `active_q`.
 /// 3. **D starts** — push to `active_d`; increment `overlaps_frame[d_sid]`;
+///    if it was zero, set `active_mask[d_sid]`;
 ///    forward-match against every active Q: `results[q_sid][d_sid] += 1`.
-/// 4. **Q starts** — push to `active_q`; catch-up via SIMD-friendly loop:
-///    `results[q_sid] += overlaps_frame`.
+/// 4. **Q starts** — push to `active_q`; sparsity-aware catch-up via
+///    `active_mask.iter_ones()` (TZCNT): `results[q_sid][d_sid] += overlaps_frame[d_sid]`
+///    for each set bit, skipping zero entries entirely.
 ///
 /// ### Fast-forward heuristic
 ///
@@ -49,6 +54,9 @@ pub fn query_sweep(
 
     let num_d_sids = results.num_cols();
     let mut overlaps_frame = vec![0u32; num_d_sids];
+    // Tracks which D_sids have a non-zero entry in overlaps_frame.
+    // Enables sparsity-aware catch-up in Event 4 via TZCNT (iter_ones).
+    let mut active_mask: BitVec<u64, Lsb0> = bitvec![u64, Lsb0; 0; num_d_sids];
 
     // Min-heap by end: Reverse((end, sid))
     let mut active_d: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
@@ -70,6 +78,7 @@ pub fn query_sweep(
                 // Clear any stale active_d state (all those intervals are expired).
                 active_d.clear();
                 overlaps_frame.fill(0);
+                active_mask.fill(false);
                 // Binary search for the first D whose start is within reach.
                 d_cursor = db_layer.partition_point(|d| d.start < dead_zone_end);
                 if d_cursor >= db_layer.len() {
@@ -98,6 +107,9 @@ pub fn query_sweep(
         if cursor == next_d_end {
             let Reverse((_, d_sid)) = active_d.pop().unwrap();
             overlaps_frame[d_sid as usize] -= 1;
+            if overlaps_frame[d_sid as usize] == 0 {
+                active_mask.set(d_sid as usize, false);
+            }
             continue;
         }
 
@@ -116,6 +128,9 @@ pub fn query_sweep(
             let d = db_layer[d_cursor];
             active_d.push(Reverse((d.end, d.sid)));
             overlaps_frame[d.sid as usize] += 1;
+            if overlaps_frame[d.sid as usize] == 1 {
+                active_mask.set(d.sid as usize, true);
+            }
 
             // Forward match: every already-active query overlaps this new D.
             for Reverse((q_end, q_sid)) in active_q.iter() {
@@ -135,10 +150,10 @@ pub fn query_sweep(
             let q = query_block[q_cursor];
             active_q.push(Reverse((q.end, q.sid)));
 
-            // SIMD-friendly: compiler auto-vectorizes this loop (AVX/SSE).
+            // Sparsity-aware catch-up: iterate only non-zero D_sids via TZCNT.
             let row = results.row_mut(q.sid as usize);
-            for (d_sid, &count) in overlaps_frame.iter().enumerate() {
-                row[d_sid] += count;
+            for d_sid in active_mask.iter_ones() {
+                row[d_sid] += overlaps_frame[d_sid];
             }
 
             q_cursor += 1;

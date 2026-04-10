@@ -2,7 +2,7 @@
 
 ### System Architecture Overview
 
-Riggle's query engine computes dense intersection statistics across entire sets without allocating intermediate overlapping intervals. It leverages massive bounded exponential layer memmaps for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, dense matrix SIMD accumulation for zero-allocation scaling, and a binary-search fast-forward heuristic to aggressively bypass dead space.
+Riggle's query engine computes dense intersection statistics across entire sets without allocating intermediate overlapping intervals. It leverages massive bounded exponential layer memmaps for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, a bitset-accelerated sparse accumulator for zero-allocation scaling, and a binary-search fast-forward heuristic to aggressively bypass dead space.
 
 ---
 
@@ -21,6 +21,7 @@ Riggle's query engine computes dense intersection statistics across entire sets 
 - **`Active_D` (The Shield):** An Implicit Min-Heap ordered by `end` coordinate. Guards against density spikes and tracks when database intervals expire.
 - **`Active_Q` (The Ring):** An Implicit Min-Heap or ring buffer ordered by `end` coordinate. Tracks active query intervals (low depth expected).
 - **`overlapsFrame` (The Delta State):** A dense 1D array `[D_sids]u32` representing the current frequency of all active database tracks at the exact sweep line coordinate.
+- **`activeMask` (The Sparsity Filter):** A bitset (`[D_sids]bit`) tracking the non-zero indices within the `overlapsFrame`.
 - **`results` (The Accumulator):** A dense 2D matrix `[Q_sids][D_sids]u32` pre-allocated per thread.
 
 ---
@@ -39,9 +40,10 @@ LOOP START (Check Dead Space):
         // We are in a dead zone. The current DB interval cannot possibly overlap the next Query.
         1. CLEAR Active_D heap.
         2. ZERO out overlapsFrame.
-        3. BINARY SEARCH the layer memmap for the first D index where:
+        3. CLEAR activeMask bitset.
+        4. BINARY SEARCH the layer memmap for the first D index where:
            D.start >= (next_Q.start - layerSize)
-        4. D_cursor = found_index
+        5. D_cursor = found_index
 ```
 
 #### 2.2. The Sweep Line State Machine
@@ -54,6 +56,7 @@ Events are processed strictly in this order to handle boundary conditions (Ends 
 
 1. `expired_D = Active_D.pop()`
 2. `overlapsFrame[expired_D.sid] -= 1`
+3. `IF overlapsFrame[expired_D.sid] == 0: activeMask.clear(expired_D.sid)`
 
 **Event 2: $Q$ Ends ($T = \text{peek}(\text{Active\_Q}).\text{end}$)**
 
@@ -63,16 +66,19 @@ Events are processed strictly in this order to handle boundary conditions (Ends 
 
 1. `Active_D.push(D_cursor)`
 2. `overlapsFrame[D_cursor.sid] += 1`
-3. _Forward Match (Sparse Update):_
+3. `IF overlapsFrame[D_cursor.sid] == 1: activeMask.set(D_cursor.sid)`
+4. _Forward Match (Sparse Update):_
    `FOR q IN Active_Q:`
    `results[q.sid][D_cursor.sid] += 1`
-4. Advance `D_cursor`
+5. Advance `D_cursor`
 
 **Event 4: $Q$ Starts ($T = \text{Q\_cursor.start}$)**
 
 1. `Active_Q.push(Q_cursor)`
-2. _Catch-Up Match (SIMD Vector Addition):_
-   `results[Q_cursor.sid] += overlapsFrame` // CPU executes AVX-512 block add
+2. _Catch-Up Match (Hardware-Sympathetic Sparse Addition):_
+   Instead of a dense vector addition over millions of zeros, the engine utilizes hardware `tzcnt` (trailing zero count) instructions over the `activeMask` bitset to instantly jump to active SIDs.
+   `FOR sid IN activeMask.iter_set_bits():`
+   `results[Q_cursor.sid][sid] += overlapsFrame[sid]`
 3. Advance `Q_cursor`
 
 ---
