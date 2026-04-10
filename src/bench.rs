@@ -87,7 +87,7 @@ pub fn generate_bed_file(path: &Path, config: &BedGenConfig) {
             let end = start + len;
             intervals.push((chrom, start, end));
         }
-        intervals.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+        intervals.sort_by(|a, b| nat_cmp(a.0, b.0).then(a.1.cmp(&b.1)));
         for (chrom, start, end) in intervals {
             writeln!(writer, "{}\t{}\t{}", chrom, start, end).unwrap();
         }
@@ -132,6 +132,52 @@ pub fn generate_bed_files_parallel(
             }
         }
     });
+}
+
+/// Parse a leading run of ASCII digits into a u64 and return the remainder.
+fn parse_u64(s: &[u8]) -> (u64, &[u8]) {
+    let mut n: u64 = 0;
+    let mut i = 0;
+    while i < s.len() && s[i].is_ascii_digit() {
+        n = n.saturating_mul(10).saturating_add((s[i] - b'0') as u64);
+        i += 1;
+    }
+    (n, &s[i..])
+}
+
+/// Compare two strings with embedded integers sorted numerically.
+/// "chr2" < "chr10" < "chrX" under this ordering.
+pub fn nat_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a = a.as_bytes();
+    let mut b = b.as_bytes();
+    loop {
+        match (a.first(), b.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    let (an, ar) = parse_u64(a);
+                    let (bn, br) = parse_u64(b);
+                    match an.cmp(&bn) {
+                        std::cmp::Ordering::Equal => {
+                            a = ar;
+                            b = br;
+                        }
+                        other => return other,
+                    }
+                } else {
+                    match ac.cmp(&bc) {
+                        std::cmp::Ordering::Equal => {
+                            a = &a[1..];
+                            b = &b[1..];
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Calculate total size of a directory recursively
