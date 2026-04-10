@@ -55,6 +55,7 @@
           packages = with pkgs; [
             just
             htslib # bgzip
+            bedtools
             giggle.packages.${system}.default
             libiconv
             cargo
