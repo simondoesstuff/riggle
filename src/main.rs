@@ -25,6 +25,10 @@ enum Commands {
         /// Path to database directory
         #[arg(short, long)]
         db: PathBuf,
+
+        /// Maximum number of BED files to hold in memory at once (default: all)
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
 
     /// Query a database with BED file(s)
@@ -44,6 +48,10 @@ enum Commands {
         /// Genome size for statistical calculations (default: 3 billion for human)
         #[arg(long, default_value = "3000000000")]
         genome_size: u64,
+
+        /// Maximum number of query files to hold in memory at once (default: all)
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
 
     /// Print database summary (shards, sources, layers)
@@ -58,13 +66,14 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Add { input, db } => run_add(input, db),
+        Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
         Commands::Query {
             db,
             query,
             output,
             genome_size,
-        } => run_query(db, query, output, genome_size),
+            batch_size,
+        } => run_query(db, query, output, genome_size, batch_size),
         Commands::Info { db } => run_info(db),
     };
 
@@ -74,8 +83,9 @@ fn main() {
     }
 }
 
-fn run_add(input: PathBuf, db: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let config = AddConfig::new(input, db);
+fn run_add(input: PathBuf, db: PathBuf, batch_size: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = AddConfig::new(input, db);
+    config.batch_size = batch_size;
     add_to_database(&config)?;
     Ok(())
 }
@@ -85,8 +95,10 @@ fn run_query(
     query: PathBuf,
     output: PathBuf,
     genome_size: u64,
+    batch_size: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = QueryConfig::new(db, query);
+    let mut config = QueryConfig::new(db, query);
+    config.batch_size = batch_size;
     let result = query_database(&config)?;
 
     // Compute sizes for Fisher's exact test

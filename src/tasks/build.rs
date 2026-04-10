@@ -39,6 +39,9 @@ pub struct AddConfig {
     /// Layer configuration — used only when creating a new database.
     /// If `None` and the database is new, defaults to `LayerConfig::default_genomic()`.
     pub layer_config: Option<LayerConfig>,
+    /// Maximum number of BED files to parse and hold in memory at once.
+    /// `None` (default) processes all files in a single batch.
+    pub batch_size: Option<usize>,
 }
 
 impl AddConfig {
@@ -47,24 +50,28 @@ impl AddConfig {
             input_path,
             db_path,
             layer_config: None,
+            batch_size: None,
         }
     }
 }
 
-/// Ingest a batch of BED files into the database.
+/// Ingest BED files into the database.
 ///
 /// If the database does not yet exist it is created.  If it already exists the
 /// new intervals are merged into the existing layer files.
 ///
-/// ### Pipeline
+/// When `config.batch_size` is set, files are processed in sequential batches
+/// of that size, bounding peak memory to roughly `batch_size` files at once.
+///
+/// ### Pipeline (per batch)
 ///
 /// 1. Load or create `meta.json`.
-/// 2. Collect BED files from `config.input_path`.
-/// 3. Parse all files in parallel, tagging each with a new D_SID.
+/// 2. Collect BED files from `config.input_path`; chunk by `batch_size`.
+/// 3. Parse the batch in parallel, tagging each file with a new D_SID.
 /// 4. Partition intervals into `(shard, layer_idx)` buckets.
 /// 5. Sort each bucket by `start` using voracious radix sort.
 /// 6. Write new buckets / merge into existing layer files (parallel per bucket).
-/// 7. Update `meta.json`.
+/// 7. Update and save `meta.json`.
 pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
     if !config.input_path.exists() {
         return Err(AddError::InputNotFound(config.input_path.clone()));
@@ -100,13 +107,28 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
         Meta::new(layer_config)
     };
 
+    let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
+    for batch in bed_files.chunks(batch_size) {
+        process_file_batch(batch, &mut meta, &config.db_path)?;
+        meta.save(&config.db_path)?;
+    }
+
+    Ok(())
+}
+
+/// Process one batch of BED files: parse → bucket → sort → write/merge → update meta.
+fn process_file_batch(
+    batch: &[PathBuf],
+    meta: &mut Meta,
+    db_path: &std::path::Path,
+) -> Result<(), AddError> {
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
 
     // Parse all files in parallel.
     // Each file is assigned a unique D_SID starting from `next_sid`.
     let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>), AddError>> =
-        bed_files
+        batch
             .par_iter()
             .enumerate()
             .map(|(i, path)| {
@@ -121,7 +143,6 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
             .collect();
 
     // Partition all intervals into (shard, layer_idx) buckets.
-    // key: (shard_name, layer_idx) → Vec<Interval>
     let mut buckets: HashMap<(String, usize), Vec<Interval>> = HashMap::new();
     let mut new_sids: Vec<(u32, String)> = Vec::new();
 
@@ -140,14 +161,10 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
     }
 
     // Sort each bucket by start coordinate using voracious radix sort.
-    // Collect into a vec for parallel iteration.
     let mut bucket_vec: Vec<((String, usize), Vec<Interval>)> = buckets.into_iter().collect();
     bucket_vec.par_iter_mut().for_each(|(_, ivs)| {
         ivs.voracious_sort();
     });
-
-    // Determine which shards and layers are newly used.
-    let mut max_layer_used = meta.num_layers.saturating_sub(1);
 
     // Write / merge each bucket into the database (parallel across buckets).
     let write_errors: Vec<AddError> = bucket_vec
@@ -156,7 +173,7 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
             if sorted_ivs.is_empty() {
                 return None;
             }
-            let shard_dir = config.db_path.join(shard);
+            let shard_dir = db_path.join(shard);
             if let Err(e) = fs::create_dir_all(&shard_dir) {
                 return Some(AddError::Io(e));
             }
@@ -175,6 +192,8 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
     }
 
     // Update meta: add new SID entries, shards, num_layers.
+    let mut max_layer_used = meta.num_layers.saturating_sub(1);
+
     for (sid, name) in new_sids {
         meta.sid_map.insert(sid, SidEntry { name });
     }
@@ -189,7 +208,6 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
     }
 
     meta.num_layers = max_layer_used + 1;
-    meta.save(&config.db_path)?;
 
     Ok(())
 }

@@ -9,7 +9,7 @@ use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
 use crate::io::{BedParseError, LayerError, Meta, MetaError, MappedLayer, is_bed_file, parse_bed_file};
-use crate::matrix::{DenseMatrix, SparseMatrix, condense_to_sparse_no_mask};
+use crate::matrix::{DenseMatrix, SparseMatrix};
 use crate::sweep::query_sweep;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,9 @@ pub struct QueryConfig {
     pub query_path: PathBuf,
     /// Number of parallel threads; defaults to all available.
     pub num_threads: Option<usize>,
+    /// Maximum number of query files to parse and hold in memory at once.
+    /// `None` (default) processes all query files in a single batch.
+    pub batch_size: Option<usize>,
 }
 
 impl QueryConfig {
@@ -49,6 +52,7 @@ impl QueryConfig {
             db_path,
             query_path,
             num_threads: None,
+            batch_size: None,
         }
     }
 }
@@ -78,20 +82,20 @@ pub struct QueryResult {
 /// Accepts a single BED file or a directory of BED files.  Each file becomes
 /// one row (Q_SID) in the result matrix.
 ///
+/// When `config.batch_size` is set, query files are processed in sequential
+/// batches, bounding peak memory to roughly `batch_size` files at once.  The
+/// per-batch dense accumulator is `batch_size × num_sources` instead of
+/// `num_queries × num_sources`.
+///
 /// ### Pipeline
 ///
-/// 1. Load `meta.json`.
-/// 2. Parse query files; tag each file's intervals with its Q_SID.
-/// 3. For each shard present in both the database and the query:
-///    a. Sort the shard's query intervals by `start`.
-///    b. For each layer 0..`meta.num_layers`:
-///       - Open the layer file; skip if absent.
-///       - Divide query intervals into blocks (one block per available thread).
-///       - `par_iter` over blocks → each runs `query_sweep` → returns a local
-///         `DenseMatrix`.
-///       - Tree-reduce (`reduce_with`) the local matrices.
-///    c. Add shard + layer result into a cross-shard accumulator.
-/// 4. Convert the final dense accumulator to sparse.
+/// 1. Load `meta.json`; enumerate query files.
+/// 2. For each batch of `batch_size` query files:
+///    a. Parse the batch; assign local Q_SIDs 0..batch_len.
+///    b. For each shard × layer: sweep, reduce, add to a batch-local accumulator.
+///    c. Drain non-zero entries from the accumulator, shifting rows by the
+///       global batch offset, into `all_entries`.
+/// 3. Build the final CSR matrix from `all_entries` (already (row,col)-sorted).
 pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let meta_path = config.db_path.join("meta.json");
     if !meta_path.exists() {
@@ -106,10 +110,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         .map(|(k, v)| (*k, v.name.clone()))
         .collect();
 
-    // Parse query files
-    let parsed = parse_query_path(&config.query_path)?;
+    let all_files = enumerate_query_files(&config.query_path)?;
 
-    if parsed.total_count == 0 {
+    if all_files.is_empty() {
         let counts = sprs::CsMat::empty(sprs::CompressedStorage::CSR, num_sources);
         return Ok(QueryResult {
             counts,
@@ -119,76 +122,102 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         });
     }
 
-    let num_queries = parsed.total_count;
-
     // Determine thread count for block sizing.
     let num_threads = config
         .num_threads
-        .unwrap_or_else(rayon::current_num_threads);
-    let num_threads = num_threads.max(1);
+        .unwrap_or_else(rayon::current_num_threads)
+        .max(1);
 
-    // Cross-shard dense accumulator — never more than one live at a time.
-    let mut accumulator = DenseMatrix::new(num_queries, num_sources);
+    let batch_size = config.batch_size.unwrap_or(all_files.len()).max(1);
 
     let db_shard_set: std::collections::HashSet<&str> =
         meta.shards.iter().map(|s| s.as_str()).collect();
 
-    for (shard, mut shard_queries) in parsed.shard_intervals {
-        if !db_shard_set.contains(shard.as_str()) {
+    // Accumulated (global_row, col, val) triples — sorted by (row, col).
+    let mut all_entries: Vec<(usize, usize, u32)> = Vec::new();
+    let mut query_names: Vec<String> = Vec::new();
+    let mut query_sources: Vec<QuerySource> = Vec::new();
+    let mut global_q_offset = 0usize;
+
+    for batch_files in all_files.chunks(batch_size) {
+        let parsed = parse_file_batch(batch_files)?;
+        let batch_len = parsed.total_count;
+        if batch_len == 0 {
             continue;
         }
-        if shard_queries.is_empty() {
-            continue;
-        }
 
-        // Sort query intervals by start for this shard.
-        shard_queries.voracious_sort();
+        // Per-batch dense accumulator: batch_len × num_sources.
+        let mut accumulator = DenseMatrix::new(batch_len, num_sources);
 
-        for layer_idx in 0..meta.num_layers {
-            let layer_path = config
-                .db_path
-                .join(&shard)
-                .join(format!("layer_{}.bin", layer_idx));
-
-            if !layer_path.exists() {
+        for (shard, mut shard_queries) in parsed.shard_intervals {
+            if !db_shard_set.contains(shard.as_str()) {
+                continue;
+            }
+            if shard_queries.is_empty() {
                 continue;
             }
 
-            let layer = MappedLayer::open(&layer_path)?;
-            if layer.is_empty() {
-                continue;
-            }
+            shard_queries.voracious_sort();
 
-            let layer_max_size = meta.layer_config.layer_max_size(layer_idx);
-            let db_intervals = layer.intervals();
+            for layer_idx in 0..meta.num_layers {
+                let layer_path = config
+                    .db_path
+                    .join(&shard)
+                    .join(format!("layer_{}.bin", layer_idx));
 
-            // Divide query intervals into evenly-sized blocks.
-            let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
-            let blocks: Vec<&[Interval]> = shard_queries.chunks(block_size).collect();
+                if !layer_path.exists() {
+                    continue;
+                }
 
-            // Parallel sweep over blocks; tree-reduce results.
-            let layer_result = blocks
-                .par_iter()
-                .map(|block| {
-                    run_sweep_block(db_intervals, layer_max_size, block, num_queries, num_sources)
-                })
-                .reduce_with(|mut a, b| {
-                    a.add_dense(&b);
-                    a
-                });
+                let layer = MappedLayer::open(&layer_path)?;
+                if layer.is_empty() {
+                    continue;
+                }
 
-            if let Some(layer_dense) = layer_result {
-                accumulator.add_dense(&layer_dense);
+                let layer_max_size = meta.layer_config.layer_max_size(layer_idx);
+                let db_intervals = layer.intervals();
+
+                let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
+                let blocks: Vec<&[Interval]> = shard_queries.chunks(block_size).collect();
+
+                let layer_result = blocks
+                    .par_iter()
+                    .map(|block| {
+                        run_sweep_block(db_intervals, layer_max_size, block, batch_len, num_sources)
+                    })
+                    .reduce_with(|mut a, b| {
+                        a.add_dense(&b);
+                        a
+                    });
+
+                if let Some(layer_dense) = layer_result {
+                    accumulator.add_dense(&layer_dense);
+                }
             }
         }
+
+        // Drain non-zero entries into all_entries with global row indices.
+        for local_row in 0..batch_len {
+            let row_slice = accumulator.row(local_row);
+            for (col, &val) in row_slice.iter().enumerate() {
+                if val > 0 {
+                    all_entries.push((global_q_offset + local_row, col, val));
+                }
+            }
+        }
+
+        global_q_offset += batch_len;
+        query_names.extend(parsed.query_names);
+        query_sources.extend(parsed.query_sources);
     }
 
-    let final_counts = condense_to_sparse_no_mask(&accumulator, num_queries, num_sources);
+    let num_queries = global_q_offset;
+    let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
     Ok(QueryResult {
         counts: final_counts,
-        query_names: parsed.query_names,
-        query_sources: parsed.query_sources,
+        query_names,
+        query_sources,
         db_sources,
     })
 }
@@ -218,43 +247,41 @@ fn run_sweep_block(
 }
 
 // ---------------------------------------------------------------------------
-// Internal: parse query path into shards
+// Internal helpers
 // ---------------------------------------------------------------------------
 
 struct ParsedQueries {
     shard_intervals: HashMap<String, Vec<Interval>>,
     query_sources: Vec<QuerySource>,
     query_names: Vec<String>,
+    /// Number of non-empty files in this batch (= number of Q_SID rows used).
     total_count: usize,
 }
 
-fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
-    let bed_files: Vec<PathBuf> = if path.is_dir() {
-        fs::read_dir(path)?
+/// Return all BED file paths under `path` (or `path` itself if it is a file).
+fn enumerate_query_files(path: &Path) -> Result<Vec<PathBuf>, QueryError> {
+    if path.is_dir() {
+        let mut files: Vec<PathBuf> = fs::read_dir(path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| is_bed_file(p))
-            .collect()
+            .collect();
+        files.sort(); // deterministic ordering
+        Ok(files)
     } else {
-        vec![path.to_path_buf()]
-    };
-
-    if bed_files.is_empty() {
-        return Ok(ParsedQueries {
-            shard_intervals: HashMap::new(),
-            query_sources: Vec::new(),
-            query_names: Vec::new(),
-            total_count: 0,
-        });
+        Ok(vec![path.to_path_buf()])
     }
+}
 
+/// Parse a slice of BED files, assigning local Q_SIDs 0..N (one per non-empty file).
+fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
     let mut shard_intervals: HashMap<String, Vec<Interval>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
     let mut file_sid = 0u32;
 
-    for bed_path in bed_files {
-        let file_shards = parse_bed_file(&bed_path, file_sid)?;
+    for bed_path in files {
+        let file_shards = parse_bed_file(bed_path, file_sid)?;
         let file_count: usize = file_shards.values().map(|v| v.len()).sum();
 
         if file_count == 0 {
@@ -284,9 +311,33 @@ fn parse_query_path(path: &Path) -> Result<ParsedQueries, QueryError> {
     })
 }
 
+/// Build a CSR sparse matrix from entries that are already sorted by (row, col).
+fn build_csr_from_sorted_entries(
+    entries: &[(usize, usize, u32)],
+    num_rows: usize,
+    num_cols: usize,
+) -> SparseMatrix {
+    let mut indptr = vec![0usize; num_rows + 1];
+    let mut indices = Vec::with_capacity(entries.len());
+    let mut data = Vec::with_capacity(entries.len());
+
+    for &(row, col, val) in entries {
+        indices.push(col);
+        data.push(val);
+        indptr[row + 1] += 1;
+    }
+    // Convert per-row counts to prefix sums.
+    for i in 0..num_rows {
+        indptr[i + 1] += indptr[i];
+    }
+
+    sprs::CsMat::new((num_rows, num_cols), indptr, indices, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matrix::condense_to_sparse_no_mask;
     use crate::tasks::build::{AddConfig, add_to_database};
     use std::io::Write;
     use tempfile::TempDir;
@@ -377,6 +428,97 @@ mod tests {
         assert_eq!(result.query_sources.len(), 2);
         let total_ivs: usize = result.query_sources.iter().map(|s| s.count).sum();
         assert_eq!(total_ivs, 3);
+    }
+
+    #[test]
+    fn test_batch_query_matches_unbatched() {
+        let input = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        // 3 DB source files
+        write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
+        write_bed(input.path(), "b.bed", "chr1\t150\t250\n");
+        write_bed(input.path(), "c.bed", "chr1\t350\t500\n");
+        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+
+        // 4 query files
+        let query_dir = TempDir::new().unwrap();
+        write_bed(query_dir.path(), "q1.bed", "chr1\t100\t200\n");
+        write_bed(query_dir.path(), "q2.bed", "chr1\t200\t350\n");
+        write_bed(query_dir.path(), "q3.bed", "chr1\t300\t450\n");
+        write_bed(query_dir.path(), "q4.bed", "chr1\t50\t600\n");
+
+        let unbatched = {
+            let config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
+            query_database(&config).unwrap()
+        };
+
+        // batch_size=1 forces one file per batch
+        let batched = {
+            let mut config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
+            config.batch_size = Some(1);
+            query_database(&config).unwrap()
+        };
+
+        assert_eq!(unbatched.counts.rows(), batched.counts.rows());
+        assert_eq!(unbatched.counts.cols(), batched.counts.cols());
+        for r in 0..unbatched.counts.rows() {
+            for c in 0..unbatched.counts.cols() {
+                assert_eq!(
+                    unbatched.counts.get(r, c),
+                    batched.counts.get(r, c),
+                    "mismatch at ({r},{c})"
+                );
+            }
+        }
+        assert_eq!(unbatched.query_names, batched.query_names);
+    }
+
+    #[test]
+    fn test_batch_add_matches_unbatched() {
+        let input = TempDir::new().unwrap();
+        let db_unbatched = TempDir::new().unwrap();
+        let db_batched = TempDir::new().unwrap();
+
+        write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
+        write_bed(input.path(), "b.bed", "chr1\t150\t250\n");
+        write_bed(input.path(), "c.bed", "chr1\t350\t500\n");
+
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db_unbatched.path().to_path_buf(),
+        )).unwrap();
+
+        let mut batched_config = AddConfig::new(
+            input.path().to_path_buf(),
+            db_batched.path().to_path_buf(),
+        );
+        batched_config.batch_size = Some(1);
+        add_to_database(&batched_config).unwrap();
+
+        let query_dir = TempDir::new().unwrap();
+        write_bed(query_dir.path(), "q.bed", "chr1\t100\t500\n");
+
+        let result_u = query_database(&QueryConfig::new(
+            db_unbatched.path().to_path_buf(),
+            query_dir.path().join("q.bed"),
+        )).unwrap();
+
+        let result_b = query_database(&QueryConfig::new(
+            db_batched.path().to_path_buf(),
+            query_dir.path().join("q.bed"),
+        )).unwrap();
+
+        assert_eq!(result_u.counts.rows(), result_b.counts.rows());
+        for r in 0..result_u.counts.rows() {
+            for c in 0..result_u.counts.cols() {
+                assert_eq!(
+                    result_u.counts.get(r, c),
+                    result_b.counts.get(r, c),
+                    "mismatch at ({r},{c})"
+                );
+            }
+        }
     }
 
     #[test]
