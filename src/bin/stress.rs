@@ -51,6 +51,10 @@ enum Commands {
         /// Keep the database after benchmark (requires --output)
         #[arg(short, long)]
         keep: bool,
+
+        /// Maximum number of BED files to hold in memory at once (default: all)
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
 
     /// Benchmark query performance at scale
@@ -74,6 +78,10 @@ enum Commands {
         /// Number of iterations
         #[arg(short, long, default_value = "3")]
         iterations: usize,
+
+        /// Maximum number of query files to hold in memory at once (default: all)
+        #[arg(long)]
+        batch_size: Option<usize>,
     },
 
     /// Analyze index size at various scales
@@ -118,8 +126,9 @@ fn main() {
             max_len,
             output,
             keep,
+            batch_size,
         } => {
-            run_build_benchmark(intervals, files, min_len, max_len, output, keep);
+            run_build_benchmark(intervals, files, min_len, max_len, output, keep, batch_size);
         }
         Commands::Query {
             db,
@@ -127,8 +136,9 @@ fn main() {
             min_len,
             max_len,
             iterations,
+            batch_size,
         } => {
-            run_query_benchmark(&db, queries, min_len, max_len, iterations);
+            run_query_benchmark(&db, queries, min_len, max_len, iterations, batch_size);
         }
         Commands::Size {
             intervals,
@@ -152,6 +162,7 @@ fn run_build_benchmark(
     max_len: u32,
     output: Option<PathBuf>,
     keep: bool,
+    batch_size: Option<usize>,
 ) {
     let intervals_per_file = total_intervals / num_files;
 
@@ -192,7 +203,8 @@ fn run_build_benchmark(
 
     println!("\nBuilding database...");
     let build_start = Instant::now();
-    let config = AddConfig::new(input_dir.path().to_path_buf(), db_path.clone());
+    let mut config = AddConfig::new(input_dir.path().to_path_buf(), db_path.clone());
+    config.batch_size = batch_size;
     add_to_database(&config).unwrap();
     let build_time = build_start.elapsed();
 
@@ -219,6 +231,7 @@ fn run_query_benchmark(
     min_len: u32,
     max_len: u32,
     iterations: usize,
+    batch_size: Option<usize>,
 ) {
     println!("=== Query Benchmark ===");
     println!("Database: {}", db_path.display());
@@ -240,7 +253,8 @@ fn run_query_benchmark(
     let mut times = Vec::with_capacity(iterations);
     for i in 0..iterations {
         let start = Instant::now();
-        let query_config = QueryConfig::new(db_path.clone(), query_path.clone());
+        let mut query_config = QueryConfig::new(db_path.clone(), query_path.clone());
+        query_config.batch_size = batch_size;
         let result = query_database(&query_config).unwrap();
         let elapsed = start.elapsed();
         times.push(elapsed.as_secs_f64());
