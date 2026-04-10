@@ -36,7 +36,7 @@ mkdir -p "$BED_DIR"
 echo "RUN: files=${NUM_FILES}, records=${NUM_RECORDS}, timeout=${TIMEOUT}s"
 just gen -f "$NUM_FILES" -n "$NUM_RECORDS" -c -o "$BED_DIR"
 # riggle's gen script doesn't sort by chromosome in the standard bioinformatics way, so...
-ls "$BED_DIR"/* | sed 's/\.gz$//g' | xargs -I {} sh -c "bedtools sort -i {}.gz > {} && bgzip -f {}"
+ls "$BED_DIR"/* | sed 's/\.gz$//g' | xargs -I {} sh -c "just sort -i {}.gz > {} && bgzip -f {}"
 
 echo
 echo "==================================  Native  ================================== "
