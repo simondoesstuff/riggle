@@ -37,13 +37,13 @@ echo "RUN: src_files=${SRC_FILES}, src_records=${SRC_RECORDS}, qry_records=${QRY
 if [ ! -d "$SRC_BED_DIR" ]; then
 	mkdir -p "$SRC_BED_DIR"
 	just gen -f "$SRC_FILES" -n "$SRC_RECORDS" -c -o "$SRC_BED_DIR"
-	ls "$SRC_BED_DIR"/* | sed 's/\.gz$//g' | xargs -I {} sh -c "bedtools sort -i {}.gz > {} && bgzip -f {}"
+	ls "$SRC_BED_DIR"/* | sed 's/\.gz$//g' | xargs -I {} sh -c "just sort -i {}.gz > {} && bgzip -f {}"
 fi
 
 # Generate and sort single query BED file (seed 99 to differ from source)
 if [ ! -f "$QRY_FILE" ]; then
 	just gen -n "$QRY_RECORDS" -s 99 -o "${QRY_FILE%.gz}"
-	bedtools sort -i "${QRY_FILE%.gz}" | bgzip >"${QRY_FILE}.tmp" && mv "${QRY_FILE}.tmp" "$QRY_FILE" && rm "${QRY_FILE%.gz}"
+	just sort -i "${QRY_FILE%.gz}" | bgzip >"${QRY_FILE}.tmp" && mv "${QRY_FILE}.tmp" "$QRY_FILE" && rm "${QRY_FILE%.gz}"
 fi
 
 cleanup() {
