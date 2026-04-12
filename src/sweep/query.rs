@@ -80,18 +80,21 @@ pub fn query_sweep(
             // Any D interval starting before (next_q_start - layer_max_size) has
             // end <= start + layer_max_size < next_q_start, so it can never overlap.
             let dead_zone_end = next_q_start.saturating_sub(layer_max_size);
+
             if db_layer[d_cursor].start < dead_zone_end {
                 // Clear any stale active_d state (all those intervals are expired).
                 active_d.clear();
                 overlaps_frame.fill(0);
                 active_mask.fill(false);
-                // Jump table lookup + short forward scan (≤ tile_size coords).
+                // O(1) Jump table lookup to get the guaranteed lower bound index
                 let approx = jump_table.lookup(dead_zone_end).min(db_layer.len());
-                let mut pos = approx;
-                while pos < db_layer.len() && db_layer[pos].start < dead_zone_end {
-                    pos += 1;
-                }
-                d_cursor = pos;
+
+                // O(log D) Binary search on the remaining slice
+                // We slice from `approx` to the end, find the relative offset, and add it back.
+                let relative_offset =
+                    db_layer[approx..].partition_point(|d| d.start < dead_zone_end);
+                d_cursor = approx + relative_offset;
+
                 if d_cursor >= db_layer.len() {
                     break; // No more DB intervals can overlap any query
                 }
@@ -101,7 +104,10 @@ pub fn query_sweep(
         let next_d_end = active_d.peek().map(|x| x.0.0).unwrap_or(u32::MAX);
         let next_q_end = active_q.peek().map(|x| x.0.0).unwrap_or(u32::MAX);
         let next_d_start = db_layer.get(d_cursor).map(|d| d.start).unwrap_or(u32::MAX);
-        let next_q_start = query_block.get(q_cursor).map(|q| q.start).unwrap_or(u32::MAX);
+        let next_q_start = query_block
+            .get(q_cursor)
+            .map(|q| q.start)
+            .unwrap_or(u32::MAX);
 
         let cursor = next_d_end
             .min(next_q_end)
