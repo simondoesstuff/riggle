@@ -14,6 +14,8 @@ pub enum LayerError {
     Io(std::io::Error),
     #[error("Layer file has invalid size: {0} bytes (not a multiple of interval stride)")]
     InvalidSize(u64),
+    #[error("Index file has invalid size: {0} bytes (not a multiple of 4)")]
+    InvalidIndexSize(u64),
 }
 
 impl From<std::io::Error> for LayerError {
