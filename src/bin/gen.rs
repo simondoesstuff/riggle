@@ -82,7 +82,23 @@ fn main() {
         pb.set_message(format!("Generating single BED file at {:?}...", cli.output));
         let start = std::time::Instant::now();
 
-        generate_bed_file(&cli.output, &config);
+        // When compressing, bgzip appends .gz — if the output path already ends in .gz,
+        // write to the bare path first so bgzip produces exactly cli.output.
+        let write_path = if cli.compress && cli.output.extension().map_or(false, |e| e == "gz") {
+            cli.output.with_extension("")
+        } else {
+            cli.output.clone()
+        };
+
+        generate_bed_file(&write_path, &config);
+
+        if cli.compress {
+            std::process::Command::new("bgzip")
+                .arg("-f")
+                .arg(&write_path)
+                .status()
+                .expect("bgzip failed");
+        }
 
         let duration = start.elapsed().as_secs_f64();
         pb.finish_and_clear(); // Remove the spinner once done

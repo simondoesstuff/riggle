@@ -36,14 +36,12 @@ echo "RUN: src_files=${SRC_FILES}, src_records=${SRC_RECORDS}, qry_records=${QRY
 # Generate and sort source BED files (seed 42)
 if [ ! -d "$SRC_BED_DIR" ]; then
 	mkdir -p "$SRC_BED_DIR"
-	just gen -f "$SRC_FILES" -n "$SRC_RECORDS" -c -o "$SRC_BED_DIR"
-	ls "$SRC_BED_DIR"/* | sed 's/\.gz$//g' | xargs -I {} sh -c "just sort -i {}.gz > {} && bgzip -f {}"
+	just gen -f "$SRC_FILES" -n "$SRC_RECORDS" -c --sort -o "$SRC_BED_DIR"
 fi
 
 # Generate and sort single query BED file (seed 99 to differ from source)
 if [ ! -f "$QRY_FILE" ]; then
-	just gen -n "$QRY_RECORDS" -s 99 -o "${QRY_FILE%.gz}"
-	just sort -i "${QRY_FILE%.gz}" | bgzip >"${QRY_FILE}.tmp" && mv "${QRY_FILE}.tmp" "$QRY_FILE" && rm "${QRY_FILE%.gz}"
+	just gen -n "$QRY_RECORDS" -s 99 -c --sort -o "$QRY_FILE"
 fi
 
 cleanup() {
@@ -57,20 +55,23 @@ echo "==================================  Native  ==============================
 batchArg=''
 [ -n "$BATCH_SIZE" ] && batchArg="--batch-size $BATCH_SIZE"
 if [ ! -d "$IDX_NATIVE" ]; then
-	timeout "$TIMEOUT" just run add -i "$SRC_BED_DIR" -d "$IDX_NATIVE" ${batchArg} || {
+	echo "Building index"
+	time timeout "$TIMEOUT" just run add -i "$SRC_BED_DIR" -d "$IDX_NATIVE" ${batchArg} || {
 		rm -rf "$IDX_NATIVE"
 		echo "[!] Native build timed out or failed"
 	}
 fi
 [ -d "$IDX_NATIVE" ] && {
 	du -sh "$IDX_NATIVE"
+	echo "Querying"
 	time timeout "$TIMEOUT" just run query -d "$IDX_NATIVE" -q "$QRY_FILE" -o /dev/null ${batchArg} || echo "[!] Native query timed out or failed"
 }
 
 echo
 echo "==================================  IGD  ===================================== "
 if [ ! -d "$IDX_IGD" ]; then
-	timeout "$TIMEOUT" igd create "$SRC_BED_DIR" "$IDX_IGD" -s 0 || {
+	echo "Building index"
+	time timeout "$TIMEOUT" igd create "$SRC_BED_DIR" "$IDX_IGD" -s 0 || {
 		rm -rf "$IDX_IGD"
 		echo "[!] IGD build timed out or failed"
 	}
@@ -79,6 +80,7 @@ fi
 	du -sh "$IDX_IGD"
 	IGD_FILE=$(ls "$IDX_IGD"/*.igd 2>/dev/null | head -1)
 	if [ -n "$IGD_FILE" ]; then
+		echo "Querying"
 		time timeout "$TIMEOUT" igd search "$IGD_FILE" -q "$QRY_FILE" >/dev/null || echo "[!] IGD query timed out or failed"
 	else
 		echo "[!] No .igd file found in $IDX_IGD"
@@ -88,13 +90,14 @@ fi
 echo
 echo "==================================  Giggle  ================================== "
 if [ ! -f "$IDX_GIGGLE/root_ids.dat" ]; then
-	rm -rf "$IDX_GIGGLE"
-	timeout "$TIMEOUT" giggle index -s -i "${SRC_BED_DIR}/*" -o "$IDX_GIGGLE" || {
+	echo "Building index"
+	time timeout "$TIMEOUT" giggle index -s -f -i "${SRC_BED_DIR}/*" -o "$IDX_GIGGLE" || {
 		rm -rf "$IDX_GIGGLE"
 		echo "[!] Giggle build timed out or failed"
 	}
 fi
 [ -f "$IDX_GIGGLE/root_ids.dat" ] && {
 	du -sh "$IDX_GIGGLE"
+	echo "Querying"
 	time timeout "$TIMEOUT" giggle search -i "$IDX_GIGGLE" -q "$QRY_FILE" >/dev/null || echo "[!] Giggle query timed out or failed"
 }
