@@ -52,3 +52,48 @@ To solve this, the Index Writer thread uses an in-place **Extend & Reverse-Shift
     - Using the merge routine (as used in merge sort), a sorted intermediate buffer is accumulated.
     - Once this buffer is fully populated (or a data source is exhausted), the buffer can be written to the end of the memmap.
     - This reverse-merge safely populates the file from back to front. As the pointers move backwards, the algorithm naturally creates the necessary gaps for the new intervals without ever clobbering data that hasn't been read yet.
+
+---
+
+## 5. Jump Table (Fast-Forward Index)
+
+To eliminate the O(log N) binary search that the query engine performs at each fast-forward step, each layer file is accompanied by a small **jump table** stored in a separate file (`layer_K.idx`, one per shard per layer).
+
+### File Format
+
+`layer_K.idx` is a flat, raw `u64` array (little-endian, no header). The file length divided by 8 gives the number of tiles. It is memory-mapped at query time for zero-copy O(1) access by tile index — no hash lookup needed at query time. Entries are `u64` because layer interval counts can exceed the u32 range at scale.
+
+### Structure
+
+Entry `t` in the jump table stores the index of the first interval in the layer whose `start` coordinate is `>= t * tile_size`:
+
+```
+table[t] = first index i such that layer[i].start >= t * tile_size
+         = count of intervals with start < t * tile_size
+```
+
+The **tile size** is `layer_max_size(K) / 2`. This ensures that for any fast-forward target `dead_zone_end`, a single jump table lookup places the cursor within one tile-width of the true position, bounding subsequent linear scan to at most `tile_size` coordinate units.
+
+### Build: New Layer
+
+For an incoming sorted batch, `new_local` is built in two steps:
+
+1. **Sparse HashMap pass:** Scan the sorted batch once. For each interval, compute its tile index `t = start / tile_size`. Collect the unique set of tile indices; for each unique `t`, record `partition_point(batch, t * tile_size)` as the value. This produces a sparse `HashMap<u32, u64>` touching only tiles that actually contain interval starts — efficient when batches are sparse over the coordinate space.
+
+2. **Densify with fill-forward:** Allocate a `u64[]` of length `max_tile + 1`. Iterate `t` from 0 to `max_tile`: fill `dense[t]` from the hashmap if present, otherwise carry forward the previous value (since no intervals start in that tile, the partition point does not change).
+
+The resulting dense array is written to `layer_K.idx`.
+
+### Build: Incremental Merge (Append)
+
+`old_table` (read from the existing `.idx`) and `new_local` (computed from the new batch as above) are treated as maps with a default of 0 for absent keys. The merged table is their element-wise sum:
+
+```
+merged[t] = old_table[t] + (new_local[t] ?? 0)
+```
+
+This works because the merged layer contains exactly `old_table[t] + new_local[t]` total intervals before the boundary `t * tile_size` — so their sum is the correct first-index into the merged layer. No re-scan of the existing layer is required; only the incoming batch is scanned to produce `new_local`.
+
+For tiles in `old_table` that lie beyond `new_local`'s coverage, `new_local[t] ?? 0` evaluates to 0. This is a conservative undercount (the jump will land slightly early) but remains correct — the subsequent linear scan advances to the true position.
+
+If the existing `layer_K.idx` is absent (e.g., a database built before jump tables were introduced), the jump table update is skipped and the query engine falls back to binary search for that layer.

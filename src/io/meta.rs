@@ -61,6 +61,14 @@ impl LayerConfig {
         val.min(u32::MAX as u64) as u32
     }
 
+    /// The jump-table tile size for layer K.
+    ///
+    /// A single table lookup lands the cursor within one tile-width of the
+    /// fast-forward target. `tile_size = layer_max_size(K) / 2`, minimum 1.
+    pub fn tile_size(&self, layer: usize) -> u32 {
+        (self.layer_max_size(layer) / 2).max(1)
+    }
+
     /// Default config suitable for genomic data (~15 layers covers u32 range).
     pub fn default_genomic() -> Self {
         Self {

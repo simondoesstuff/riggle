@@ -8,8 +8,9 @@ use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
 use crate::io::{
-    BedParseError, LayerConfig, LayerError, Meta, MetaError, SidEntry, extend_layer, is_bed_file,
-    parse_bed_file, write_layer,
+    BedParseError, LayerConfig, LayerError, Meta, MetaError, SidEntry,
+    build_jump_table, extend_jump_table, extend_layer, is_bed_file,
+    parse_bed_file, write_jump_table, write_layer,
 };
 
 /// Errors from the add / build pipeline
@@ -178,12 +179,28 @@ fn process_file_batch(
                 return Some(AddError::Io(e));
             }
             let layer_path = shard_dir.join(format!("layer_{}.bin", layer_idx));
-            let result = if layer_path.exists() {
+            let idx_path = shard_dir.join(format!("layer_{}.idx", layer_idx));
+            let tile_sz = layer_config.tile_size(*layer_idx);
+
+            let layer_exists = layer_path.exists();
+            let layer_result = if layer_exists {
                 extend_layer(&layer_path, sorted_ivs)
             } else {
                 write_layer(&layer_path, sorted_ivs)
             };
-            result.err().map(AddError::Layer)
+            if let Err(e) = layer_result {
+                return Some(AddError::Layer(e));
+            }
+
+            let idx_result = if layer_exists {
+                // Merge into existing .idx (no-op if .idx is absent).
+                extend_jump_table(&idx_path, sorted_ivs, tile_sz)
+            } else {
+                // New layer — create the .idx from scratch.
+                let table = build_jump_table(sorted_ivs, tile_sz);
+                write_jump_table(&idx_path, &table)
+            };
+            idx_result.err().map(AddError::Layer)
         })
         .collect();
 

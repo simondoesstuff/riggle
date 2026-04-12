@@ -8,7 +8,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::io::{BedParseError, LayerError, Meta, MetaError, MappedLayer, is_bed_file, parse_bed_file};
+use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file, parse_bed_file};
 use crate::matrix::{DenseMatrix, SparseMatrix};
 use crate::sweep::query_sweep;
 
@@ -175,6 +175,10 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 }
 
                 let layer_max_size = meta.layer_config.layer_max_size(layer_idx);
+                let tile_size = meta.layer_config.tile_size(layer_idx);
+                let idx_path = config.db_path.join(&shard).join(format!("layer_{}.idx", layer_idx));
+                let jump_table = MappedJumpTable::open(&idx_path, tile_size)?;
+
                 let db_intervals = layer.intervals();
 
                 let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
@@ -183,7 +187,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 let layer_result = blocks
                     .par_iter()
                     .map(|block| {
-                        run_sweep_block(db_intervals, layer_max_size, block, batch_len, num_sources)
+                        run_sweep_block(db_intervals, layer_max_size, &jump_table, block, batch_len, num_sources)
                     })
                     .reduce_with(|mut a, b| {
                         a.add_dense(&b);
@@ -226,6 +230,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 fn run_sweep_block(
     db_intervals: &[Interval],
     layer_max_size: u32,
+    jump_table: &MappedJumpTable,
     query_block: &[Interval],
     num_queries: usize,
     num_sources: usize,
@@ -238,7 +243,7 @@ fn run_sweep_block(
             scratch.resize_and_zero(num_queries, num_sources);
         }
 
-        query_sweep(db_intervals, layer_max_size, query_block, scratch);
+        query_sweep(db_intervals, layer_max_size, jump_table, query_block, scratch);
 
         let result = scratch.clone();
         scratch.resize_and_zero(num_queries, num_sources);
