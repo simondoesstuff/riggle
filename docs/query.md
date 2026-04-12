@@ -41,10 +41,15 @@ LOOP START (Check Dead Space):
         1. CLEAR Active_D heap.
         2. ZERO out overlapsFrame.
         3. CLEAR activeMask bitset.
-        4. BINARY SEARCH the layer memmap for the first D index where:
-           D.start >= (next_Q.start - layerSize)
+        4. JUMP TABLE LOOKUP for dead_zone_end = (next_Q.start - layerSize):
+             tile_idx  = dead_zone_end / tile_size        // O(1) index
+             D_cursor  = jump_table[tile_idx]             // jump to tile start
+             SCAN forward while D_cursor.start < dead_zone_end  // ≤ tile_size coords
+           Falls back to BINARY SEARCH if jump table is absent.
         5. D_cursor = found_index
 ```
+
+**Jump table layout:** `layer_K.idx` is a flat raw `u64[]` (memory-mapped, zero-copy) where `table[t]` is the index of the first interval with `start >= t * tile_size`. Entries are `u64` to support layer sizes beyond the u32 range. The tile size is `layer_max_size(K) / 2`. The table is conservative for tiles beyond the last ingested batch's coverage (may undercount, landing the cursor slightly early), but correctness is preserved by the forward scan. Because the lookup lands within one tile of the target, the scan covers at most `tile_size` coordinate units — a constant bounded by the layer's own size class, independent of total layer length. This reduces the fast-forward cost from O(log N/K) per dead zone to O(1) amortized. If the `.idx` file is absent, the engine falls back to binary search.
 
 #### 2.2. The Sweep Line State Machine
 
