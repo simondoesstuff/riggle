@@ -87,17 +87,17 @@ fi
 	fi
 }
 
-echo
-echo "==================================  Giggle  ================================== "
-if [ ! -f "$IDX_GIGGLE/root_ids.dat" ]; then
-	echo "Building index"
-	time timeout "$TIMEOUT" giggle index -s -f -i "${SRC_BED_DIR}/*" -o "$IDX_GIGGLE" || {
-		rm -rf "$IDX_GIGGLE"
-		echo "[!] Giggle build timed out or failed"
-	}
-fi
-[ -f "$IDX_GIGGLE/root_ids.dat" ] && {
-	du -sh "$IDX_GIGGLE"
-	echo "Querying"
-	time timeout "$TIMEOUT" giggle search -i "$IDX_GIGGLE" -q "$QRY_FILE" >/dev/null || echo "[!] Giggle query timed out or failed"
-}
+# echo
+# echo "==================================  Giggle  ================================== "
+# if [ ! -f "$IDX_GIGGLE/root_ids.dat" ]; then
+# 	echo "Building index"
+# 	time timeout "$TIMEOUT" giggle index -s -f -i "${SRC_BED_DIR}/*" -o "$IDX_GIGGLE" || {
+# 		rm -rf "$IDX_GIGGLE"
+# 		echo "[!] Giggle build timed out or failed"
+# 	}
+# fi
+# [ -f "$IDX_GIGGLE/root_ids.dat" ] && {
+# 	du -sh "$IDX_GIGGLE"
+# 	echo "Querying"
+# 	time timeout "$TIMEOUT" giggle search -i "$IDX_GIGGLE" -q "$QRY_FILE" >/dev/null || echo "[!] Giggle query timed out or failed"
+# }
