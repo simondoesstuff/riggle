@@ -1,0 +1,63 @@
+❮ rm -rf data/at_scale_query_* && ./scripts/at_scale_query.sh -f 1000 -n 2000000 -m 100000000 -t 3600 -b 400
+RUN: src_files=1000, src_records=2000000, qry_records=100000000, timeout=3600s
+cargo run --release --bin gen -- -f 1000 -n 2000000 -c --sort -o data/at_scale_query_src_beds
+   Compiling riggle v0.1.0 (/Users/simon/Code/lab/riggle)
+    Finished `release` profile [optimized] target(s) in 3.43s
+     Running `target/release/gen -f 1000 -n 2000000 -c --sort -o data/at_scale_query_src_beds`
+Starting BED file generation...
+Successfully generated 1000 files in "data/at_scale_query_src_beds"
+generate_parallel_beds |   2000000000 elements |  282.040s |     7.09 Melem/s
+cargo run --release --bin gen -- -n 100000000 -s 99 -c --sort -o data/at_scale_query_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/gen -n 100000000 -s 99 -c --sort -o data/at_scale_query_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_query_query.bed.gz"
+generate_single_bed  |    100000000 elements |  102.019s |   980.21 Kelem/s
+
+==================================  Native  ==================================
+Building index
+cargo run --release --bin riggle -- add -i data/at_scale_query_src_beds -d data/at_scale_query_riggle_idx --batch-size 400
+   Compiling riggle v0.1.0 (/Users/simon/Code/lab/riggle)
+    Finished `release` profile [optimized] target(s) in 0.70s
+     Running `target/release/riggle add -i data/at_scale_query_src_beds -d data/at_scale_query_riggle_idx --batch-size 400`
+
+real    3m39.033s
+user    8m39.816s
+sys     1m34.572s
+24G     data/at_scale_query_riggle_idx
+Querying
+cargo run --release --bin riggle -- query -d data/at_scale_query_riggle_idx -q data/at_scale_query_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 1.96s
+     Running `target/release/riggle query -d data/at_scale_query_riggle_idx -q data/at_scale_query_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 1000 database sources → /dev/null
+
+real    5m2.891s
+user    36m55.689s
+sys     0m42.198s
+
+==================================  IGD  =====================================
+Building index
+Create igd from data/at_scale_query_src_beds/*:
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435458       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435458       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     200409645       366216
+
+Save igd database to data/at_scale_query_igd_idx/-s.igd
+Total intervals, l_avg:  2000000000     5050.093
+
+real    26m49.797s
+user    7m3.837s
+sys     6m45.364s
+39G     data/at_scale_query_igd_idx
+Querying
+
+real    12m31.779s
+user    7m17.857s
+sys     4m31.871s

@@ -24,7 +24,7 @@ while getopts f:n:m:t:b: flag; do
 done
 
 DATA_DIR="data"
-PREFIX="${DATA_DIR}/at_scale_query_"
+PREFIX="${DATA_DIR}/at_scale_bench_"
 SRC_BED_DIR="${PREFIX}src_beds"
 QRY_FILE="${PREFIX}query.bed.gz"
 IDX_NATIVE="${PREFIX}riggle_idx"
@@ -55,7 +55,7 @@ echo "==================================  Native  ==============================
 batchArg=''
 [ -n "$BATCH_SIZE" ] && batchArg="--batch-size $BATCH_SIZE"
 if [ ! -d "$IDX_NATIVE" ]; then
-	echo "Building index"
+	echo ">>>   Building index   <<<"
 	time timeout "$TIMEOUT" just run add -i "$SRC_BED_DIR" -d "$IDX_NATIVE" ${batchArg} || {
 		rm -rf "$IDX_NATIVE"
 		echo "[!] Native build timed out or failed"
@@ -63,14 +63,14 @@ if [ ! -d "$IDX_NATIVE" ]; then
 fi
 [ -d "$IDX_NATIVE" ] && {
 	du -sh "$IDX_NATIVE"
-	echo "Querying"
+	echo ">>>   Querying   <<<"
 	time timeout "$TIMEOUT" just run query -d "$IDX_NATIVE" -q "$QRY_FILE" -o /dev/null ${batchArg} || echo "[!] Native query timed out or failed"
 }
 
 echo
 echo "==================================  IGD  ===================================== "
 if [ ! -d "$IDX_IGD" ]; then
-	echo "Building index"
+	echo ">>>   Building index   <<<"
 	time timeout "$TIMEOUT" igd create "$SRC_BED_DIR" "$IDX_IGD" -s 0 || {
 		rm -rf "$IDX_IGD"
 		echo "[!] IGD build timed out or failed"
@@ -80,7 +80,7 @@ fi
 	du -sh "$IDX_IGD"
 	IGD_FILE=$(ls "$IDX_IGD"/*.igd 2>/dev/null | head -1)
 	if [ -n "$IGD_FILE" ]; then
-		echo "Querying"
+		echo ">>>   Querying   <<<"
 		time timeout "$TIMEOUT" igd search "$IGD_FILE" -q "$QRY_FILE" >/dev/null || echo "[!] IGD query timed out or failed"
 	else
 		echo "[!] No .igd file found in $IDX_IGD"
@@ -90,7 +90,7 @@ fi
 # echo
 # echo "==================================  Giggle  ================================== "
 # if [ ! -f "$IDX_GIGGLE/root_ids.dat" ]; then
-# 	echo "Building index"
+# 	echo ">>>   Building index   <<<"
 # 	time timeout "$TIMEOUT" giggle index -s -f -i "${SRC_BED_DIR}/*" -o "$IDX_GIGGLE" || {
 # 		rm -rf "$IDX_GIGGLE"
 # 		echo "[!] Giggle build timed out or failed"
@@ -98,6 +98,6 @@ fi
 # fi
 # [ -f "$IDX_GIGGLE/root_ids.dat" ] && {
 # 	du -sh "$IDX_GIGGLE"
-# 	echo "Querying"
+# 	echo ">>>   Querying   <<<"
 # 	time timeout "$TIMEOUT" giggle search -i "$IDX_GIGGLE" -q "$QRY_FILE" >/dev/null || echo "[!] Giggle query timed out or failed"
 # }
