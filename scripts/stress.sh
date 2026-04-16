@@ -7,7 +7,7 @@ SRC_RECORDS=3000000  # Records per source file
 QRY_RECORDS=10000000 # Records in the single query file
 TIMEOUT=300          # Default timeout in seconds
 BATCH_SIZE=''        # Query batch size, None = all
-echo "10M over 300M"
+# Default: 10M over 300M
 
 # Parse command-line arguments
 # -f / -n : source (database) shape
