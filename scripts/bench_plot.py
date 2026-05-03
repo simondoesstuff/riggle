@@ -13,13 +13,22 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from asymptotic_plot import plot_asymptotic, Curve
+from asymptotic_plot import Curve, plot_asymptotic
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
 
 _TIME_RE = re.compile(r"real\s+(\d+)m([\d.]+)s")
 _RUN_RE = re.compile(r"RUN: src_files=(\d+), src_records=(\d+)")
 _SECTION_RE = re.compile(r"={10,}\s+(\w+)\s+={10,}")
+_SIZE_RE = re.compile(r"^([\d.]+)(K|M|G)\s+\S")
+
+_SIZE_MULT = {"K": 1024, "M": 1024**2, "G": 1024**3}
+
+
+def _parse_size(line: str) -> float | None:
+    """Return index size in bytes, or None."""
+    m = _SIZE_RE.search(line)
+    return float(m.group(1)) * _SIZE_MULT[m.group(2)] if m else None
 
 
 def _parse_time(line: str) -> float | None:
@@ -40,23 +49,28 @@ def parse_bench(text: str) -> dict[str, dict[str, list[tuple[int, float]]]]:
     results: dict = {}
     current_n: int | None = None
     current_algo: str | None = None
-    current_phase: str | None = None   # 'index' | 'query'
+    current_phase: str | None = None  # 'index' | 'query'
     phase_failed = False
     pending_time: float | None = None
+    pending_size: float | None = None
 
     def commit() -> None:
-        nonlocal pending_time, phase_failed
+        nonlocal pending_time, pending_size, phase_failed
         if (
-            pending_time is not None
-            and not phase_failed
+            not phase_failed
             and current_algo
             and current_phase
             and current_n is not None
         ):
-            results.setdefault(current_algo, {"index": [], "query": []})[
-                current_phase
-            ].append((current_n, pending_time))
+            bucket = results.setdefault(
+                current_algo, {"index": [], "query": [], "size": []}
+            )
+            if pending_time is not None:
+                bucket[current_phase].append((current_n, pending_time))
+            if pending_size is not None and current_phase == "index":
+                bucket["size"].append((current_n, pending_size))
         pending_time = None
+        pending_size = None
         phase_failed = False
 
     for line in text.splitlines():
@@ -75,7 +89,7 @@ def parse_bench(text: str) -> dict[str, dict[str, list[tuple[int, float]]]]:
             commit()
             algo = m.group(1).strip()
             if algo == "Native":
-                algo = "Riggle"
+                algo = "Chuckle"
             current_algo = algo
             current_phase = None
             continue
@@ -100,6 +114,11 @@ def parse_bench(text: str) -> dict[str, dict[str, list[tuple[int, float]]]]:
         t = _parse_time(line)
         if t is not None:
             pending_time = t  # keep the last 'real' seen for this phase
+            continue
+
+        s = _parse_size(line)
+        if s is not None and current_phase == "index":
+            pending_size = s
 
     commit()
     return results
@@ -107,13 +126,13 @@ def parse_bench(text: str) -> dict[str, dict[str, list[tuple[int, float]]]]:
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-_LINEAR = lambda x, a: a * x              # noqa: E731
-_NLOGN  = lambda x, a: a * x * np.log2(x)  # noqa: E731
+_LINEAR = lambda x, a: a * x  # noqa: E731
+_NLOGN = lambda x, a: a * x * np.log2(x)  # noqa: E731
 
 # Riggle and IGD are linear; Giggle is NlogN.
 _ALGO_FIT: dict[str, object] = {
-    "Riggle": _LINEAR,
-    "IGD":    _LINEAR,
+    "Chuckle": _LINEAR,
+    "IGD": _LINEAR,
     "Giggle": _NLOGN,
 }
 
@@ -135,12 +154,16 @@ def bench_curves(
         if not pts:
             continue
         xs, ys = zip(*pts)
-        curves.append(Curve(
-            label=algo,
-            xs=list(xs),
-            ys=list(ys),
-            fit=_ALGO_FIT.get(algo, _LINEAR),
-        ))
+        if phase == "size":
+            ys = tuple(y / 1024**3 for y in ys)  # bytes → GB
+        curves.append(
+            Curve(
+                label=algo,
+                xs=list(xs),
+                ys=list(ys),
+                fit=_ALGO_FIT.get(algo, _LINEAR),
+            )
+        )
     return curves
 
 
@@ -153,23 +176,35 @@ if __name__ == "__main__":
     parser.add_argument("input", help="Benchmark output file (e.g. at_scale_many.txt)")
     parser.add_argument(
         "--phase",
-        choices=["index", "query"],
+        choices=["index", "query", "size"],
         default="index",
-        help="Which timing to plot (default: index)",
+        help="Which metric to plot (default: index)",
     )
-    parser.add_argument("--save", metavar="PATH", help="Save plot to file instead of showing")
+    parser.add_argument(
+        "--save", metavar="PATH", help="Save plot to file instead of showing"
+    )
     args = parser.parse_args()
 
     text = Path(args.input).read_text()
     parsed = parse_bench(text)
     curves = bench_curves(parsed, phase=args.phase)  # fits per-algo
 
-    phase_label = args.phase.capitalize()
-    plot_asymptotic(
-        curves,
-        title=f"{phase_label} Time vs Total Source Intervals",
-        xlabel="total source intervals (n)",
-        ylabel="wall-clock time (s)",
-        show=args.save is None,
-        save_path=args.save,
-    )
+    if args.phase == "size":
+        plot_asymptotic(
+            curves,
+            title="Index Size vs Total Source Intervals",
+            xlabel="total source intervals (n)",
+            ylabel="index size (GB)",
+            show=args.save is None,
+            save_path=args.save,
+        )
+    else:
+        phase_label = args.phase.capitalize()
+        plot_asymptotic(
+            curves,
+            title=f"{phase_label} Time vs Total Source Intervals",
+            xlabel="total source intervals (n)",
+            ylabel="wall-clock time (s)",
+            show=args.save is None,
+            save_path=args.save,
+        )
