@@ -1,0 +1,656 @@
+❮ ./scripts/at_scale_many.sh
+RUN: src_files=2, src_records=5000, qry_records=1000, timeout=600s
+cargo run --release --bin gen -- -f 2 -n 5000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.30s
+     Running `target/release/gen -f 2 -n 5000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 2 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |        10000 elements |    0.025s |   396.58 Kelem/s
+cargo run --release --bin gen -- -n 1000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 1000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |         1000 elements |    0.014s |    71.48 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m0.286s
+user    0m0.162s
+sys     0m0.312s
+453M    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 2 database sources → /dev/null
+
+real    0m0.240s
+user    0m0.057s
+sys     0m0.113s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+nCtgs, nRegions, nTiles: 24      25352   365320
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  10000    25019.245
+
+real    0m2.926s
+user    0m0.092s
+sys     0m2.710s
+2.7M    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m0.008s
+user    0m0.003s
+sys     0m0.003s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 10000 intervals.
+
+real    0m0.048s
+user    0m0.026s
+sys     0m0.015s
+404K    data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m0.019s
+user    0m0.011s
+sys     0m0.007s
+RUN: src_files=2, src_records=50000, qry_records=10000, timeout=600s
+cargo run --release --bin gen -- -f 2 -n 50000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/gen -f 2 -n 50000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 2 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |       100000 elements |    0.075s |     1.33 Melem/s
+cargo run --release --bin gen -- -n 10000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 10000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |        10000 elements |    0.025s |   393.14 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m0.387s
+user    0m0.305s
+sys     0m0.568s
+887M    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 2 database sources → /dev/null
+
+real    0m0.303s
+user    0m0.077s
+sys     0m0.156s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+nCtgs, nRegions, nTiles: 24      252295  366126
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  100000    24934.402
+
+real    0m32.370s
+user    0m0.578s
+sys     0m21.730s
+5.6M    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m0.013s
+user    0m0.006s
+sys     0m0.004s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 100000 intervals.
+
+real    0m0.248s
+user    0m0.192s
+sys     0m0.037s
+2.7M    data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m0.054s
+user    0m0.041s
+sys     0m0.011s
+RUN: src_files=5, src_records=200000, qry_records=100000, timeout=600s
+cargo run --release --bin gen -- -f 5 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/gen -f 5 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 5 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |      1000000 elements |    0.262s |     3.81 Melem/s
+cargo run --release --bin gen -- -n 100000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 100000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |       100000 elements |    0.126s |   791.94 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m0.501s
+user    0m0.598s
+sys     0m0.565s
+958M    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 5 database sources → /dev/null
+
+real    0m0.401s
+user    0m0.243s
+sys     0m0.198s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+nCtgs, nRegions, nTiles: 24      2526027         366215
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  1000000    25011.927
+
+real    1m13.188s
+user    0m1.410s
+sys     0m44.024s
+41M     data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m0.060s
+user    0m0.044s
+sys     0m0.013s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 1000000 intervals.
+
+real    0m1.924s
+user    0m1.688s
+sys     0m0.136s
+24M     data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m0.357s
+user    0m0.321s
+sys     0m0.034s
+RUN: src_files=10, src_records=200000, qry_records=200000, timeout=600s
+cargo run --release --bin gen -- -f 10 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/gen -f 10 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 10 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |      2000000 elements |    0.300s |     6.68 Melem/s
+cargo run --release --bin gen -- -n 200000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 200000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |       200000 elements |    0.234s |   855.47 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m0.638s
+user    0m0.930s
+sys     0m0.559s
+973M    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 10 database sources → /dev/null
+
+real    0m0.363s
+user    0m0.485s
+sys     0m0.177s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    5051860         366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  2000000    25008.024
+
+real    1m14.426s
+user    0m1.759s
+sys     0m44.367s
+81M     data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m0.127s
+user    0m0.095s
+sys     0m0.029s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 2000000 intervals.
+
+real    0m3.852s
+user    0m3.493s
+sys     0m0.255s
+53M     data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m0.796s
+user    0m0.730s
+sys     0m0.064s
+RUN: src_files=20, src_records=200000, qry_records=400000, timeout=600s
+cargo run --release --bin gen -- -f 20 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/gen -f 20 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 20 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |      4000000 elements |    0.592s |     6.76 Melem/s
+cargo run --release --bin gen -- -n 400000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 400000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |       400000 elements |    0.459s |   872.15 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m0.716s
+user    0m1.450s
+sys     0m0.569s
+998M    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 20 database sources → /dev/null
+
+real    0m0.472s
+user    0m1.011s
+sys     0m0.179s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    10103649        366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  4000000    25004.428
+
+real    1m14.955s
+user    0m2.607s
+sys     0m44.209s
+161M    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m0.340s
+user    0m0.243s
+sys     0m0.094s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 4000000 intervals.
+
+real    0m8.089s
+user    0m7.356s
+sys     0m0.490s
+97M     data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m2.511s
+user    0m2.374s
+sys     0m0.133s
+RUN: src_files=50, src_records=200000, qry_records=1000000, timeout=1200s
+cargo run --release --bin gen -- -f 50 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/gen -f 50 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 50 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |     10000000 elements |    1.414s |     7.07 Melem/s
+cargo run --release --bin gen -- -n 1000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 1000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |      1000000 elements |    1.139s |   877.63 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m1.170s
+user    0m3.051s
+sys     0m0.609s
+1.1G    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 50 database sources → /dev/null
+
+real    0m0.836s
+user    0m2.770s
+sys     0m0.164s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    25263554        366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  10000000    25006.831
+
+real    1m23.004s
+user    0m5.458s
+sys     0m45.169s
+401M    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m1.398s
+user    0m0.807s
+sys     0m0.589s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 10000000 intervals.
+
+real    0m22.399s
+user    0m20.778s
+sys     0m1.229s
+232M    data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m12.413s
+user    0m11.879s
+sys     0m0.522s
+RUN: src_files=100, src_records=200000, qry_records=2000000, timeout=1200s
+cargo run --release --bin gen -- -f 100 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.20s
+     Running `target/release/gen -f 100 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 100 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |     20000000 elements |    2.820s |     7.09 Melem/s
+cargo run --release --bin gen -- -n 2000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 2000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |      2000000 elements |    2.266s |   882.65 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m1.895s
+user    0m5.755s
+sys     0m0.792s
+1.2G    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 100 database sources → /dev/null
+
+real    0m1.695s
+user    0m6.898s
+sys     0m0.264s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    50521388        366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  20000000    25004.358
+
+real    1m25.332s
+user    0m8.826s
+sys     0m45.342s
+785M    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m4.187s
+user    0m2.177s
+sys     0m2.008s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 20000000 intervals.
+
+real    0m50.967s
+user    0m48.140s
+sys     0m2.485s
+457M    data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    0m44.195s
+user    0m40.206s
+sys     0m3.151s
+RUN: src_files=200, src_records=200000, qry_records=4000000, timeout=2400s
+cargo run --release --bin gen -- -f 200 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/gen -f 200 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 200 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |     40000000 elements |    5.582s |     7.17 Melem/s
+cargo run --release --bin gen -- -n 4000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 4000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |      4000000 elements |    4.464s |   895.97 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m3.366s
+user    0m11.157s
+sys     0m1.134s
+1.4G    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 200 database sources → /dev/null
+
+real    0m3.323s
+user    0m17.328s
+sys     0m0.248s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    101037688       366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  40000000    25002.682
+
+real    1m43.761s
+user    0m14.349s
+sys     0m54.730s
+1.6G    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m12.314s
+user    0m6.097s
+sys     0m6.212s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Indexed 40000000 intervals.
+
+real    2m3.658s
+user    1m58.116s
+sys     0m5.106s
+941M    data/at_scale_bench_giggle_idx
+>>>   Querying   <<<
+
+real    22m46.091s
+user    1m50.527s
+sys     15m1.752s
+RUN: src_files=500, src_records=200000, qry_records=10000000, timeout=3600s
+cargo run --release --bin gen -- -f 500 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running `target/release/gen -f 500 -n 200000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 500 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |    100000000 elements |   13.859s |     7.22 Melem/s
+cargo run --release --bin gen -- -n 10000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/gen -n 10000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |     10000000 elements |   11.108s |   900.24 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    0m8.895s
+user    0m27.903s
+sys     0m3.507s
+2.1G    data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 500 database sources → /dev/null
+
+real    0m11.177s
+user    1m14.838s
+sys     0m0.437s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+..........nCtgs, nRegions, nTiles: 24    252598753       366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  100000000    25003.204
+
+real    2m6.603s
+user    0m31.975s
+sys     0m57.696s
+3.8G    data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    0m51.772s
+user    0m24.188s
+sys     0m27.577s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Could not open file 'at_scale_bench_src_beds/source_326.bed.gz'
+giggle: Could not open at_scale_bench_src_beds/source_326.bed.gz.
+
+
+real    0m0.128s
+user    0m0.010s
+sys     0m0.020s
+[!] Giggle build timed out or failed
+RUN: src_files=1000, src_records=1000000, qry_records=100000000, timeout=3600s
+cargo run --release --bin gen -- -f 1000 -n 1000000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target/release/gen -f 1000 -n 1000000 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_src_beds`
+Starting BED file generation...
+Successfully generated 1000 files in "data/at_scale_bench_src_beds"
+generate_parallel_beds |   1000000000 elements |  137.581s |     7.27 Melem/s
+cargo run --release --bin gen -- -n 100000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running `target/release/gen -n 100000000 -s 99 --min-len 1 --max-len 50000 -c --sort -o data/at_scale_bench_query.bed.gz`
+Starting BED file generation...
+Successfully generated 1 file at: "data/at_scale_bench_query.bed.gz"
+generate_single_bed  |    100000000 elements |  100.306s |   996.95 Kelem/s
+
+==================================  Native  ==================================
+>>>   Building index   <<<
+cargo run --release --bin riggle -- add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/riggle add -i data/at_scale_bench_src_beds -d data/at_scale_bench_riggle_idx --batch-size 400`
+
+real    1m42.717s
+user    4m29.956s
+sys     0m33.168s
+13G     data/at_scale_bench_riggle_idx
+>>>   Querying   <<<
+cargo run --release --bin riggle -- query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400
+    Finished `release` profile [optimized] target(s) in 0.16s
+     Running `target/release/riggle query -d data/at_scale_bench_riggle_idx -q data/at_scale_bench_query.bed.gz -o /dev/null --batch-size 400`
+Query complete: 1 query files × 1000 database sources → /dev/null
+
+real    6m41.512s
+user    57m25.347s
+sys     0m28.049s
+
+==================================  IGD  =====================================
+>>>   Building index   <<<
+Create igd from data/at_scale_bench_src_beds/*:
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435460       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435458       366216
+.nCtgs, nRegions, nTiles: 24     268435459       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435459       366216
+.nCtgs, nRegions, nTiles: 24     268435457       366216
+.nCtgs, nRegions, nTiles: 24     268435458       366216
+.nCtgs, nRegions, nTiles: 24     109945765       366216
+
+Save igd database to data/at_scale_bench_igd_idx/-s.igd
+Total intervals, l_avg:  1000000000    25000.894
+
+real    21m37.507s
+user    4m29.645s
+sys     6m16.853s
+38G     data/at_scale_bench_igd_idx
+>>>   Querying   <<<
+
+real    31m33.908s
+user    14m37.657s
+sys     16m25.413s
+
+==================================  Giggle  ==================================
+>>>   Building index   <<<
+Could not open file 'at_scale_bench_src_beds/source_326.bed.gz'
+giggle: Could not open at_scale_bench_src_beds/source_326.bed.gz.
+
+
+real    0m0.160s
+user    0m0.010s
+sys     0m0.025s
+[!] Giggle build timed out or failed
+
+

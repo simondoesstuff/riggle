@@ -36,12 +36,12 @@ echo "RUN: src_files=${SRC_FILES}, src_records=${SRC_RECORDS}, qry_records=${QRY
 # Generate and sort source BED files (seed 42)
 if [ ! -d "$SRC_BED_DIR" ]; then
 	mkdir -p "$SRC_BED_DIR"
-	just gen -f "$SRC_FILES" -n "$SRC_RECORDS" -c --sort -o "$SRC_BED_DIR"
+	just gen -f "$SRC_FILES" -n "$SRC_RECORDS" --min-len 1 --max-len 50000 -c --sort -o "$SRC_BED_DIR"
 fi
 
 # Generate and sort single query BED file (seed 99 to differ from source)
 if [ ! -f "$QRY_FILE" ]; then
-	just gen -n "$QRY_RECORDS" -s 99 -c --sort -o "$QRY_FILE"
+	just gen -n "$QRY_RECORDS" -s 99 --min-len 1 --max-len 50000 -c --sort -o "$QRY_FILE"
 fi
 
 cleanup() {
