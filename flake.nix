@@ -61,14 +61,7 @@
             cargo
             samply
             igd
-
-            (python3.withPackages (
-              py-pkgs: with py-pkgs; [
-                matplotlib
-                numpy
-                scipy
-              ]
-            ))
+            uv
           ];
 
           # Help the linker find libiconv on Darwin
