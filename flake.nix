@@ -49,19 +49,59 @@
             cp bin/igd $out/bin/
           '';
         };
+
+        # for non-nix users https://hgdownload.gi.ucsc.edu/downloads.html#utilities_downloads
+        liftOver = pkgs.stdenv.mkDerivation rec {
+          pname = "liftOver";
+          version = "latest";
+
+          # hashes may require adjustment
+          src =
+            if pkgs.stdenv.isDarwin then
+              pkgs.fetchurl {
+                url = "https://hgdownload.soe.ucsc.edu/admin/exe/macOSX.x86_64/liftOver";
+                sha256 = "sha256-9lg7+MXpUrMsZK9tAkpHAQWJPS16RDrByno1iC/8kuA=";
+              }
+            else
+              pkgs.fetchurl {
+                url = "https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/liftOver";
+                sha256 = "sha256-0000000000000000000000000000000000000000000="; # Placeholder
+              };
+
+          # Since we are fetching a bare binary, we need to skip the unpack phase
+          dontUnpack = true;
+
+          # For Linux, we often need to patch the binary to find the right libraries
+          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.autoPatchelfHook ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.zlib
+            pkgs.openssl
+            pkgs.libpng
+          ];
+
+          installPhase = ''
+            mkdir -p $out/bin
+            cp $src $out/bin/liftOver
+            chmod +x $out/bin/liftOver
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShellNoCC {
           packages = with pkgs; [
-            just
+            cargo
+            # bio
             htslib # bgzip
             bedtools
             giggle.packages.${system}.default
-            libiconv
-            cargo
-            samply
             igd
+            liftOver
+            # misc
+            just
+            libiconv
+            # analysis
             uv
+            samply
           ];
 
           # Help the linker find libiconv on Darwin
