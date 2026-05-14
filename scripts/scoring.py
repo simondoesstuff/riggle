@@ -24,9 +24,16 @@ trials whose total overlap count (pairwise query×db pairs) is >= the observed c
 score_mc_fix_size_distinct is the same test but counts distinct db intervals hit
 rather than total pairs — lower variance when db intervals stack deeply.
 
+calibrate_mc_stability plots the number of MC trials required for a stable
+p-value estimate against the effective genome size.  A neighbourhood radius d
+is swept from near-zero to the full chromosome span.  Valid placements at each
+d are the union of per-db-interval windows, so the method works correctly even
+when hit intervals are scattered (e.g. GWAS SNPs across a chromosome).
+Because p ∝ 1/L, required_trials ∝ L, revealing when MC becomes intractable.
+
 CLI
 ---
-    python scoring.py [--method mean|bm25-merge|bm25-sum|mc-fix-size] query.bed db1.bed ...
+    python scoring.py [--method mean|bm25-merge|bm25-sum|mc-fix-size|calibrate] query.bed db1.bed ...
 """
 
 from __future__ import annotations
@@ -85,6 +92,37 @@ def _merge_length(starts: np.ndarray, ends: np.ndarray) -> int:
             cur_s, cur_e = int(s[i]), int(e[i])
     total += cur_e - cur_s
     return total
+
+
+def _merge_intervals(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Merge overlapping intervals; return (N, 2) int64 array of [start, end) pairs."""
+    if len(starts) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    order = np.argsort(starts)
+    s = starts[order].astype(np.int64)
+    e = ends[order].astype(np.int64)
+    merged: list[tuple[int, int]] = []
+    cur_s, cur_e = int(s[0]), int(e[0])
+    for i in range(1, len(s)):
+        if s[i] <= cur_e:
+            cur_e = max(cur_e, int(e[i]))
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = int(s[i]), int(e[i])
+    merged.append((cur_s, cur_e))
+    return np.array(merged, dtype=np.int64)
+
+
+def _sample_from_intervals(merged: np.ndarray, rng: np.random.Generator) -> int:
+    """Sample a uniform random integer from the union of merged [start, end) intervals."""
+    lengths = merged[:, 1] - merged[:, 0]
+    pos = int(rng.integers(0, int(lengths.sum())))
+    cum = 0
+    for i, ln in enumerate(lengths):
+        cum += int(ln)
+        if pos < cum:
+            return int(merged[i, 0]) + pos - (cum - int(ln))
+    return int(merged[-1, 0])  # unreachable in practice
 
 
 def _pairwise_jaccard(
@@ -455,6 +493,246 @@ def score_mc_fix_size_distinct(
 
 
 # ---------------------------------------------------------------------------
+# MC stability calibration
+# ---------------------------------------------------------------------------
+
+
+def calibrate_mc_stability(
+    query_path: str | Path,
+    db_path: str | Path,
+    *,
+    n_points: int = 10,
+    n_trials: int = 5000,
+    target_cv: float = 0.2,
+    output: str | Path | None = None,
+    rng: np.random.Generator | None = None,
+) -> None:
+    """
+    Plot estimated MC trials required for stable p-values vs effective genome size.
+
+    Tests the hypothesis that MC noise in SNP-based analyses arises because the
+    overlap probability p ∝ 1/L shrinks as the valid placement space L grows, so
+    the required number of trials ∝ L, quickly becoming intractable.
+
+    Instead of a bounding-box expansion (which collapses when hits are spread
+    across a chromosome), a neighbourhood radius d is swept.  For each d, a
+    query interval of size s is valid at any position within d bp of *any*
+    individual db interval — i.e. the union of per-db-interval windows:
+
+        valid starts for size s = ⋃_i  [db_s_i − d − s + 1,  db_e_i + d)
+
+    d is swept log-uniformly from 0 (only overlapping placements) to the span
+    of the largest db chromosome (effectively the whole genome).  The effective
+    genome size plotted on the x-axis is the total bp in valid start zones
+    (averaged over query sizes per chromosome).
+
+    At each d, n_trials random placements are drawn and p̂ estimated; then:
+
+        n_required = (1 − p̂) / (p̂ · target_cv²)
+
+    Parameters
+    ----------
+    query_path, db_path
+        Paths to BED files.
+    n_points
+        Number of neighbourhood radii to sample (log-spaced, default 10).
+    n_trials
+        MC trials per radius used to estimate p (default 5000).
+    target_cv
+        Target coefficient of variation for p-value stability (default 0.2).
+    output
+        Path for the saved plot (PNG/PDF); show interactively if None.
+    rng
+        Numpy random Generator (optional).
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        raise ImportError("matplotlib is required for calibration: pip install matplotlib")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    index = build_index(db_path)
+    query = parse_bed(query_path)
+
+    # -- per-chrom data: query sizes, db starts/ends -----------------------------
+    chrom_info: dict[str, np.ndarray] = {}   # chrom -> query sizes
+    for chrom, ivs in query.items():
+        if chrom not in index.ncls:
+            continue
+        qs = np.array([s for s, _ in ivs], dtype=np.int64)
+        qe = np.array([e for _, e in ivs], dtype=np.int64)
+        qi = np.arange(len(ivs), dtype=np.int64)
+        _, db_hit = index.ncls[chrom].all_overlaps_both(qs, qe, qi)
+        if len(db_hit) == 0:
+            continue
+        chrom_info[chrom] = np.array([e - s for s, e in ivs], dtype=np.int64)
+
+    if not chrom_info:
+        print("No overlapping chromosomes found; nothing to calibrate.")
+        return
+
+    # -- observed distinct db intervals hit --------------------------------------
+    observed = 0
+    for chrom in chrom_info:
+        ivs = query[chrom]
+        qs = np.array([s for s, _ in ivs], dtype=np.int64)
+        qe = np.array([e for _, e in ivs], dtype=np.int64)
+        qi = np.arange(len(ivs), dtype=np.int64)
+        _, db_hit = index.ncls[chrom].all_overlaps_both(qs, qe, qi)
+        observed += len(np.unique(db_hit))
+
+    # -- d sweep range: 0 to span of largest db chromosome ----------------------
+    max_d = max(
+        int(index.ends[c].max() - index.starts[c].min()) for c in chrom_info
+    )
+    # d=0 means query must overlap db interval; start at 1 to avoid empty zones
+    d_values = np.unique(
+        np.logspace(0, math.log10(max_d), n_points).astype(np.int64)
+    )
+
+    # -- full-db effective size (for reference line on plot) ---------------------
+    full_eff_size = sum(
+        int(index.ends[c].max() - index.starts[c].min()) for c in chrom_info
+    )
+
+    span_bp: list[float] = []
+    p_hats: list[float] = []
+    n_required: list[float] = []
+    resolved_flags: list[bool] = []
+
+    for d in d_values:
+        # -- build per-chrom valid-start zone maps (keyed by unique query size) --
+        # For size s, valid starts = ⋃_i [db_s_i − d − s + 1, db_e_i + d)
+        per_chrom: list[tuple[str, np.ndarray, dict[int, np.ndarray]]] = []
+        total_eff_size = 0
+
+        for chrom, sizes in chrom_info.items():
+            db_s = index.starts[chrom]
+            db_e = index.ends[chrom]
+            size_zones: dict[int, np.ndarray] = {}
+            for s in np.unique(sizes):
+                zone_starts = db_s - int(d) - int(s) + 1
+                zone_ends = db_e + int(d)
+                size_zones[int(s)] = _merge_intervals(zone_starts, zone_ends)
+            # effective size: use mean query size as representative
+            mean_s = int(sizes.mean())
+            rep_zones = size_zones[min(size_zones, key=lambda k: abs(k - mean_s))]
+            total_eff_size += int((rep_zones[:, 1] - rep_zones[:, 0]).sum())
+            per_chrom.append((chrom, sizes, size_zones))
+
+        # -- MC estimate of p for this d -----------------------------------------
+        at_least = 0
+        for _ in range(n_trials):
+            trial_count = 0
+            for chrom, sizes, size_zones in per_chrom:
+                rand_starts = np.empty(len(sizes), dtype=np.int64)
+                for j, s in enumerate(sizes):
+                    rand_starts[j] = _sample_from_intervals(size_zones[int(s)], rng)
+                rand_ends = rand_starts + sizes
+                qi = np.arange(len(sizes), dtype=np.int64)
+                _, db_hit = index.ncls[chrom].all_overlaps_both(rand_starts, rand_ends, qi)
+                trial_count += len(np.unique(db_hit))
+            if trial_count >= observed:
+                at_least += 1
+
+        # resolved = at least one trial succeeded; unresolved = zero hits (p unknown)
+        resolved = at_least > 0
+        if resolved:
+            p_hat = at_least / n_trials
+            n_req = (1.0 - p_hat) / (p_hat * target_cv**2)
+            status = f"p̂={p_hat:.4f}  n_req={n_req:,.0f}"
+        else:
+            # p < 1/n_trials; n_req is a strict lower bound of (n_trials-1)/target_cv²
+            p_hat = 1.0 / n_trials          # upper bound on p
+            n_req = (1.0 - p_hat) / (p_hat * target_cv**2)  # lower bound on n_req
+            status = f"p̂<{1/n_trials:.2e}  n_req>{n_req:,.0f}  [unresolved]"
+
+        span_bp.append(float(total_eff_size))
+        p_hats.append(p_hat)
+        n_required.append(n_req)
+        resolved_flags.append(resolved)
+
+        print(f"  d={d:>10,} bp  eff={total_eff_size / 1e6:>8.2f} Mbp  {status}")
+
+    # -- plot --------------------------------------------------------------------
+    span_mbp = [s / 1e6 for s in span_bp]
+    full_mbp = full_eff_size / 1e6
+
+    res = [i for i, r in enumerate(resolved_flags) if r]
+    unres = [i for i, r in enumerate(resolved_flags) if not r]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # required-trials panel
+    if res:
+        ax1.loglog(
+            [span_mbp[i] for i in res], [n_required[i] for i in res],
+            "o-", color="steelblue", label="resolved",
+        )
+    if unres:
+        ax1.scatter(
+            [span_mbp[i] for i in unres], [n_required[i] for i in unres],
+            marker=6,  # caretup = upward triangle = lower bound
+            color="steelblue", s=80, zorder=5, label="lower bound (unresolved)",
+        )
+        # dashed line connecting last resolved point (if any) to first lower bound
+        if res:
+            join_x = [span_mbp[res[-1]], span_mbp[unres[0]]]
+            join_y = [n_required[res[-1]], n_required[unres[0]]]
+            ax1.loglog(join_x, join_y, "--", color="steelblue", alpha=0.4)
+    ax1.axhline(
+        n_trials, color="red", linestyle="--", alpha=0.7,
+        label=f"current n_trials={n_trials:,}",
+    )
+    ax1.axvline(full_mbp, color="grey", linestyle=":", alpha=0.6, label="full db span")
+    ax1.set_xlabel("Effective genome size (Mbp)")
+    ax1.set_ylabel(f"Required trials (CV < {target_cv})")
+    ax1.set_title("MC trials required vs genome size")
+    ax1.legend(fontsize=8)
+    ax1.grid(True, alpha=0.3, which="both")
+
+    # p-value panel
+    if res:
+        ax2.loglog(
+            [span_mbp[i] for i in res], [p_hats[i] for i in res],
+            "s-", color="darkorange", label="resolved",
+        )
+    if unres:
+        ax2.scatter(
+            [span_mbp[i] for i in unres], [p_hats[i] for i in unres],
+            marker=7,  # caretdown = upper bound
+            color="darkorange", s=80, zorder=5, label="upper bound (unresolved)",
+        )
+        if res:
+            join_x = [span_mbp[res[-1]], span_mbp[unres[0]]]
+            join_y = [p_hats[res[-1]], p_hats[unres[0]]]
+            ax2.loglog(join_x, join_y, "--", color="darkorange", alpha=0.4)
+    ax2.axvline(full_mbp, color="grey", linestyle=":", alpha=0.6, label="full db span")
+    ax2.set_xlabel("Effective genome size (Mbp)")
+    ax2.set_ylabel("Estimated p-value")
+    ax2.set_title("p-value vs genome size")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3, which="both")
+
+    fig.suptitle(
+        f"MC stability calibration — "
+        f"query: {Path(query_path).name}  db: {Path(db_path).name}\n"
+        f"observed distinct db hits: {observed}  "
+        f"n_trials per point: {n_trials:,}",
+        fontsize=10,
+    )
+    fig.tight_layout()
+
+    if output:
+        fig.savefig(output, dpi=150, bbox_inches="tight")
+        print(f"Saved: {output}")
+    else:
+        plt.show()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -476,25 +754,54 @@ if __name__ == "__main__":
     parser.add_argument("databases", nargs="+", help="Database BED file(s)")
     parser.add_argument(
         "--method",
-        choices=[*_METHODS, "all"],
+        choices=[*_METHODS, "calibrate", "all"],
         default="mean",
-        help="Scoring method, or 'all' to run every method (default: mean)",
+        help="Scoring method, 'calibrate' to plot MC stability, or 'all' (default: mean)",
     )
     parser.add_argument(
         "--n-trials",
         type=int,
         default=1000,
-        help="Monte Carlo trials for mc-fix-size method (default: 1000)",
+        help="MC trials for mc-fix-size methods (default: 1000); trials per span point for calibrate (default overridden to 5000)",
+    )
+    parser.add_argument(
+        "--n-points",
+        type=int,
+        default=10,
+        help="Number of span sizes to sweep for calibrate (default: 10)",
+    )
+    parser.add_argument(
+        "--target-cv",
+        type=float,
+        default=0.2,
+        help="Target CV for stability estimate in calibrate (default: 0.2)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output path for calibrate plot (PNG/PDF); show interactively if omitted",
     )
     args = parser.parse_args()
 
-    methods = _METHODS if args.method == "all" else {args.method: _METHODS[args.method]}
-
-    for name, score_fn in methods.items():
-        print(name)
+    if args.method == "calibrate":
+        n_trials_calibrate = args.n_trials if args.n_trials != 1000 else 5000
         for db in args.databases:
-            if name in ("mc-fix-size", "mc-fix-size-distinct"):
-                score = score_fn(args.query, db, n_trials=args.n_trials)
-            else:
-                score = score_fn(args.query, db)
-            print(f"{db}\t{score:.6f}")
+            print(f"calibrate: {db}")
+            calibrate_mc_stability(
+                args.query,
+                db,
+                n_points=args.n_points,
+                n_trials=n_trials_calibrate,
+                target_cv=args.target_cv,
+                output=args.output,
+            )
+    else:
+        methods = _METHODS if args.method == "all" else {args.method: _METHODS[args.method]}
+        for name, score_fn in methods.items():
+            print(name)
+            for db in args.databases:
+                if name in ("mc-fix-size", "mc-fix-size-distinct"):
+                    score = score_fn(args.query, db, n_trials=args.n_trials)
+                else:
+                    score = score_fn(args.query, db)
+                print(f"{db}\t{score:.6f}")
