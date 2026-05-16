@@ -38,6 +38,7 @@ def plot_asymptotic(
     ylabel: str = "time",
     show: bool = True,
     save_path: Optional[str] = None,
+    ymax: Optional[float] = None,
 ):
     fig, ax = plt.subplots(figsize=(9, 5))
     prop_cycle = plt.rcParams["axes.prop_cycle"]
@@ -76,9 +77,12 @@ def plot_asymptotic(
             except (RuntimeError, ValueError):
                 pass
 
-        ax.scatter(xs, ys, color=color, label=curve.label, zorder=5, s=40)
+        ys_plot = np.minimum(ys, ymax) if ymax is not None else ys
+        ax.scatter(xs, ys_plot, color=color, label=curve.label, zorder=5, s=40)
 
     ax.set_xscale("log")
+    if ymax is not None:
+        ax.set_ylim(0, ymax)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
