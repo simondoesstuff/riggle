@@ -121,6 +121,19 @@ def parse_bench(text: str) -> dict[str, dict[str, list[tuple[int, float]]]]:
             pending_size = s
 
     commit()
+
+    # Deduplicate: keep the first occurrence of each n per (algo, phase).
+    # Retry passes can re-emit size lines for the same n without new timing.
+    for algo_data in results.values():
+        for key in ("index", "query", "size"):
+            seen: set[int] = set()
+            deduped = []
+            for n, val in algo_data[key]:
+                if n not in seen:
+                    seen.add(n)
+                    deduped.append((n, val))
+            algo_data[key] = deduped
+
     return results
 
 
@@ -183,6 +196,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save", metavar="PATH", help="Save plot to file instead of showing"
     )
+    parser.add_argument(
+        "--ymax", type=float, metavar="Y", help="Clip y-axis at this value; points beyond are pinned to the edge"
+    )
     args = parser.parse_args()
 
     text = Path(args.input).read_text()
@@ -197,6 +213,7 @@ if __name__ == "__main__":
             ylabel="index size (GB)",
             show=args.save is None,
             save_path=args.save,
+            ymax=args.ymax,
         )
     else:
         phase_label = args.phase.capitalize()
@@ -207,4 +224,5 @@ if __name__ == "__main__":
             ylabel="wall-clock time (s)",
             show=args.save is None,
             save_path=args.save,
+            ymax=args.ymax,
         )
