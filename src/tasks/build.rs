@@ -7,6 +7,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
+use crate::fourier::{DepthMap, intervals_to_bed_map};
 use crate::io::{
     BedParseError, LayerConfig, LayerError, Meta, MetaError, SidEntry,
     build_jump_table, extend_jump_table, extend_layer, is_bed_file,
@@ -126,7 +127,11 @@ fn process_file_batch(
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
 
-    // Parse all files in parallel.
+    // Ensure the depthmap directory exists before the parallel section.
+    let depthmap_dir = db_path.join("depthmap");
+    fs::create_dir_all(&depthmap_dir)?;
+
+    // Parse all files in parallel and save per-file Fourier spectra.
     // Each file is assigned a unique D_SID starting from `next_sid`.
     let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>), AddError>> =
         batch
@@ -139,6 +144,12 @@ fn process_file_batch(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| format!("file_{}", sid));
                 let shards = parse_bed_file(path, sid)?;
+
+                // Build and persist the sparse depth map for this file.
+                let bed_map = intervals_to_bed_map(&shards);
+                let dm = DepthMap::build(&bed_map);
+                dm.save(&depthmap_dir.join(format!("{sid}.bin")))?;
+
                 Ok((sid, name, shards))
             })
             .collect();
