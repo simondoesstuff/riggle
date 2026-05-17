@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +8,14 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file, parse_bed_file};
+use crate::fourier::{
+    BedMap as FourierBedMap, ChromDbSpec, DEFAULT_EPSILON, DepthMap, bed_map_v, build_db_spectra,
+    compute_m, compute_pvalue_cached, parse_bed_as_map,
+};
+use crate::io::{
+    BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file,
+    parse_bed_file,
+};
 use crate::matrix::{DenseMatrix, SparseMatrix};
 use crate::sweep::query_sweep;
 
@@ -44,6 +51,11 @@ pub struct QueryConfig {
     /// Maximum number of query files to parse and hold in memory at once.
     /// `None` (default) processes all query files in a single batch.
     pub batch_size: Option<usize>,
+    /// When `true`, compute FFT-based right-tailed p-values for every
+    /// (query, DB) pair with at least one interval overlap.  Requires that
+    /// the database was built with `add_to_database` (which caches Fourier
+    /// spectra under `{db}/fourier/`).
+    pub stats: bool,
 }
 
 impl QueryConfig {
@@ -53,6 +65,7 @@ impl QueryConfig {
             query_path,
             num_threads: None,
             batch_size: None,
+            stats: false,
         }
     }
 }
@@ -62,6 +75,19 @@ impl QueryConfig {
 pub struct QuerySource {
     pub name: String,
     pub count: usize,
+}
+
+/// A single Fourier p-value result for one (query, DB-source) pair.
+#[derive(Debug, Clone)]
+pub struct PValueResult {
+    /// Row index in the overlap matrix (= Q_SID).
+    pub query_id: usize,
+    /// Database source identifier.
+    pub db_sid: u32,
+    /// Base-pair overlap at shift 0, measured in 100 bp bins.
+    pub observed_bins: f64,
+    /// Right-tailed p-value under the rigid-body shift null model.
+    pub p_value: f64,
 }
 
 /// Output of a query operation
@@ -75,6 +101,8 @@ pub struct QueryResult {
     pub query_sources: Vec<QuerySource>,
     /// Database source names (D_SID → name)
     pub db_sources: HashMap<u32, String>,
+    /// Fourier p-values; populated only when `QueryConfig::stats == true`.
+    pub pvalues: Vec<PValueResult>,
 }
 
 /// Execute a query against the database.
@@ -96,6 +124,7 @@ pub struct QueryResult {
 ///    c. Drain non-zero entries from the accumulator, shifting rows by the
 ///       global batch offset, into `all_entries`.
 /// 3. Build the final CSR matrix from `all_entries` (already (row,col)-sorted).
+/// 4. If `config.stats`: compute Fourier p-values for all non-zero pairs.
 pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let meta_path = config.db_path.join("meta.json");
     if !meta_path.exists() {
@@ -119,6 +148,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             query_names: Vec::new(),
             query_sources: Vec::new(),
             db_sources,
+            pvalues: Vec::new(),
         });
     }
 
@@ -137,6 +167,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let mut all_entries: Vec<(usize, usize, u32)> = Vec::new();
     let mut query_names: Vec<String> = Vec::new();
     let mut query_sources: Vec<QuerySource> = Vec::new();
+    let mut query_file_paths: Vec<PathBuf> = Vec::new();
     let mut global_q_offset = 0usize;
 
     for batch_files in all_files.chunks(batch_size) {
@@ -176,7 +207,10 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
                 let layer_max_size = meta.layer_config.layer_max_size(layer_idx);
                 let tile_size = meta.layer_config.tile_size(layer_idx);
-                let idx_path = config.db_path.join(&shard).join(format!("layer_{}.idx", layer_idx));
+                let idx_path = config
+                    .db_path
+                    .join(&shard)
+                    .join(format!("layer_{}.idx", layer_idx));
                 let jump_table = MappedJumpTable::open(&idx_path, tile_size)?;
 
                 let db_intervals = layer.intervals();
@@ -187,7 +221,14 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 let layer_result = blocks
                     .par_iter()
                     .map(|block| {
-                        run_sweep_block(db_intervals, layer_max_size, &jump_table, block, batch_len, num_sources)
+                        run_sweep_block(
+                            db_intervals,
+                            layer_max_size,
+                            &jump_table,
+                            block,
+                            batch_len,
+                            num_sources,
+                        )
                     })
                     .reduce_with(|mut a, b| {
                         a.add_dense(&b);
@@ -213,17 +254,111 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         global_q_offset += batch_len;
         query_names.extend(parsed.query_names);
         query_sources.extend(parsed.query_sources);
+        query_file_paths.extend(parsed.file_paths);
     }
 
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
+
+    // ── Phase 2: Fourier p-values ────────────────────────────────────────────
+    let pvalues = if config.stats {
+        compute_fourier_pvalues(&final_counts, &query_file_paths, &config.db_path)
+    } else {
+        Vec::new()
+    };
 
     Ok(QueryResult {
         counts: final_counts,
         query_names,
         query_sources,
         db_sources,
+        pvalues,
     })
+}
+
+/// For every non-zero (q_sid, d_sid) pair in `counts`, compute the FFT-based
+/// right-tailed p-value.
+///
+/// Two-phase caching strategy to amortise expensive spectrum construction:
+///
+/// Phase A: For each unique DB SID, load its DepthMap once, then build coverage
+/// spectra at M_max (the maximum M needed by any query overlapping this DB file).
+/// Cost: O(K_db · M_max) per DB file, done once regardless of query count.
+///
+/// Phase B: For each (query, DB) pair, build the query spectrum at M_pair ≤
+/// M_max and cross-correlate with the cached DB spectrum.
+///
+/// Pairs for which a depthmap is missing (DB built before this feature) are
+/// silently skipped.
+fn compute_fourier_pvalues(
+    counts: &SparseMatrix,
+    query_file_paths: &[PathBuf],
+    db_path: &Path,
+) -> Vec<PValueResult> {
+    // Collect non-zero (q_sid, d_sid) pairs, grouped by d_sid.
+    let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (q_sid, row) in counts.outer_iterator().enumerate() {
+        for (d_sid, &cnt) in row.iter() {
+            if cnt > 0 {
+                by_db.entry(d_sid as u32).or_default().push(q_sid);
+            }
+        }
+    }
+    if by_db.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect unique query SIDs and parse their BedMaps in parallel.
+    let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
+    let query_bedmaps: HashMap<usize, (FourierBedMap, f64)> = needed_q_sids
+        .par_iter()
+        .filter_map(|&q_sid| {
+            let path = query_file_paths.get(q_sid)?;
+            let bed = parse_bed_as_map(path).ok()?;
+            let v = bed_map_v(&bed);
+            Some((q_sid, (bed, v)))
+        })
+        .collect();
+
+    // For each DB file: load DepthMap, build cached spectra, compute p-values
+    // for all queries that overlap it.
+    by_db
+        .par_iter()
+        .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
+            let dm_path = db_path.join("depthmap").join(format!("{d_sid}.bin"));
+            let dm = match DepthMap::load(&dm_path) {
+                Ok(d) => d,
+                Err(_) => return Vec::new(),
+            };
+            let v_db = dm.total_v();
+
+            // M_max = largest M needed by any query overlapping this DB file.
+            let v_q_max = q_sids
+                .iter()
+                .filter_map(|q| query_bedmaps.get(q).map(|(_, v)| *v))
+                .fold(0.0f64, f64::max);
+            let m_max = compute_m(v_q_max, v_db, DEFAULT_EPSILON);
+
+            // Build DB spectra once at m_max.
+            let db_spectra: Vec<ChromDbSpec> = build_db_spectra(&dm, m_max);
+
+            q_sids
+                .iter()
+                .filter_map(|&q_sid| {
+                    let (query_bed, v_q) = query_bedmaps.get(&q_sid)?;
+                    let m_pair = compute_m(*v_q, v_db, DEFAULT_EPSILON).min(m_max);
+                    let (observed_bins, p_value) =
+                        compute_pvalue_cached(query_bed, &db_spectra, m_pair)?;
+                    Some(PValueResult {
+                        query_id: q_sid,
+                        db_sid: d_sid,
+                        observed_bins,
+                        p_value,
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Run a single sweep block using the thread-local scratch buffer.
@@ -243,7 +378,13 @@ fn run_sweep_block(
             scratch.resize_and_zero(num_queries, num_sources);
         }
 
-        query_sweep(db_intervals, layer_max_size, jump_table, query_block, scratch);
+        query_sweep(
+            db_intervals,
+            layer_max_size,
+            jump_table,
+            query_block,
+            scratch,
+        );
 
         let result = scratch.clone();
         scratch.resize_and_zero(num_queries, num_sources);
@@ -259,6 +400,8 @@ struct ParsedQueries {
     shard_intervals: HashMap<String, Vec<Interval>>,
     query_sources: Vec<QuerySource>,
     query_names: Vec<String>,
+    /// Paths of non-empty files in this batch (same order as query_names).
+    file_paths: Vec<PathBuf>,
     /// Number of non-empty files in this batch (= number of Q_SID rows used).
     total_count: usize,
 }
@@ -283,6 +426,7 @@ fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
     let mut shard_intervals: HashMap<String, Vec<Interval>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
+    let mut file_paths = Vec::new();
     let mut file_sid = 0u32;
 
     for bed_path in files {
@@ -299,7 +443,11 @@ fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
             .unwrap_or_else(|| format!("query_{}", file_sid));
 
         query_names.push(name.clone());
-        query_sources.push(QuerySource { name, count: file_count });
+        query_sources.push(QuerySource {
+            name,
+            count: file_count,
+        });
+        file_paths.push(bed_path.clone());
 
         for (shard, intervals) in file_shards {
             shard_intervals.entry(shard).or_default().extend(intervals);
@@ -312,6 +460,7 @@ fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
         shard_intervals,
         query_sources,
         query_names,
+        file_paths,
         total_count: file_sid as usize,
     })
 }
@@ -361,7 +510,11 @@ mod tests {
 
         write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
         write_bed(input.path(), "b.bed", "chr1\t150\t250\n");
-        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
         write_bed(query_dir.path(), "q.bed", "chr1\t100\t200\n");
         let config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
@@ -369,6 +522,7 @@ mod tests {
 
         assert_eq!(result.counts.rows(), 1);
         assert_eq!(result.db_sources.len(), 2);
+        assert!(result.pvalues.is_empty());
     }
 
     #[test]
@@ -377,10 +531,18 @@ mod tests {
         let db = TempDir::new().unwrap();
 
         write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr2\t300\t400\n");
-        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
         let query_dir = TempDir::new().unwrap();
-        write_bed(query_dir.path(), "q.bed", "chr1\t100\t200\nchr2\t300\t400\n");
+        write_bed(
+            query_dir.path(),
+            "q.bed",
+            "chr1\t100\t200\nchr2\t300\t400\n",
+        );
         let config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
         let result = query_database(&config).unwrap();
 
@@ -393,7 +555,11 @@ mod tests {
         let db = TempDir::new().unwrap();
 
         write_bed(input.path(), "a.bed", "chr1\t100\t200\n");
-        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
         let query_dir = TempDir::new().unwrap();
         write_bed(query_dir.path(), "q.bed", "chr2\t100\t200\n"); // chr2 not in db
@@ -411,7 +577,10 @@ mod tests {
             PathBuf::from("/nonexistent/path"),
             PathBuf::from("/tmp/q.bed"),
         );
-        assert!(matches!(query_database(&config), Err(QueryError::DatabaseNotFound(_))));
+        assert!(matches!(
+            query_database(&config),
+            Err(QueryError::DatabaseNotFound(_))
+        ));
     }
 
     #[test]
@@ -420,11 +589,19 @@ mod tests {
         let db = TempDir::new().unwrap();
 
         write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
-        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
         let query_dir = TempDir::new().unwrap();
         write_bed(query_dir.path(), "q1.bed", "chr1\t100\t200\n");
-        write_bed(query_dir.path(), "q2.bed", "chr1\t300\t400\nchr1\t350\t450\n");
+        write_bed(
+            query_dir.path(),
+            "q2.bed",
+            "chr1\t300\t400\nchr1\t350\t450\n",
+        );
 
         let config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
         let result = query_database(&config).unwrap();
@@ -444,7 +621,11 @@ mod tests {
         write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
         write_bed(input.path(), "b.bed", "chr1\t150\t250\n");
         write_bed(input.path(), "c.bed", "chr1\t350\t500\n");
-        add_to_database(&AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf())).unwrap();
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
 
         // 4 query files
         let query_dir = TempDir::new().unwrap();
@@ -460,7 +641,8 @@ mod tests {
 
         // batch_size=1 forces one file per batch
         let batched = {
-            let mut config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
+            let mut config =
+                QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
             config.batch_size = Some(1);
             query_database(&config).unwrap()
         };
@@ -492,12 +674,11 @@ mod tests {
         add_to_database(&AddConfig::new(
             input.path().to_path_buf(),
             db_unbatched.path().to_path_buf(),
-        )).unwrap();
+        ))
+        .unwrap();
 
-        let mut batched_config = AddConfig::new(
-            input.path().to_path_buf(),
-            db_batched.path().to_path_buf(),
-        );
+        let mut batched_config =
+            AddConfig::new(input.path().to_path_buf(), db_batched.path().to_path_buf());
         batched_config.batch_size = Some(1);
         add_to_database(&batched_config).unwrap();
 
@@ -507,12 +688,14 @@ mod tests {
         let result_u = query_database(&QueryConfig::new(
             db_unbatched.path().to_path_buf(),
             query_dir.path().join("q.bed"),
-        )).unwrap();
+        ))
+        .unwrap();
 
         let result_b = query_database(&QueryConfig::new(
             db_batched.path().to_path_buf(),
             query_dir.path().join("q.bed"),
-        )).unwrap();
+        ))
+        .unwrap();
 
         assert_eq!(result_u.counts.rows(), result_b.counts.rows());
         for r in 0..result_u.counts.rows() {
