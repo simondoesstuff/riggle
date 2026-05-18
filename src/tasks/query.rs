@@ -9,8 +9,7 @@ use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
 use crate::fourier::{
-    ChromDbSpec, DEFAULT_EPSILON, DepthMap, bed_map_v, build_db_spectra, compute_m,
-    compute_pvalue_cached, parse_bed_as_map,
+    ChromDbSpec, DepthMap, build_db_spectra, compute_pvalue_cached, parse_bed_as_map,
 };
 use crate::io::{
     BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file,
@@ -305,16 +304,15 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 ///
 /// Three-phase strategy that eliminates all redundant forward FFTs:
 ///
-/// Phase A: Load all needed DB DepthMaps once in parallel to obtain V_db values.
+/// Phase A: Load all needed DB DepthMaps once in parallel.
 ///
-/// Phase B: For each query, determine the maximum V_db it will face, then build
-/// its coverage spectra once at that M_max.  All subsequent comparisons for that
-/// query reuse the cached spectra — forward FFT runs exactly once per (file,
-/// chromosome) rather than once per (file, chromosome, DB partner).
+/// Phase B: Build each query's full coverage spectra once.  All subsequent
+/// comparisons for that query reuse the cached spectra — the O(N log N)
+/// forward FFT runs exactly once per (file, chromosome).
 ///
-/// Phase C: For each DB file, build DB spectra once, then cross-correlate with
-/// every query spectrum that overlaps it.  The inner loop is purely O(M) complex
-/// multiplications — no FFT.
+/// Phase C: For each DB file, build DB spectra once, then for every paired
+/// query compute μ, σ², and the observed overlap via an O(N/2) Parseval dot
+/// product, and convert to a Gaussian p-value — no IFFT required.
 ///
 /// Pairs for which a depthmap is missing (DB built before this feature) are
 /// silently skipped.
@@ -347,30 +345,14 @@ fn compute_fourier_pvalues(
         })
         .collect();
 
-    // Compute the maximum V_db each query will be compared against.
-    let mut q_max_vdb: HashMap<usize, f64> = HashMap::new();
-    for (&d_sid, q_sids) in &by_db {
-        let v_db = db_depthmaps.get(&d_sid).map_or(0.0, |dm| dm.total_v());
-        for &q_sid in q_sids {
-            q_max_vdb
-                .entry(q_sid)
-                .and_modify(|v| *v = f64::max(*v, v_db))
-                .or_insert(v_db);
-        }
-    }
-
-    // Phase B: build query spectra once per query file.
-    let query_spectra: HashMap<usize, (Vec<ChromDbSpec>, f64)> = needed_q_sids
+    // Phase B: build full query coverage spectra once per query file.
+    let query_spectra: HashMap<usize, Vec<ChromDbSpec>> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
             let path = query_file_paths.get(q_sid)?;
             let bed = parse_bed_as_map(path).ok()?;
-            let v_q = bed_map_v(&bed);
-            let max_v_db = q_max_vdb.get(&q_sid).copied().unwrap_or(1.0);
-            let m_q_max = compute_m(v_q, max_v_db, DEFAULT_EPSILON);
             let q_dm = DepthMap::build(&bed);
-            let spectra = build_db_spectra(&q_dm, m_q_max);
-            Some((q_sid, (spectra, v_q)))
+            Some((q_sid, build_db_spectra(&q_dm)))
         })
         .collect();
 
@@ -382,23 +364,15 @@ fn compute_fourier_pvalues(
                 Some(d) => d,
                 None => return Vec::new(),
             };
-            let v_db = dm.total_v();
 
-            let v_q_max = q_sids
-                .iter()
-                .filter_map(|q| query_spectra.get(q).map(|(_, v)| *v))
-                .fold(0.0f64, f64::max);
-            let m_max = compute_m(v_q_max, v_db, DEFAULT_EPSILON);
-
-            let db_spectra = build_db_spectra(dm, m_max);
+            let db_spectra = build_db_spectra(dm);
 
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
-                    let (q_spec, v_q) = query_spectra.get(&q_sid)?;
-                    let m_pair = compute_m(*v_q, v_db, DEFAULT_EPSILON).min(m_max);
+                    let q_spec = query_spectra.get(&q_sid)?;
                     let (observed_bins, p_value) =
-                        compute_pvalue_cached(q_spec, &db_spectra, m_pair)?;
+                        compute_pvalue_cached(q_spec, &db_spectra)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,
