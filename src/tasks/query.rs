@@ -9,8 +9,8 @@ use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
 use crate::fourier::{
-    BedMap as FourierBedMap, ChromDbSpec, DEFAULT_EPSILON, DepthMap, bed_map_v, build_db_spectra,
-    compute_m, compute_pvalue_cached, parse_bed_as_map,
+    ChromDbSpec, DEFAULT_EPSILON, DepthMap, bed_map_v, build_db_spectra, compute_m,
+    compute_pvalue_cached, parse_bed_as_map,
 };
 use crate::io::{
     BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file,
@@ -279,14 +279,18 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 /// For every non-zero (q_sid, d_sid) pair in `counts`, compute the FFT-based
 /// right-tailed p-value.
 ///
-/// Two-phase caching strategy to amortise expensive spectrum construction:
+/// Three-phase strategy that eliminates all redundant forward FFTs:
 ///
-/// Phase A: For each unique DB SID, load its DepthMap once, then build coverage
-/// spectra at M_max (the maximum M needed by any query overlapping this DB file).
-/// Cost: O(K_db · M_max) per DB file, done once regardless of query count.
+/// Phase A: Load all needed DB DepthMaps once in parallel to obtain V_db values.
 ///
-/// Phase B: For each (query, DB) pair, build the query spectrum at M_pair ≤
-/// M_max and cross-correlate with the cached DB spectrum.
+/// Phase B: For each query, determine the maximum V_db it will face, then build
+/// its coverage spectra once at that M_max.  All subsequent comparisons for that
+/// query reuse the cached spectra — forward FFT runs exactly once per (file,
+/// chromosome) rather than once per (file, chromosome, DB partner).
+///
+/// Phase C: For each DB file, build DB spectra once, then cross-correlate with
+/// every query spectrum that overlaps it.  The inner loop is purely O(M) complex
+/// multiplications — no FFT.
 ///
 /// Pairs for which a depthmap is missing (DB built before this feature) are
 /// silently skipped.
@@ -308,47 +312,69 @@ fn compute_fourier_pvalues(
         return Vec::new();
     }
 
-    // Collect unique query SIDs and parse their BedMaps in parallel.
     let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
-    let query_bedmaps: HashMap<usize, (FourierBedMap, f64)> = needed_q_sids
+
+    // Phase A: load all needed DB DepthMaps once.
+    let db_depthmaps: HashMap<u32, DepthMap> = by_db
+        .par_iter()
+        .filter_map(|(&d_sid, _)| {
+            let dm_path = db_path.join("depthmap").join(format!("{d_sid}.bin"));
+            Some((d_sid, DepthMap::load(&dm_path).ok()?))
+        })
+        .collect();
+
+    // Compute the maximum V_db each query will be compared against.
+    let mut q_max_vdb: HashMap<usize, f64> = HashMap::new();
+    for (&d_sid, q_sids) in &by_db {
+        let v_db = db_depthmaps.get(&d_sid).map_or(0.0, |dm| dm.total_v());
+        for &q_sid in q_sids {
+            q_max_vdb
+                .entry(q_sid)
+                .and_modify(|v| *v = f64::max(*v, v_db))
+                .or_insert(v_db);
+        }
+    }
+
+    // Phase B: build query spectra once per query file.
+    let query_spectra: HashMap<usize, (Vec<ChromDbSpec>, f64)> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
             let path = query_file_paths.get(q_sid)?;
             let bed = parse_bed_as_map(path).ok()?;
-            let v = bed_map_v(&bed);
-            Some((q_sid, (bed, v)))
+            let v_q = bed_map_v(&bed);
+            let max_v_db = q_max_vdb.get(&q_sid).copied().unwrap_or(1.0);
+            let m_q_max = compute_m(v_q, max_v_db, DEFAULT_EPSILON);
+            let q_dm = DepthMap::build(&bed);
+            let spectra = build_db_spectra(&q_dm, m_q_max);
+            Some((q_sid, (spectra, v_q)))
         })
         .collect();
 
-    // For each DB file: load DepthMap, build cached spectra, compute p-values
-    // for all queries that overlap it.
+    // Phase C: for each DB file, build DB spectra once then cross-correlate.
     by_db
         .par_iter()
         .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
-            let dm_path = db_path.join("depthmap").join(format!("{d_sid}.bin"));
-            let dm = match DepthMap::load(&dm_path) {
-                Ok(d) => d,
-                Err(_) => return Vec::new(),
+            let dm = match db_depthmaps.get(&d_sid) {
+                Some(d) => d,
+                None => return Vec::new(),
             };
             let v_db = dm.total_v();
 
-            // M_max = largest M needed by any query overlapping this DB file.
             let v_q_max = q_sids
                 .iter()
-                .filter_map(|q| query_bedmaps.get(q).map(|(_, v)| *v))
+                .filter_map(|q| query_spectra.get(q).map(|(_, v)| *v))
                 .fold(0.0f64, f64::max);
             let m_max = compute_m(v_q_max, v_db, DEFAULT_EPSILON);
 
-            // Build DB spectra once at m_max.
-            let db_spectra: Vec<ChromDbSpec> = build_db_spectra(&dm, m_max);
+            let db_spectra = build_db_spectra(dm, m_max);
 
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
-                    let (query_bed, v_q) = query_bedmaps.get(&q_sid)?;
+                    let (q_spec, v_q) = query_spectra.get(&q_sid)?;
                     let m_pair = compute_m(*v_q, v_db, DEFAULT_EPSILON).min(m_max);
                     let (observed_bins, p_value) =
-                        compute_pvalue_cached(query_bed, &db_spectra, m_pair)?;
+                        compute_pvalue_cached(q_spec, &db_spectra, m_pair)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,

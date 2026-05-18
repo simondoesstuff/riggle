@@ -34,6 +34,7 @@
 //! (linearity of IFFT) and gives a single M-sample null distribution for
 //! the combined multi-chromosome overlap.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -42,6 +43,11 @@ use std::path::Path;
 use rayon::prelude::*;
 use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
+
+thread_local! {
+    static REAL_PLANNER: RefCell<RealFftPlanner<f32>> = RefCell::new(RealFftPlanner::new());
+    static COMPLEX_PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::new());
+}
 
 const BIN_SIZE: u32 = 100;
 
@@ -230,28 +236,31 @@ pub fn build_db_spectra(dm: &DepthMap, m: usize) -> Vec<ChromDbSpec> {
         .collect()
 }
 
-/// Compute the right-tailed p-value for the overlap between `query_bed` and
-/// a cached DB spectrum (produced by [`build_db_spectra`]).
+/// Compute the right-tailed p-value for a (query, DB) pair given pre-built
+/// spectra for both sides (produced by [`build_db_spectra`]).
 ///
 /// `m` is the number of null samples (IFFT length); must be a power of two.
 /// The per-chromosome spectra may have been built at a larger M — only the
 /// first `m` coefficients are used.
 ///
 /// ### Algorithm
-/// 1. For each shared chromosome, compute G_Q[k] via real FFT, then accumulate
-///    the cross-correlation into `C_total[k] += G_Q[k] · conj(G_B[k])`.
-/// 2. Single M-length complex IFFT of `C_total` → M samples `c[s]`.
-///    `c[s]` is proportional to the overlap between query and DB when the DB
-///    is circularly shifted by `s · N_chrom / M` bins on each chromosome.
+/// 1. For each chromosome present in both `q_spectra` and `db_spectra`,
+///    accumulate the cross-correlation: `C_total[k] += G_Q[k] · conj(G_B[k])`.
+///    This is a pure O(M) dot product — no FFTs happen here.
+/// 2. Single M-length complex IFFT of `C_total` (via the thread-local planner)
+///    → M samples `c[s]` of total overlap vs a circular shift of s·N/M bins.
 /// 3. Empirical p-value = fraction of the M samples with `c[s] ≥ c[0]`.
 ///    `c[0]` (shift = 0) corresponds to the actual observed overlap.
-/// 4. `observed_bins` is computed as the Parseval-normalised sum
-///    Σ_chrom Re(Σ_k G_Q[k]·conj(G_B[k])) / N_chrom, which approximates the
-///    overlap in 100 bp bins.
+/// 4. `observed_bins` is the Parseval-normalised sum
+///    Σ_chrom Re(Σ_k G_Q[k]·conj(G_B[k])) / N_chrom.
+///
+/// Both `q_spectra` and `db_spectra` are produced by [`build_db_spectra`].
+/// Call [`build_db_spectra`] once per file and reuse across multiple comparisons
+/// to amortise the O(N log N) forward FFT cost.
 ///
 /// Returns `(observed_bins, p_value)` or `None` if no chromosomes are shared.
 pub fn compute_pvalue_cached(
-    query_bed: &BedMap,
+    q_spectra: &[ChromDbSpec],
     db_spectra: &[ChromDbSpec],
     m: usize,
 ) -> Option<(f64, f64)> {
@@ -260,27 +269,20 @@ pub fn compute_pvalue_cached(
     let mut has_data = false;
 
     for db_cs in db_spectra {
-        let ivs = match query_bed.get(&db_cs.chrom) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
+        let q_spec = match q_spectra.iter().find(|s| s.chrom == db_cs.chrom) {
+            Some(s) => &s.spec,
+            None => continue,
         };
-        let (pos, neg) = build_spikes(ivs, db_cs.n_bins);
-        let q_cdm = ChromDepthMap {
-            chrom: db_cs.chrom.clone(),
-            n_bins: db_cs.n_bins,
-            pos_spikes: pos,
-            neg_spikes: neg,
-        };
-        let m_pair = m.min(db_cs.spec.len());
-        let q_spec = chrom_coverage_spectrum(&q_cdm, m_pair);
 
-        // Accumulate cross-correlation spectrum: C_total[k] += G_Q[k]·conj(G_B[k])
+        let m_pair = m.min(db_cs.spec.len()).min(q_spec.len());
+
+        // O(M) cross-correlation accumulation — no FFT.
         for k in 0..m_pair {
             c_total[k] += q_spec[k] * db_cs.spec[k].conj();
         }
 
         // Parseval-normalised observed overlap for this chromosome (in bins).
-        let dot: f32 = q_spec
+        let dot: f32 = q_spec[..m_pair]
             .iter()
             .zip(db_cs.spec[..m_pair].iter())
             .map(|(q, b)| (q * b.conj()).re)
@@ -294,31 +296,30 @@ pub fn compute_pvalue_cached(
         return None;
     }
 
-    // Single M-length complex IFFT of the combined cross-correlation.
+    // Single M-length complex IFFT via the thread-local planner (plan cache hit).
     // c_total[s].re is proportional to the total overlap at shift s across
-    // all shared chromosomes (unnormalized but consistent across shifts).
-    // c_total[0].re corresponds to shift = 0 (the actual observed overlap).
-    let mut planner = FftPlanner::<f32>::new();
-    let ifft = planner.plan_fft_inverse(m);
+    // all shared chromosomes. c_total[0].re is the actual observed overlap.
+    let ifft = COMPLEX_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(m));
     ifft.process(&mut c_total);
 
     let obs_ref = c_total[0].re;
-    // Empirical right-tail: fraction of the M shifts with overlap ≥ observed.
     let count_geq = c_total.iter().filter(|x| x.re >= obs_ref).count();
     let p_value = count_geq as f64 / m as f64;
 
     Some((observed, p_value))
 }
 
-/// Convenience: compute p-value directly from a DepthMap (builds spectra inline).
-/// Use [`build_db_spectra`] + [`compute_pvalue_cached`] when the DB file is
-/// queried by multiple query files (amortises spectrum construction).
+/// Convenience: compute p-value directly from two BedMaps (builds spectra inline).
+/// Use [`build_db_spectra`] + [`compute_pvalue_cached`] when either file is
+/// compared against multiple partners (amortises the O(N log N) forward FFT).
 pub fn compute_pvalue(query_bed: &BedMap, db_dm: &DepthMap, epsilon: f64) -> Option<(f64, f64)> {
     let v_q = bed_map_v(query_bed);
     let v_db = db_dm.total_v();
     let m = compute_m(v_q, v_db, epsilon);
     let db_spectra = build_db_spectra(db_dm, m);
-    compute_pvalue_cached(query_bed, &db_spectra, m)
+    let q_dm = DepthMap::build(query_bed);
+    let q_spectra = build_db_spectra(&q_dm, m);
+    compute_pvalue_cached(&q_spectra, &db_spectra, m)
 }
 
 /// Convert a `parse_bed_file` result into a [`BedMap`].
@@ -393,8 +394,7 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap, m: usize) -> Vec<Complex<f32>> {
     let n = cdm.n();
     let m_cap = m.min(n / 2 + 1);
 
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n);
+    let fft = REAL_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
     let mut indata = fft.make_input_vec(); // vec![0f32; n]
 
     // Build impulse train (derivative of coverage) in-place.
@@ -529,8 +529,10 @@ mod tests {
         let v_db = dm.total_v();
         let m = compute_m(v_q, v_db, DEFAULT_EPSILON);
         let db_spectra = build_db_spectra(&dm, m);
+        let q_dm = DepthMap::build(&bed);
+        let q_spectra = build_db_spectra(&q_dm, m);
 
-        let (obs_cached, pv_cached) = compute_pvalue_cached(&bed, &db_spectra, m).unwrap();
+        let (obs_cached, pv_cached) = compute_pvalue_cached(&q_spectra, &db_spectra, m).unwrap();
         let (obs_direct, pv_direct) = compute_pvalue(&bed, &dm, DEFAULT_EPSILON).unwrap();
 
         assert!((obs_cached - obs_direct).abs() < 1.0, "obs mismatch");
