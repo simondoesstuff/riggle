@@ -51,8 +51,8 @@ thread_local! {
 
 const BIN_SIZE: u32 = 100;
 
-/// Absolute error tolerance in 100 bp overlap bins.
-pub const DEFAULT_EPSILON: f64 = 1.0;
+/// Absolute error tolerance in p-values on 100 bp overlap bins.
+pub const DEFAULT_EPSILON: f64 = 1.0e1;
 
 /// Hard upper cap on the number of frequencies to retain (must be a power of two).
 /// ≈ 33 M — well above the typical genomic working range while bounding memory.

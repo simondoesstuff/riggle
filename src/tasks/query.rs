@@ -264,7 +264,29 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
     // ── Phase 2: Fourier p-values ────────────────────────────────────────────
     let pvalues = if config.stats {
-        compute_fourier_pvalues(&final_counts, &query_file_paths, &config.db_path)
+        let mut pvalues =
+            compute_fourier_pvalues(&final_counts, &query_file_paths, &config.db_path);
+        // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
+        // under any null).  Emit them explicitly so callers get a complete
+        // result set without having to infer absences.
+        for q_sid in 0..num_queries {
+            let row = final_counts.outer_view(q_sid);
+            // Collect d_sids that already have a computed p-value entry.
+            let nonzero: HashSet<usize> = row
+                .map(|rv| rv.iter().map(|(d, _)| d).collect())
+                .unwrap_or_default();
+            for d_sid in 0..num_sources {
+                if !nonzero.contains(&d_sid) {
+                    pvalues.push(PValueResult {
+                        query_id: q_sid,
+                        db_sid: d_sid as u32,
+                        observed_bins: 0.0,
+                        p_value: 1.0,
+                    });
+                }
+            }
+        }
+        pvalues
     } else {
         Vec::new()
     };
@@ -757,5 +779,42 @@ mod tests {
         let sparse = condense_to_sparse_no_mask(&folded, 2, 3);
         assert_eq!(sparse.get(0, 0), Some(&15)); // 1+2+3+4+5
         assert_eq!(sparse.get(1, 0), None);
+    }
+
+    /// Zero-overlap (query, DB) pairs must appear in pvalues with p_value=1.0
+    /// when stats=true, so callers always receive a complete result set.
+    #[test]
+    fn test_stats_zero_overlap_pairs_have_pvalue_one() {
+        let input = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        // Two DB sources on non-overlapping regions.
+        write_bed(input.path(), "a.bed", "chr1\t100\t200\n");
+        write_bed(input.path(), "b.bed", "chr1\t500\t600\n");
+        add_to_database(&AddConfig::new(
+            input.path().to_path_buf(),
+            db.path().to_path_buf(),
+        ))
+        .unwrap();
+
+        // Query only overlaps "a", not "b".
+        let query_dir = TempDir::new().unwrap();
+        write_bed(query_dir.path(), "q.bed", "chr1\t100\t200\n");
+
+        let mut config =
+            QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
+        config.stats = true;
+        let result = query_database(&config).unwrap();
+
+        // Must have exactly num_queries × num_sources = 1 × 2 = 2 p-value entries.
+        assert_eq!(result.pvalues.len(), 2);
+
+        // The zero-overlap pair must carry p_value=1.0.
+        let zero_pair = result
+            .pvalues
+            .iter()
+            .find(|pv| pv.observed_bins == 0.0)
+            .expect("zero-overlap entry missing");
+        assert_eq!(zero_pair.p_value, 1.0);
     }
 }
