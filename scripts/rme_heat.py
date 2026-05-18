@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import sys
 from collections.abc import Callable, Iterator, Sequence
@@ -150,6 +152,58 @@ def parse_score_file(score_path: Pathish) -> tuple[list[str], list[float]]:
         return [], []
     keys, values = zip(*parsed_tuples)
     return list(keys), list(values)
+
+
+def parse_json_file(
+    json_path: Pathish, score_field: str = "p_value"
+) -> tuple[list[str], list[float]]:
+    with open(json_path) as f:
+        data = json.load(f)
+
+    # Accept a bare list or find the first list value in an object
+    records: list[dict] = (
+        data
+        if isinstance(data, list)
+        else next(v for v in data.values() if isinstance(v, list))
+    )
+
+    # Find the file-path-like field with the most unique values (skip score_field)
+    first = records[0]
+    path_fields = [
+        k
+        for k, v in first.items()
+        if isinstance(v, str) and ("." in v or "/" in v) and k != score_field
+    ]
+    name_field = max(path_fields, key=lambda k: len({r[k] for r in records}))
+
+    def _strip_extensions(filename: str) -> str:
+        for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
+            if filename.endswith(ext):
+                return filename[: -len(ext)]
+        return filename.split(".")[0]
+
+    pairs = [
+        (_strip_extensions(Path(r[name_field]).name), float(r[score_field]))
+        for r in records
+    ]
+
+    # p_value-like fields: log
+    if "p_val" in score_field.lower() or "pval" in score_field.lower():
+        pairs = [(a, -math.log(b) if b > 0 else float("inf")) for a, b in pairs]
+
+    pairs.sort(key=lambda x: -x[1])
+    if not pairs:
+        return [], []
+    keys, values = zip(*pairs)
+    return list(keys), list(values)
+
+
+def parse_input_file(
+    path: Pathish, score_field: str = "p_value"
+) -> tuple[list[str], list[float]]:
+    if str(path).endswith(".json"):
+        return parse_json_file(path, score_field)
+    return parse_score_file(path)
 
 
 # ==========================================
@@ -302,12 +356,13 @@ def _prepare_plot_data(
     score_paths: tuple[Pathish, ...],
     names: tuple[str, ...],
     states: list[str] | None = None,
+    score_field: str = "p_value",
 ) -> list[_PlotData]:
     col_labels = states if states is not None else chromatin_states
     result: list[_PlotData] = []
 
     for path, name in zip(score_paths, names):
-        beds, scores = parse_score_file(path)
+        beds, scores = parse_input_file(path, score_field)
         cell_types: set[str] = set()
         parsed_data: dict[tuple[str, str], float] = {}
 
@@ -352,11 +407,14 @@ def plot_rme_similarity(
     output_path: Pathish | None = None,
     show: bool = True,
     states: list[str] | None = None,
+    score_field: str = "p_value",
 ) -> None:
     if len(score_paths) != len(names):
         raise ValueError("Must provide the same number of score paths and names.")
 
-    plot_data_list = _prepare_plot_data(score_paths, names, states=states)
+    plot_data_list = _prepare_plot_data(
+        score_paths, names, states=states, score_field=score_field
+    )
     if not plot_data_list:
         print("No valid data to plot.", file=sys.stderr)
         return
@@ -422,6 +480,14 @@ def main() -> None:
         metavar="STATE",
         help=f"Chromatin states to include (default: all). Choices: {', '.join(chromatin_states)}",
     )
+    parser.add_argument(
+        "--score-field",
+        default="p_value",
+        help=(
+            "Field name to use as the score when parsing JSON inputs (default: p_value). "
+            "Fields containing 'p_val' are automatically negated so lower p-value → higher score."
+        ),
+    )
     args = parser.parse_args()
 
     if len(args.scores) != len(args.names):
@@ -434,6 +500,7 @@ def main() -> None:
         output_path=args.output,
         show=not args.no_show,
         states=args.states,
+        score_field=args.score_field,
     )
 
 
