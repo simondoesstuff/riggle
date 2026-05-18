@@ -8,9 +8,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{
-    ChromDbSpec, DepthMap, build_db_spectra, compute_pvalue_cached, parse_bed_as_map,
-};
+use crate::fourier::{DEFAULT_VARIANCE_THRESHOLD, DepthMap, build_db_spectra, compute_pvalue_cached, parse_bed_as_map};
 use crate::io::{
     BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file,
     parse_bed_file,
@@ -55,6 +53,10 @@ pub struct QueryConfig {
     /// the database was built with `add_to_database` (which caches Fourier
     /// spectra under `{db}/fourier/`).
     pub stats: bool,
+    /// Fraction of cross-correlation power to retain before the IFFT.
+    /// 1.0 = full spectrum (fast path, no scan); lower values act as a
+    /// smoothing regulariser.  See [`DEFAULT_VARIANCE_THRESHOLD`].
+    pub variance_threshold: f64,
 }
 
 impl QueryConfig {
@@ -65,6 +67,7 @@ impl QueryConfig {
             num_threads: None,
             batch_size: None,
             stats: false,
+            variance_threshold: DEFAULT_VARIANCE_THRESHOLD,
         }
     }
 }
@@ -263,8 +266,12 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
     // ── Phase 2: Fourier p-values ────────────────────────────────────────────
     let pvalues = if config.stats {
-        let mut pvalues =
-            compute_fourier_pvalues(&final_counts, &query_file_paths, &config.db_path);
+        let mut pvalues = compute_fourier_pvalues(
+            &final_counts,
+            &query_file_paths,
+            &config.db_path,
+            config.variance_threshold,
+        );
         // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
         // under any null).  Emit them explicitly so callers get a complete
         // result set without having to infer absences.
@@ -304,15 +311,16 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 ///
 /// Three-phase strategy that eliminates all redundant forward FFTs:
 ///
-/// Phase A: Load all needed DB DepthMaps once in parallel.
+/// Phase A: Load all needed DB DepthMaps once in parallel to obtain V_db values.
 ///
-/// Phase B: Build each query's full coverage spectra once.  All subsequent
-/// comparisons for that query reuse the cached spectra — the O(N log N)
-/// forward FFT runs exactly once per (file, chromosome).
+/// Phase B: For each query, determine the maximum V_db it will face, then build
+/// its coverage spectra once at that M_max.  All subsequent comparisons for that
+/// query reuse the cached spectra — forward FFT runs exactly once per (file,
+/// chromosome) rather than once per (file, chromosome, DB partner).
 ///
-/// Phase C: For each DB file, build DB spectra once, then for every paired
-/// query compute μ, σ², and the observed overlap via an O(N/2) Parseval dot
-/// product, and convert to a Gaussian p-value — no IFFT required.
+/// Phase C: For each DB file, build DB spectra once, then cross-correlate with
+/// every query spectrum that overlaps it.  The inner loop is purely O(M) complex
+/// multiplications — no FFT.
 ///
 /// Pairs for which a depthmap is missing (DB built before this feature) are
 /// silently skipped.
@@ -320,6 +328,7 @@ fn compute_fourier_pvalues(
     counts: &SparseMatrix,
     query_file_paths: &[PathBuf],
     db_path: &Path,
+    variance_threshold: f64,
 ) -> Vec<PValueResult> {
     // Collect non-zero (q_sid, d_sid) pairs, grouped by d_sid.
     let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -345,8 +354,8 @@ fn compute_fourier_pvalues(
         })
         .collect();
 
-    // Phase B: build full query coverage spectra once per query file.
-    let query_spectra: HashMap<usize, Vec<ChromDbSpec>> = needed_q_sids
+    // Phase B: build query spectra once per query file.
+    let query_spectra: HashMap<usize, _> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
             let path = query_file_paths.get(q_sid)?;
@@ -372,7 +381,7 @@ fn compute_fourier_pvalues(
                 .filter_map(|&q_sid| {
                     let q_spec = query_spectra.get(&q_sid)?;
                     let (observed_bins, p_value) =
-                        compute_pvalue_cached(q_spec, &db_spectra)?;
+                        compute_pvalue_cached(q_spec, &db_spectra, variance_threshold)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,

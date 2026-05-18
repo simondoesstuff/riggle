@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 use riggle::io::Meta;
 use riggle::stats::{StatResult, StatsOutput};
+use riggle::fourier::DEFAULT_VARIANCE_THRESHOLD;
 use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
@@ -54,6 +55,12 @@ enum Commands {
         /// Maximum number of query files to hold in memory at once (default: all)
         #[arg(long)]
         batch_size: Option<usize>,
+
+        /// Fraction of cross-correlation power to retain before the IFFT (0 < v ≤ 1).
+        /// 1.0 uses the full spectrum; lower values (e.g. 0.90) act as a smoothing
+        /// regulariser that can sharpen biological signal.
+        #[arg(long, default_value_t = DEFAULT_VARIANCE_THRESHOLD)]
+        variance_threshold: f64,
     },
 
     /// Print database summary (shards, sources, layers)
@@ -69,8 +76,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
-        Commands::Query { db, query, output, stats, batch_size } => {
-            run_query(db, query, output, stats, batch_size)
+        Commands::Query { db, query, output, stats, batch_size, variance_threshold } => {
+            run_query(db, query, output, stats, batch_size, variance_threshold)
         }
         Commands::Info { db } => run_info(db),
     };
@@ -98,10 +105,12 @@ fn run_query(
     output: PathBuf,
     stats: bool,
     batch_size: Option<usize>,
+    variance_threshold: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = QueryConfig::new(db, query);
     config.batch_size = batch_size;
     config.stats = stats;
+    config.variance_threshold = variance_threshold;
     let result = query_database(&config)?;
 
     let db_sources = &result.db_sources;
