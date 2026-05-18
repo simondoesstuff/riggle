@@ -9,7 +9,7 @@ use voracious_radix_sort::RadixSort;
 use crate::core::Interval;
 use crate::fourier::{DepthMap, intervals_to_bed_map};
 use crate::io::{
-    BedParseError, LayerConfig, LayerError, Meta, MetaError, SidEntry,
+    BedParseError, DepthStoreBuilder, LayerConfig, LayerError, Meta, MetaError, SidEntry,
     build_jump_table, extend_jump_table, extend_layer, is_bed_file,
     parse_bed_file, write_jump_table, write_layer,
 };
@@ -127,15 +127,13 @@ fn process_file_batch(
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
 
-    // Ensure reserved directories exist before the parallel section.
-    let depthmap_dir = db_path.join("depthmap");
-    fs::create_dir_all(&depthmap_dir)?;
+    // Ensure the shards directory exists before the parallel section.
     let shards_dir = db_path.join("shards");
     fs::create_dir_all(&shards_dir)?;
 
-    // Parse all files in parallel and save per-file Fourier spectra.
+    // Parse all files in parallel, building depth maps in-memory.
     // Each file is assigned a unique D_SID starting from `next_sid`.
-    let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>), AddError>> =
+    let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>, DepthMap), AddError>> =
         batch
             .par_iter()
             .enumerate()
@@ -146,22 +144,26 @@ fn process_file_batch(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| format!("file_{}", sid));
                 let shards = parse_bed_file(path, sid)?;
-
-                // Build and persist the sparse depth map for this file.
                 let bed_map = intervals_to_bed_map(&shards);
                 let dm = DepthMap::build(&bed_map);
-                dm.save(&depthmap_dir.join(format!("{sid}.bin")))?;
-
-                Ok((sid, name, shards))
+                Ok((sid, name, shards, dm))
             })
             .collect();
 
-    // Partition all intervals into (shard, layer_idx) buckets.
+    // Partition all intervals into (shard, layer_idx) buckets and collect
+    // depth maps for the consolidated store.
     let mut buckets: HashMap<(String, usize), Vec<Interval>> = HashMap::new();
     let mut new_sids: Vec<(u32, String)> = Vec::new();
+    let store_path = db_path.join("depthmap.rkyv");
+    let mut store = if store_path.exists() {
+        DepthStoreBuilder::load(&store_path)?
+    } else {
+        DepthStoreBuilder::new()
+    };
 
     for result in parse_results {
-        let (sid, name, shard_map) = result?;
+        let (sid, name, shard_map, dm) = result?;
+        store.insert(sid, &dm);
         new_sids.push((sid, name));
         for (shard, intervals) in shard_map {
             for iv in intervals {
@@ -220,6 +222,9 @@ fn process_file_batch(
     if let Some(err) = write_errors.into_iter().next() {
         return Err(err);
     }
+
+    // Persist the consolidated depth-map store.
+    store.save(&store_path)?;
 
     // Update meta: add new SID entries, shards, num_layers.
     let mut max_layer_used = meta.num_layers.saturating_sub(1);

@@ -21,6 +21,8 @@ wide = "0.7.33"
 flate2 = "1.1.9"
 rustfft = "6.2"
 realfft = "3"
+rkyv = "0.8"
+rend = "0.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

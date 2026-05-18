@@ -37,8 +37,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Read, Write};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -138,54 +136,6 @@ impl DepthMap {
             })
             .collect();
         DepthMap { chroms }
-    }
-
-    /// Save to `DMAP\x01\x00` binary format.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"DMAP\x01\x00");
-        buf.extend_from_slice(&(self.chroms.len() as u32).to_le_bytes());
-        for cdm in &self.chroms {
-            let name = cdm.chrom.as_bytes();
-            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name);
-            buf.extend_from_slice(&(cdm.n_bins as u64).to_le_bytes());
-            write_u32_slice(&mut buf, &cdm.pos_spikes);
-            write_u32_slice(&mut buf, &cdm.neg_spikes);
-        }
-        fs::File::create(path)?.write_all(&buf)
-    }
-
-    /// Load from a binary file produced by [`DepthMap::save`].
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let mut buf = Vec::new();
-        fs::File::open(path)?.read_to_end(&mut buf)?;
-        let mut pos = 0;
-        if buf.get(pos..pos + 6) != Some(b"DMAP\x01\x00") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid DMAP magic",
-            ));
-        }
-        pos += 6;
-        let nc = read_u32(&buf, &mut pos) as usize;
-        let mut chroms = Vec::with_capacity(nc);
-        for _ in 0..nc {
-            let nlen = read_u32(&buf, &mut pos) as usize;
-            let chrom = String::from_utf8(buf[pos..pos + nlen].to_vec())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            pos += nlen;
-            let n_bins = read_u64(&buf, &mut pos) as usize;
-            let pos_spikes = read_u32_slice(&buf, &mut pos);
-            let neg_spikes = read_u32_slice(&buf, &mut pos);
-            chroms.push(ChromDepthMap {
-                chrom,
-                n_bins,
-                pos_spikes,
-                neg_spikes,
-            });
-        }
-        Ok(DepthMap { chroms })
     }
 
     /// Total V across all chromosomes.
@@ -420,69 +370,16 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap) -> Vec<Complex<f32>> {
     spectrum
 }
 
-// ── Binary I/O helpers ────────────────────────────────────────────────────────
-
-fn write_u32_slice(buf: &mut Vec<u8>, v: &[u32]) {
-    buf.extend_from_slice(&(v.len() as u64).to_le_bytes());
-    for &x in v {
-        buf.extend_from_slice(&x.to_le_bytes());
-    }
-}
-
-fn read_u32(buf: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
-    v
-}
-
-fn read_u64(buf: &[u8], pos: &mut usize) -> u64 {
-    let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
-    *pos += 8;
-    v
-}
-
-fn read_u32_slice(buf: &[u8], pos: &mut usize) -> Vec<u32> {
-    let len = read_u64(buf, pos) as usize;
-    let mut v = Vec::with_capacity(len);
-    for _ in 0..len {
-        v.push(read_u32(buf, pos));
-    }
-    v
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     fn small_bed() -> BedMap {
         let mut m = BedMap::new();
         m.insert("chr22".to_string(), vec![(10_000_000, 10_001_000)]);
         m
-    }
-
-    #[test]
-    fn test_depth_map_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.bin");
-
-        let bed = small_bed();
-        let dm = DepthMap::build(&bed);
-        assert_eq!(dm.chroms.len(), 1);
-        assert_eq!(dm.chroms[0].chrom, "chr22");
-
-        dm.save(&path).unwrap();
-        let loaded = DepthMap::load(&path).unwrap();
-
-        assert_eq!(loaded.chroms.len(), 1);
-        let orig = &dm.chroms[0];
-        let back = &loaded.chroms[0];
-        assert_eq!(back.chrom, orig.chrom);
-        assert_eq!(back.n_bins, orig.n_bins);
-        assert_eq!(back.pos_spikes, orig.pos_spikes);
-        assert_eq!(back.neg_spikes, orig.neg_spikes);
     }
 
     #[test]
