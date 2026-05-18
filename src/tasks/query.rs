@@ -10,8 +10,8 @@ use voracious_radix_sort::RadixSort;
 use crate::core::Interval;
 use crate::fourier::{DEFAULT_VARIANCE_THRESHOLD, DepthMap, build_db_spectra, compute_pvalue_cached, parse_bed_as_map};
 use crate::io::{
-    BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, is_bed_file,
-    parse_bed_file,
+    BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, Meta, MetaError,
+    is_bed_file, parse_bed_file,
 };
 use crate::matrix::{DenseMatrix, SparseMatrix};
 use crate::sweep::query_sweep;
@@ -345,13 +345,16 @@ fn compute_fourier_pvalues(
 
     let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
 
-    // Phase A: load all needed DB DepthMaps once.
+    // Phase A: open the consolidated depth-map store once, then extract the
+    // needed DepthMaps in parallel.
+    let store_path = db_path.join("depthmap.rkyv");
+    let store = match MappedDepthStore::open(&store_path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
     let db_depthmaps: HashMap<u32, DepthMap> = by_db
         .par_iter()
-        .filter_map(|(&d_sid, _)| {
-            let dm_path = db_path.join("depthmap").join(format!("{d_sid}.bin"));
-            Some((d_sid, DepthMap::load(&dm_path).ok()?))
-        })
+        .filter_map(|(&d_sid, _)| Some((d_sid, store.get(d_sid)?)))
         .collect();
 
     // Phase B: build query spectra once per query file.
