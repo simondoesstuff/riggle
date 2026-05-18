@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -105,43 +104,60 @@ fn run_query(
     config.stats = stats;
     let result = query_database(&config)?;
 
-    // Build a fast lookup from (q_sid, d_sid) → (observed_bins, p_value).
-    let pvalue_map: HashMap<(usize, u32), (f64, f64)> = result
-        .pvalues
-        .iter()
-        .map(|pv| ((pv.query_id, pv.db_sid), (pv.observed_bins, pv.p_value)))
-        .collect();
-
-    // Flatten the sparse overlap matrix into StatResult records.
     let db_sources = &result.db_sources;
     let query_names = &result.query_names;
-    let mut stat_results: Vec<StatResult> = result
-        .counts
-        .outer_iterator()
-        .enumerate()
-        .flat_map(|(q_sid, row)| {
-            let q_name = query_names.get(q_sid).cloned().unwrap_or_default();
-            row.iter()
-                .map(|(d_sid, &overlap_count)| {
-                    let db_name = db_sources
-                        .get(&(d_sid as u32))
-                        .cloned()
-                        .unwrap_or_default();
-                    let (observed_bins, p_value) = pvalue_map
-                        .get(&(q_sid, d_sid as u32))
-                        .map(|&(o, p)| (Some(o), Some(p)))
-                        .unwrap_or((None, None));
-                    StatResult {
-                        query_name: q_name.clone(),
-                        db_name,
-                        overlap_count,
-                        observed_bins,
-                        p_value,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+
+    // When stats are enabled, pvalues covers every (q_sid, d_sid) pair
+    // (non-zero overlaps with computed p-values, plus zero-overlap pairs with
+    // p_value=1.0).  Drive the output from that complete list so no pair is
+    // silently absent.  Without stats, fall back to the sparse matrix which
+    // only records non-zero overlaps.
+    let mut stat_results: Vec<StatResult> = if stats {
+        result
+            .pvalues
+            .iter()
+            .map(|pv| {
+                let q_name = query_names.get(pv.query_id).cloned().unwrap_or_default();
+                let db_name = db_sources.get(&pv.db_sid).cloned().unwrap_or_default();
+                let overlap_count = result
+                    .counts
+                    .get(pv.query_id, pv.db_sid as usize)
+                    .copied()
+                    .unwrap_or(0);
+                StatResult {
+                    query_name: q_name,
+                    db_name,
+                    overlap_count,
+                    observed_bins: Some(pv.observed_bins),
+                    p_value: Some(pv.p_value),
+                }
+            })
+            .collect()
+    } else {
+        result
+            .counts
+            .outer_iterator()
+            .enumerate()
+            .flat_map(|(q_sid, row)| {
+                let q_name = query_names.get(q_sid).cloned().unwrap_or_default();
+                row.iter()
+                    .map(|(d_sid, &overlap_count)| {
+                        let db_name = db_sources
+                            .get(&(d_sid as u32))
+                            .cloned()
+                            .unwrap_or_default();
+                        StatResult {
+                            query_name: q_name.clone(),
+                            db_name,
+                            overlap_count,
+                            observed_bins: None,
+                            p_value: None,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
 
     // Sort by p-value when available, otherwise by descending overlap count.
     stat_results.sort_by(|a, b| match (a.p_value, b.p_value) {
