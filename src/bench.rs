@@ -229,7 +229,7 @@ pub fn analyze_index_size(
     let mut layer_map: std::collections::HashMap<u8, (u64, usize)> =
         std::collections::HashMap::new();
 
-    if let Ok(shards) = fs::read_dir(db_path) {
+    if let Ok(shards) = fs::read_dir(db_path.join("shards")) {
         for entry in shards.filter_map(|e| e.ok()) {
             let shard_path = entry.path();
             if !shard_path.is_dir() {

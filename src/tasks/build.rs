@@ -127,9 +127,11 @@ fn process_file_batch(
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
 
-    // Ensure the depthmap directory exists before the parallel section.
+    // Ensure reserved directories exist before the parallel section.
     let depthmap_dir = db_path.join("depthmap");
     fs::create_dir_all(&depthmap_dir)?;
+    let shards_dir = db_path.join("shards");
+    fs::create_dir_all(&shards_dir)?;
 
     // Parse all files in parallel and save per-file Fourier spectra.
     // Each file is assigned a unique D_SID starting from `next_sid`.
@@ -185,7 +187,7 @@ fn process_file_batch(
             if sorted_ivs.is_empty() {
                 return None;
             }
-            let shard_dir = db_path.join(shard);
+            let shard_dir = shards_dir.join(shard);
             if let Err(e) = fs::create_dir_all(&shard_dir) {
                 return Some(AddError::Io(e));
             }
@@ -313,9 +315,8 @@ mod tests {
         ))
         .unwrap();
 
-        let meta = Meta::load(db.path()).unwrap();
         // All these intervals have size 100, which falls in layer 0 (size < 128)
-        let layer_path = db.path().join("chr1").join("layer_0.bin");
+        let layer_path = db.path().join("shards").join("chr1").join("layer_0.bin");
         assert!(layer_path.exists());
         let mapped = MappedLayer::open(&layer_path).unwrap();
         let ivs = mapped.intervals();
@@ -343,7 +344,7 @@ mod tests {
 
         let meta = Meta::load(db.path()).unwrap();
         assert_eq!(meta.shards.len(), 2);
-        assert!(db.path().join("chr1").exists());
-        assert!(db.path().join("chr2").exists());
+        assert!(db.path().join("shards").join("chr1").exists());
+        assert!(db.path().join("shards").join("chr2").exists());
     }
 }
