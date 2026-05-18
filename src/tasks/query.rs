@@ -193,6 +193,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             for layer_idx in 0..meta.num_layers {
                 let layer_path = config
                     .db_path
+                    .join("shards")
                     .join(&shard)
                     .join(format!("layer_{}.bin", layer_idx));
 
@@ -209,6 +210,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 let tile_size = meta.layer_config.tile_size(layer_idx);
                 let idx_path = config
                     .db_path
+                    .join("shards")
                     .join(&shard)
                     .join(format!("layer_{}.idx", layer_idx));
                 let jump_table = MappedJumpTable::open(&idx_path, tile_size)?;
