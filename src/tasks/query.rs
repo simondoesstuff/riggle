@@ -8,7 +8,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{DEFAULT_VARIANCE_THRESHOLD, DepthMap, build_db_spectra, compute_pvalue_cached, parse_bed_as_map};
+use crate::fourier::{DEFAULT_VARIANCE_THRESHOLD, DepthMap, FilterMask, FilterMode, build_db_spectra_with_filter, compute_pvalue_cached, parse_bed_as_map};
 use crate::io::{
     BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, Meta, MetaError,
     is_bed_file, parse_bed_file,
@@ -57,6 +57,16 @@ pub struct QueryConfig {
     /// 1.0 = full spectrum (fast path, no scan); lower values act as a
     /// smoothing regulariser.  See [`DEFAULT_VARIANCE_THRESHOLD`].
     pub variance_threshold: f64,
+    /// Optional positional filter: a BED file paired with a [`FilterMode`].
+    ///
+    /// - `Whitelist`: only 100 bp tiles covered by the BED contribute; chromosomes
+    ///   absent from the BED are excluded entirely.
+    /// - `Blacklist`: tiles covered by the BED are zeroed out; all other tiles
+    ///   remain accessible.
+    ///
+    /// Exactly one of whitelist / blacklist may be set (they are mutually exclusive).
+    /// Has no effect unless `stats` is `true`.
+    pub filter: Option<(std::path::PathBuf, FilterMode)>,
 }
 
 impl QueryConfig {
@@ -68,6 +78,7 @@ impl QueryConfig {
             batch_size: None,
             stats: false,
             variance_threshold: DEFAULT_VARIANCE_THRESHOLD,
+            filter: None,
         }
     }
 }
@@ -266,11 +277,15 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
     // ── Phase 2: Fourier p-values ────────────────────────────────────────────
     let pvalues = if config.stats {
+        let filter = config.filter.as_ref().and_then(|(p, mode)| {
+            parse_bed_as_map(p).ok().map(|bed| FilterMask::build(&bed, *mode))
+        });
         let mut pvalues = compute_fourier_pvalues(
             &final_counts,
             &query_file_paths,
             &config.db_path,
             config.variance_threshold,
+            filter.as_ref(),
         );
         // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
         // under any null).  Emit them explicitly so callers get a complete
@@ -329,6 +344,7 @@ fn compute_fourier_pvalues(
     query_file_paths: &[PathBuf],
     db_path: &Path,
     variance_threshold: f64,
+    filter: Option<&FilterMask>,
 ) -> Vec<PValueResult> {
     // Collect non-zero (q_sid, d_sid) pairs, grouped by d_sid.
     let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -364,7 +380,7 @@ fn compute_fourier_pvalues(
             let path = query_file_paths.get(q_sid)?;
             let bed = parse_bed_as_map(path).ok()?;
             let q_dm = DepthMap::build(&bed);
-            Some((q_sid, build_db_spectra(&q_dm)))
+            Some((q_sid, build_db_spectra_with_filter(&q_dm, filter)))
         })
         .collect();
 
@@ -377,7 +393,7 @@ fn compute_fourier_pvalues(
                 None => return Vec::new(),
             };
 
-            let db_spectra = build_db_spectra(dm);
+            let db_spectra = build_db_spectra_with_filter(dm, filter);
 
             q_sids
                 .iter()
