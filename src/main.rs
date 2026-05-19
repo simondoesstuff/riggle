@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use riggle::io::Meta;
 use riggle::stats::{StatResult, StatsOutput};
 use riggle::fourier::DEFAULT_VARIANCE_THRESHOLD;
+use riggle::fourier::FilterMode;
 use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
@@ -61,6 +62,18 @@ enum Commands {
         /// regulariser that can sharpen biological signal.
         #[arg(long, default_value_t = DEFAULT_VARIANCE_THRESHOLD)]
         variance_threshold: f64,
+
+        /// Whitelist BED: only tiles covered by this file contribute to the p-value
+        /// calculation; chromosomes absent from the file are excluded entirely.
+        /// Mutually exclusive with --blacklist.  Only meaningful with --stats.
+        #[arg(long, conflicts_with = "blacklist")]
+        whitelist: Option<PathBuf>,
+
+        /// Blacklist BED: tiles covered by this file are excluded from the p-value
+        /// calculation; all other tiles remain accessible.
+        /// Mutually exclusive with --whitelist.  Only meaningful with --stats.
+        #[arg(long, conflicts_with = "whitelist")]
+        blacklist: Option<PathBuf>,
     },
 
     /// Print database summary (shards, sources, layers)
@@ -76,8 +89,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
-        Commands::Query { db, query, output, stats, batch_size, variance_threshold } => {
-            run_query(db, query, output, stats, batch_size, variance_threshold)
+        Commands::Query { db, query, output, stats, batch_size, variance_threshold, whitelist, blacklist } => {
+            run_query(db, query, output, stats, batch_size, variance_threshold, whitelist, blacklist)
         }
         Commands::Info { db } => run_info(db),
     };
@@ -106,11 +119,15 @@ fn run_query(
     stats: bool,
     batch_size: Option<usize>,
     variance_threshold: f64,
+    whitelist: Option<PathBuf>,
+    blacklist: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = QueryConfig::new(db, query);
     config.batch_size = batch_size;
     config.stats = stats;
     config.variance_threshold = variance_threshold;
+    config.filter = whitelist.map(|p| (p, FilterMode::Whitelist))
+        .or_else(|| blacklist.map(|p| (p, FilterMode::Blacklist)));
     let result = query_database(&config)?;
 
     let db_sources = &result.db_sources;

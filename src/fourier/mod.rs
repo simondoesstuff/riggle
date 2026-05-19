@@ -43,6 +43,96 @@ use rayon::prelude::*;
 use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 
+// ── FilterMask ────────────────────────────────────────────────────────────────
+
+/// Whether a [`FilterMask`] BED file lists regions to keep or regions to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Only bins covered by the BED are accessible; chromosomes absent from the
+    /// BED are excluded entirely.
+    Whitelist,
+    /// Bins covered by the BED are zeroed out; all other bins remain accessible.
+    /// Chromosomes absent from the BED are unaffected (fully accessible).
+    Blacklist,
+}
+
+/// A per-chromosome boolean mask at 100 bp resolution.
+///
+/// Internally always stores `true = accessible` regardless of the source mode.
+/// Built from a [`BedMap`] via [`FilterMask::build`].
+pub struct FilterMask {
+    chroms: HashMap<String, Vec<bool>>,
+    mode: FilterMode,
+}
+
+impl FilterMask {
+    /// Build a `FilterMask` from a [`BedMap`] and a [`FilterMode`].
+    ///
+    /// **Whitelist**: only bins covered by `bed` are marked accessible; chromosomes
+    /// absent from `bed` are excluded entirely.
+    ///
+    /// **Blacklist**: all bins start accessible; bins covered by `bed` are marked
+    /// inaccessible.  Chromosomes absent from `bed` remain fully accessible.
+    pub fn build(bed: &BedMap, mode: FilterMode) -> Self {
+        let chrom_sizes: HashMap<&str, u32> = hg38_chrom_sizes().iter().copied().collect();
+
+        let chroms = match mode {
+            FilterMode::Whitelist => bed
+                .iter()
+                .filter_map(|(chrom, ivs)| {
+                    if ivs.is_empty() {
+                        return None;
+                    }
+                    let &size = chrom_sizes.get(chrom.as_str())?;
+                    let n_bins = ((size + BIN_SIZE - 1) / BIN_SIZE) as usize;
+                    let mut mask = vec![false; n_bins];
+                    for &(s, e) in ivs {
+                        let sb = (s / BIN_SIZE) as usize;
+                        let eb = (((e + BIN_SIZE - 1) / BIN_SIZE) as usize).min(n_bins);
+                        for b in sb..eb {
+                            mask[b] = true;
+                        }
+                    }
+                    Some((chrom.clone(), mask))
+                })
+                .collect(),
+
+            FilterMode::Blacklist => chrom_sizes
+                .iter()
+                .map(|(&chrom, &size)| {
+                    let n_bins = ((size + BIN_SIZE - 1) / BIN_SIZE) as usize;
+                    let mut mask = vec![true; n_bins];
+                    if let Some(ivs) = bed.get(chrom) {
+                        for &(s, e) in ivs {
+                            let sb = (s / BIN_SIZE) as usize;
+                            let eb = (((e + BIN_SIZE - 1) / BIN_SIZE) as usize).min(n_bins);
+                            for b in sb..eb {
+                                mask[b] = false;
+                            }
+                        }
+                    }
+                    (chrom.to_string(), mask)
+                })
+                .collect(),
+        };
+
+        FilterMask { chroms, mode }
+    }
+
+    /// Return the accessibility mask for `chrom` (`true` = bin contributes to FFT).
+    ///
+    /// For a whitelist, returns `None` if the chromosome was absent from the BED
+    /// (fully inaccessible).  For a blacklist, always returns `Some` since every
+    /// chromosome is represented.
+    pub fn get(&self, chrom: &str) -> Option<&[bool]> {
+        self.chroms.get(chrom).map(Vec::as_slice)
+    }
+
+    pub fn mode(&self) -> FilterMode {
+        self.mode
+    }
+}
+
 thread_local! {
     static REAL_PLANNER: RefCell<RealFftPlanner<f32>> = RefCell::new(RealFftPlanner::new());
     static COMPLEX_PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::new());
@@ -155,17 +245,41 @@ pub fn bed_map_v(bed: &BedMap) -> f64 {
 /// Stores all N/2+1 coefficients from the real forward FFT.
 /// Runs in parallel over chromosomes.
 pub fn build_db_spectra(dm: &DepthMap) -> Vec<ChromDbSpec> {
+    build_db_spectra_with_filter(dm, None)
+}
+
+/// Like [`build_db_spectra`] but applies a [`FilterMask`] before the FFT.
+///
+/// For each chromosome:
+/// - If `filter` is `None`, the full coverage vector is used (same as
+///   [`build_db_spectra`]).
+/// - If `filter` is `Some(f)` and `f` has an entry for the chromosome, the
+///   coverage vector is multiplied element-wise by the boolean mask (non-
+///   whitelisted bins are zeroed out) before the forward FFT.
+/// - If `filter` is `Some(f)` but `f` has **no** entry for the chromosome, that
+///   chromosome is excluded entirely (no `ChromDbSpec` is emitted for it).
+///
+/// This confines both the observed overlap and the shift-null distribution to
+/// the same accessible genomic space, implementing a positional prior.
+pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) -> Vec<ChromDbSpec> {
     dm.chroms
         .par_iter()
-        .map(|cdm| {
-            let spec = chrom_coverage_spectrum(cdm);
-            ChromDbSpec {
+        .filter_map(|cdm| {
+            let mask = match filter {
+                None => None,
+                Some(f) => match f.get(&cdm.chrom) {
+                    Some(m) => Some(m),
+                    None => return None, // chromosome excluded by filter
+                },
+            };
+            let spec = chrom_coverage_spectrum(cdm, mask);
+            Some(ChromDbSpec {
                 chrom: cdm.chrom.clone(),
                 n: cdm.n(),
                 n_bins: cdm.n_bins,
                 v: cdm.v(),
                 spec,
-            }
+            })
         })
         .collect()
 }
@@ -340,11 +454,15 @@ fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>)
 }
 
 /// Build a real-valued coverage array of length `n = cdm.n()` via prefix sum
-/// of the impulse train, then forward-FFT it with `realfft`, returning all
-/// n/2+1 complex coefficients.
+/// of the impulse train, optionally mask it, then forward-FFT it with
+/// `realfft`, returning all n/2+1 complex coefficients.
 ///
-/// Cost: O(N) build + O(N log N) FFT.
-fn chrom_coverage_spectrum(cdm: &ChromDepthMap) -> Vec<Complex<f32>> {
+/// When `mask` is `Some(m)`, bins whose entry in `m` is `false` are zeroed
+/// after the prefix sum but before the FFT.  Bins beyond `m.len()` are already
+/// zero-padded by `make_input_vec`.
+///
+/// Cost: O(N) build + O(N) mask application + O(N log N) FFT.
+fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> Vec<Complex<f32>> {
     let n = cdm.n();
 
     let fft = REAL_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
@@ -362,6 +480,16 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap) -> Vec<Complex<f32>> {
     // Prefix sum: impulse train → coverage g[j].
     for i in 1..n {
         indata[i] += indata[i - 1];
+    }
+
+    // Apply positional filter: zero out non-whitelisted bins.
+    if let Some(mask) = mask {
+        for (i, &allowed) in mask.iter().enumerate() {
+            if !allowed {
+                indata[i] = 0.0;
+            }
+        }
+        // Bins beyond mask.len() are already 0.0 (zero-padded by make_input_vec).
     }
 
     let mut spectrum = fft.make_output_vec(); // complex, length n/2+1
@@ -401,6 +529,70 @@ mod tests {
         let (observed, p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
         assert!(observed > 50_000.0, "observed={observed}");
         assert!(p_value < 0.1, "p_value={p_value}");
+    }
+
+    #[test]
+    fn test_filter_mask_excludes_unmatched_chrom() {
+        // DB and query both on chr22; filter only covers chr21.
+        // With filter active, no chromosomes are shared → None.
+        let mut bed = BedMap::new();
+        bed.insert("chr22".to_string(), vec![(10_000_000, 11_000_000)]);
+        let dm = DepthMap::build(&bed);
+
+        let mut filter_bed = BedMap::new();
+        filter_bed.insert("chr21".to_string(), vec![(0, 46_709_983)]);
+        let filter = FilterMask::build(&filter_bed, FilterMode::Whitelist);
+
+        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+
+        // chr22 excluded by filter → no spectra → p-value is None.
+        assert!(db_spectra.is_empty());
+        let result = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_filter_mask_confines_signal() {
+        // Query and DB identical on chr22; filter covers the whole chromosome.
+        // Should still return a low p-value (signal is preserved).
+        let mut bed = BedMap::new();
+        bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
+        let dm = DepthMap::build(&bed);
+
+        // Full chr22 whitelist (all bins accessible).
+        let mut filter_bed = BedMap::new();
+        filter_bed.insert("chr22".to_string(), vec![(0, 50_818_468)]);
+        let filter = FilterMask::build(&filter_bed, FilterMode::Whitelist);
+
+        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        let (observed, p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
+
+        assert!(observed > 50_000.0, "observed={observed}");
+        assert!(p_value < 0.1, "p_value={p_value}");
+    }
+
+    #[test]
+    fn test_blacklist_excludes_signal() {
+        // Query and DB both on chr22; blacklist covers the entire signal region.
+        // After blacklisting, the coverage vectors are all-zero → no cross-
+        // correlation power → observed overlap ~0 and p-value should be high.
+        let mut bed = BedMap::new();
+        bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
+        let dm = DepthMap::build(&bed);
+
+        // Blacklist covers exactly the signal region (plus some slack).
+        let mut bl_bed = BedMap::new();
+        bl_bed.insert("chr22".to_string(), vec![(0, 50_818_468)]);
+        let filter = FilterMask::build(&bl_bed, FilterMode::Blacklist);
+
+        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        // chr22 is present in the blacklist mask (all bins blocked), so it is
+        // not excluded from spectra — but all bins are zero, so observed ≈ 0.
+        let (observed, _p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
+        assert!(observed.abs() < 1.0, "observed should be ~0 after full blacklist, got {observed}");
     }
 
     #[test]
