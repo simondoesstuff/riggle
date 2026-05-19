@@ -33,7 +33,9 @@ struct StoredChrom {
     chrom: String,
     /// Number of 100 bp bins on this chromosome (fits in u32 for hg38).
     n_bins: u32,
+    /// Raw bp start positions (one per interval); fractional bin split applied at query time.
     pos_spikes: Vec<u32>,
+    /// Raw bp end positions (one per interval); fractional bin split applied at query time.
     neg_spikes: Vec<u32>,
 }
 
