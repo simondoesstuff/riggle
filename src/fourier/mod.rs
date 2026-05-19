@@ -145,6 +145,15 @@ const BIN_SIZE: u32 = 100;
 /// act as a smoothing regulariser and can sharpen biological signal.
 pub const DEFAULT_VARIANCE_THRESHOLD: f64 = 1.0;
 
+/// Fraction of retained cross-correlation coefficients that are tapered by the
+/// Tukey (cosine) window before the IFFT.  The window is flat for the lowest
+/// (1 − α) fraction of the retained M coefficients and rolls off smoothly to
+/// zero over the top α fraction, eliminating Gibbs ringing at the spectral
+/// truncation edge without touching the DC component.
+///
+/// α = 0: rectangular (no taper); α = 1: full Hann taper over all M bins.
+pub const TUKEY_ALPHA: f32 = 0.1;
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Chromosome name → (start, end) interval pairs.
@@ -261,7 +270,10 @@ pub fn build_db_spectra(dm: &DepthMap) -> Vec<ChromDbSpec> {
 ///
 /// This confines both the observed overlap and the shift-null distribution to
 /// the same accessible genomic space, implementing a positional prior.
-pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) -> Vec<ChromDbSpec> {
+pub fn build_db_spectra_with_filter(
+    dm: &DepthMap,
+    filter: Option<&FilterMask>,
+) -> Vec<ChromDbSpec> {
     dm.chroms
         .par_iter()
         .filter_map(|cdm| {
@@ -367,6 +379,14 @@ pub fn compute_pvalue_cached(
     };
     c_total.truncate(m);
 
+    // Tukey cosine taper: smooth the spectral-truncation edge so the IFFT
+    // null distribution is free of Gibbs ringing.  DC (k = 0) is always in
+    // the flat region of the window and is unaffected.
+    let window = tukey_taper(m, TUKEY_ALPHA);
+    for (c, &w) in c_total.iter_mut().zip(window.iter()) {
+        *c *= w;
+    }
+
     // M-length complex IFFT via the thread-local planner (plan cache hit).
     // c_total[s].re is proportional to the total overlap at shift s across
     // all shared chromosomes. c_total[0].re is the actual observed overlap.
@@ -439,6 +459,30 @@ pub fn hg38_chrom_sizes() -> &'static [(&'static str, u32)] {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// One-sided cosine taper for the high-frequency tail of a length-`m` spectrum.
+///
+/// Produces a window `w[0..m]` that is 1.0 for k < (1−α)·m and rolls off via
+/// a raised-cosine curve from 1.0 to 0.0 over the remaining α·m coefficients.
+/// The DC component (k = 0) is always preserved at weight 1.0.
+fn tukey_taper(m: usize, alpha: f32) -> Vec<f32> {
+    if alpha <= 0.0 || m <= 1 {
+        return vec![1.0; m];
+    }
+    let alpha = alpha.min(1.0);
+    let taper_start = ((1.0 - alpha) * m as f32) as usize;
+    let taper_len = m - taper_start;
+    (0..m)
+        .map(|k| {
+            if k < taper_start || taper_len == 0 {
+                1.0_f32
+            } else {
+                let t = (k - taper_start) as f32 / taper_len as f32;
+                0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+            }
+        })
+        .collect()
+}
 
 /// Convert intervals to (+1, −1) spike index vectors.
 fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>) {
@@ -592,7 +636,37 @@ mod tests {
         // chr22 is present in the blacklist mask (all bins blocked), so it is
         // not excluded from spectra — but all bins are zero, so observed ≈ 0.
         let (observed, _p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
-        assert!(observed.abs() < 1.0, "observed should be ~0 after full blacklist, got {observed}");
+        assert!(
+            observed.abs() < 1.0,
+            "observed should be ~0 after full blacklist, got {observed}"
+        );
+    }
+
+    #[test]
+    fn test_tukey_taper_shape() {
+        // DC and flat region are 1.0; last coefficient is near 0.
+        let w = tukey_taper(100, 0.5);
+        assert_eq!(w.len(), 100);
+        assert!((w[0] - 1.0).abs() < 1e-6, "DC must be 1.0, got {}", w[0]);
+        assert!(
+            (w[49] - 1.0).abs() < 1e-6,
+            "flat region at k=49, got {}",
+            w[49]
+        );
+        // k=99 is the last bin: t ≈ 1-ε, cos(π) = -1 → w ≈ 0
+        assert!(w[99] < 0.05, "last bin should be near 0, got {}", w[99]);
+        // Monotonically non-increasing in the taper zone (k=50..99).
+        for k in 50..99 {
+            assert!(
+                w[k] >= w[k + 1] - 1e-6,
+                "non-monotone at k={k}: {}>{}",
+                w[k],
+                w[k + 1]
+            );
+        }
+        // α=0 → all ones.
+        let rect = tukey_taper(8, 0.0);
+        assert!(rect.iter().all(|&v| (v - 1.0).abs() < 1e-6));
     }
 
     #[test]
