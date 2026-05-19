@@ -122,17 +122,27 @@ fn parse_bed(path: &str) -> BedMap {
 /// Build a real f32 derivative spike array of length `n` and return it alongside
 /// Σᵢ g[i] (total area under the depth curve over `chrom_bins` bins).
 ///
-/// Spike rule:  d[floor(start/BIN)] += 1,  d[ceil(end/BIN)] -= 1
+/// Each spike at raw position x is split between bins floor(x/BIN) and floor(x/BIN)+1
+/// with weights (1−frac) and frac, where frac = (x % BIN_SIZE) / BIN_SIZE.
+/// This eliminates aliasing for intervals shorter than BIN_SIZE.
 /// prefix_sum(d) = g = per-bin coverage depth.
 fn build_derivative(intervals: &[(u32, u32)], n: usize, chrom_bins: usize) -> (Vec<f32>, f32) {
+    let max_bp = (chrom_bins as u32) * BIN_SIZE;
     let mut d = vec![0.0f32; n];
     for &(s, e) in intervals {
-        let sb = ((s / BIN_SIZE) as usize).min(chrom_bins);
-        let eb = (((e + BIN_SIZE - 1) / BIN_SIZE) as usize).min(chrom_bins);
-        if sb < n { d[sb] += 1.0; }
-        if eb < n { d[eb] -= 1.0; }
+        let s = s.min(max_bp);
+        let e = e.min(max_bp);
+        let sb = (s / BIN_SIZE) as usize;
+        let sf = (s % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        if sb < n { d[sb] += 1.0 - sf; }
+        if sf > 0.0 && sb + 1 < n { d[sb + 1] += sf; }
+        let eb = (e / BIN_SIZE) as usize;
+        let ef = (e % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        if eb < n { d[eb] -= 1.0 - ef; }
+        if ef > 0.0 && eb + 1 < n { d[eb + 1] -= ef; }
     }
     // Σ_i g[i] = Σ_j d[j] · (chrom_bins − j)
+    // This formula works correctly with fractional d[j] values.
     let total_cov: f32 = d[..chrom_bins.min(n)]
         .iter()
         .enumerate()

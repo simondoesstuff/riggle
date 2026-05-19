@@ -145,15 +145,6 @@ const BIN_SIZE: u32 = 100;
 /// act as a smoothing regulariser and can sharpen biological signal.
 pub const DEFAULT_VARIANCE_THRESHOLD: f64 = 1.0;
 
-/// Fraction of retained cross-correlation coefficients that are tapered by the
-/// Tukey (cosine) window before the IFFT.  The window is flat for the lowest
-/// (1 − α) fraction of the retained M coefficients and rolls off smoothly to
-/// zero over the top α fraction, eliminating Gibbs ringing at the spectral
-/// truncation edge without touching the DC component.
-///
-/// α = 0: rectangular (no taper); α = 1: full Hann taper over all M bins.
-pub const TUKEY_ALPHA: f32 = 0.1;
-
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Chromosome name → (start, end) interval pairs.
@@ -174,13 +165,18 @@ pub struct ChromDbSpec {
 }
 
 /// Sparse Dirac impulse train (derivative coverage) for one chromosome.
+///
+/// Spikes are stored as raw bp positions.  At query time each spike is
+/// fractionally distributed across two adjacent bins (linear interpolation
+/// between `floor(x/BIN)` and `floor(x/BIN)+1`) to eliminate aliasing for
+/// intervals smaller than `BIN_SIZE`.
 #[derive(Debug)]
 pub struct ChromDepthMap {
     pub chrom: String,
     pub n_bins: usize,
-    /// Bin indices with a +1 impulse (interval starts, floor(s/BIN)).
+    /// Raw bp start positions with a +1 impulse (one per interval).
     pub pos_spikes: Vec<u32>,
-    /// Bin indices with a -1 impulse (interval ends, ceil(e/BIN)).
+    /// Raw bp end positions with a -1 impulse (one per interval).
     pub neg_spikes: Vec<u32>,
 }
 
@@ -189,18 +185,15 @@ impl ChromDepthMap {
     pub fn v(&self) -> f64 {
         (self.pos_spikes.len() + self.neg_spikes.len()) as f64
     }
-    /// Total coverage: Σ_j d[j]·(n_bins − j).
+    /// Total coverage in bins: Σ_interval (end − start) / BIN_SIZE.
+    ///
+    /// With fractional spike distribution, this equals
+    ///   Σ_pos (n_bins − x/BIN_SIZE) − Σ_neg (n_bins − x/BIN_SIZE).
     pub fn total_cov(&self) -> f64 {
-        let pos: f64 = self
-            .pos_spikes
-            .iter()
-            .map(|&j| (self.n_bins - j as usize) as f64)
-            .sum();
-        let neg: f64 = self
-            .neg_spikes
-            .iter()
-            .map(|&j| (self.n_bins - j as usize) as f64)
-            .sum();
+        let n = self.n_bins as f64;
+        let b = BIN_SIZE as f64;
+        let pos: f64 = self.pos_spikes.iter().map(|&x| n - x as f64 / b).sum();
+        let neg: f64 = self.neg_spikes.iter().map(|&x| n - x as f64 / b).sum();
         pos - neg
     }
     fn n(&self) -> usize {
@@ -270,10 +263,7 @@ pub fn build_db_spectra(dm: &DepthMap) -> Vec<ChromDbSpec> {
 ///
 /// This confines both the observed overlap and the shift-null distribution to
 /// the same accessible genomic space, implementing a positional prior.
-pub fn build_db_spectra_with_filter(
-    dm: &DepthMap,
-    filter: Option<&FilterMask>,
-) -> Vec<ChromDbSpec> {
+pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) -> Vec<ChromDbSpec> {
     dm.chroms
         .par_iter()
         .filter_map(|cdm| {
@@ -379,14 +369,6 @@ pub fn compute_pvalue_cached(
     };
     c_total.truncate(m);
 
-    // Tukey cosine taper: smooth the spectral-truncation edge so the IFFT
-    // null distribution is free of Gibbs ringing.  DC (k = 0) is always in
-    // the flat region of the window and is unaffected.
-    let window = tukey_taper(m, TUKEY_ALPHA);
-    for (c, &w) in c_total.iter_mut().zip(window.iter()) {
-        *c *= w;
-    }
-
     // M-length complex IFFT via the thread-local planner (plan cache hit).
     // c_total[s].re is proportional to the total overlap at shift s across
     // all shared chromosomes. c_total[0].re is the actual observed overlap.
@@ -460,39 +442,17 @@ pub fn hg38_chrom_sizes() -> &'static [(&'static str, u32)] {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// One-sided cosine taper for the high-frequency tail of a length-`m` spectrum.
+/// Convert intervals to raw bp position vectors for fractional spike distribution.
 ///
-/// Produces a window `w[0..m]` that is 1.0 for k < (1−α)·m and rolls off via
-/// a raised-cosine curve from 1.0 to 0.0 over the remaining α·m coefficients.
-/// The DC component (k = 0) is always preserved at weight 1.0.
-fn tukey_taper(m: usize, alpha: f32) -> Vec<f32> {
-    if alpha <= 0.0 || m <= 1 {
-        return vec![1.0; m];
-    }
-    let alpha = alpha.min(1.0);
-    let taper_start = ((1.0 - alpha) * m as f32) as usize;
-    let taper_len = m - taper_start;
-    (0..m)
-        .map(|k| {
-            if k < taper_start || taper_len == 0 {
-                1.0_f32
-            } else {
-                let t = (k - taper_start) as f32 / taper_len as f32;
-                0.5 * (1.0 + (std::f32::consts::PI * t).cos())
-            }
-        })
-        .collect()
-}
-
-/// Convert intervals to (+1, −1) spike index vectors.
+/// Positions are clamped to `[0, n_bins × BIN_SIZE]`; the fractional
+/// bin-split is applied later in [`chrom_coverage_spectrum`].
 fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>) {
+    let max_bp = (n_bins as u32) * BIN_SIZE;
     let mut pos = Vec::with_capacity(intervals.len());
     let mut neg = Vec::with_capacity(intervals.len());
     for &(s, e) in intervals {
-        let sb = ((s / BIN_SIZE) as usize).min(n_bins) as u32;
-        let eb = (((e + BIN_SIZE - 1) / BIN_SIZE) as usize).min(n_bins) as u32;
-        pos.push(sb);
-        neg.push(eb);
+        pos.push(s.min(max_bp));
+        neg.push(e.min(max_bp));
     }
     (pos, neg)
 }
@@ -512,14 +472,26 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> Vec<Co
     let fft = REAL_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
     let mut indata = fft.make_input_vec(); // vec![0f32; n]
 
-    // Build impulse train (derivative of coverage) in-place.
-    for &j in &cdm.pos_spikes {
-        let idx = (j as usize).min(n - 1);
-        indata[idx] += 1.0;
+    // Build fractionally-weighted impulse train (anti-aliased derivative of coverage).
+    // Each spike at raw position x is split between bins floor(x/BIN) and floor(x/BIN)+1
+    // with weights (1−frac) and frac, where frac = (x % BIN_SIZE) / BIN_SIZE.
+    // For sub-bin intervals this correctly assigns fractional coverage rather than
+    // cancelling to zero as the old integer-bin scheme did.
+    for &x in &cdm.pos_spikes {
+        let bin = (x / BIN_SIZE) as usize;
+        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        indata[bin.min(n - 1)] += 1.0 - frac;
+        if frac > 0.0 && bin + 1 < n {
+            indata[bin + 1] += frac;
+        }
     }
-    for &j in &cdm.neg_spikes {
-        let idx = (j as usize).min(n - 1);
-        indata[idx] -= 1.0;
+    for &x in &cdm.neg_spikes {
+        let bin = (x / BIN_SIZE) as usize;
+        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        indata[bin.min(n - 1)] -= 1.0 - frac;
+        if frac > 0.0 && bin + 1 < n {
+            indata[bin + 1] -= frac;
+        }
     }
     // Prefix sum: impulse train → coverage g[j].
     for i in 1..n {
@@ -547,12 +519,6 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> Vec<Co
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn small_bed() -> BedMap {
-        let mut m = BedMap::new();
-        m.insert("chr22".to_string(), vec![(10_000_000, 10_001_000)]);
-        m
-    }
 
     #[test]
     fn test_compute_pvalue_identical() {
@@ -636,37 +602,7 @@ mod tests {
         // chr22 is present in the blacklist mask (all bins blocked), so it is
         // not excluded from spectra — but all bins are zero, so observed ≈ 0.
         let (observed, _p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
-        assert!(
-            observed.abs() < 1.0,
-            "observed should be ~0 after full blacklist, got {observed}"
-        );
-    }
-
-    #[test]
-    fn test_tukey_taper_shape() {
-        // DC and flat region are 1.0; last coefficient is near 0.
-        let w = tukey_taper(100, 0.5);
-        assert_eq!(w.len(), 100);
-        assert!((w[0] - 1.0).abs() < 1e-6, "DC must be 1.0, got {}", w[0]);
-        assert!(
-            (w[49] - 1.0).abs() < 1e-6,
-            "flat region at k=49, got {}",
-            w[49]
-        );
-        // k=99 is the last bin: t ≈ 1-ε, cos(π) = -1 → w ≈ 0
-        assert!(w[99] < 0.05, "last bin should be near 0, got {}", w[99]);
-        // Monotonically non-increasing in the taper zone (k=50..99).
-        for k in 50..99 {
-            assert!(
-                w[k] >= w[k + 1] - 1e-6,
-                "non-monotone at k={k}: {}>{}",
-                w[k],
-                w[k + 1]
-            );
-        }
-        // α=0 → all ones.
-        let rect = tukey_taper(8, 0.0);
-        assert!(rect.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(observed.abs() < 1.0, "observed should be ~0 after full blacklist, got {observed}");
     }
 
     #[test]
@@ -699,5 +635,31 @@ mod tests {
 
         assert!((obs_cached - obs_direct).abs() < 1.0, "obs mismatch");
         assert!((pv_cached - pv_direct).abs() < 0.05, "pv mismatch");
+    }
+
+    /// Verify fractional spike distribution for a sub-bin interval.
+    ///
+    /// Interval [20, 80] fits entirely within bin 0 (100 bp bins).
+    /// Expected coverage in fractional bins: (80 − 20) / 100 = 0.60.
+    ///
+    /// Spike maths:
+    ///   start=20 → bin 0 += 0.80, bin 1 += 0.20
+    ///   end=80   → bin 0 -= 0.20, bin 1 -= 0.80
+    ///   net:       bin 0 = +0.60, bin 1 = −0.60
+    ///   prefix sum: g[0] = 0.60, g[1..] = 0.0
+    #[test]
+    fn test_sub_bin_fractional_coverage() {
+        let mut bed = BedMap::new();
+        bed.insert("chr22".to_string(), vec![(20, 80)]);
+        let dm = DepthMap::build(&bed);
+        let chrom = &dm.chroms[0];
+
+        // total_cov should equal (80 − 20) / 100 = 0.6 bins.
+        let tc = chrom.total_cov();
+        assert!((tc - 0.6).abs() < 1e-9, "total_cov={tc}");
+
+        // Verify by checking raw spike storage (raw bp positions).
+        assert_eq!(chrom.pos_spikes, vec![20u32]);
+        assert_eq!(chrom.neg_spikes, vec![80u32]);
     }
 }
