@@ -10,6 +10,7 @@
     };
     # packages
     giggle.url = "path:/Users/simon/Code/lab/giggle-dev/giggle";
+    bits.url = "github:arq5x/bits";
     igd-src = {
       url = "github:databio/iGD";
       flake = false;
@@ -22,6 +23,7 @@
       flake-utils,
       treefmt-nix,
       giggle,
+      bits,
       igd-src,
       ...
     }:
@@ -60,7 +62,7 @@
             if pkgs.stdenv.isDarwin then
               pkgs.fetchurl {
                 url = "https://hgdownload.soe.ucsc.edu/admin/exe/macOSX.x86_64/liftOver";
-                sha256 = "sha256-9lg7+MXpUrMsZK9tAkpHAQWJPS16RDrByno1iC/8kuA=";
+                sha256 = "sha256-4yXbLOxjyXSvJsLdnlW70vOZ5K14PWnDahdGGiFxh7Y=";
               }
             else
               pkgs.fetchurl {
@@ -94,6 +96,7 @@
             htslib # bgzip
             bedtools
             giggle.packages.${system}.default
+            bits.packages.${system}.default
             igd
             liftOver
             # misc
