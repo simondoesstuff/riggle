@@ -1,0 +1,40 @@
+# Run from project root: snakemake -j<cores>
+#
+# GWAS data (first time only):
+#   snakemake gwas_all
+#
+# BITS sweep (all 39 traits, n=100 trials):
+#   snakemake -j4 $(printf 'data/bits/100/%s.tsv ' $(ls data/gwas/*.bed | xargs -n1 basename | sed 's/.bed//'))
+#
+# Giggle index + all traits:
+#   snakemake -j4 $(printf 'data/giggle/%s.tsv ' $(ls data/gwas/*.bed | xargs -n1 basename | sed 's/.bed//'))
+#
+# Chuckle (build index once, then one at a time — ~250 GB RAM per query):
+#   snakemake data/rme_chuckle
+#   snakemake --resources mem_mb=260000 -j1 data/chuckle/Rheumatoid_arthritis.json
+#
+# Scatter plots (giggle vs BITS, 100 trials):
+#   snakemake data/plots/scatter_giggle_bits_100.png
+#   snakemake data/plots/scatter_Rheumatoid_arthritis_100_per_bed.png
+#   snakemake data/plots/scatter_all_tools_100.png   # needs chuckle data for all traits
+#
+# Benchmarks (quick scale):
+#   snakemake bench_all
+#   snakemake data/plots/bench_index.png
+
+include: "rules/gwas.smk"
+include: "rules/roadmap_epigenomics.smk"
+include: "rules/bits.smk"
+include: "rules/giggle.smk"
+include: "rules/chuckle.smk"
+include: "rules/plots.smk"
+include: "rules/bench.smk"
+
+
+rule all:
+    default_target: True
+    input:
+        rme_all_beds,
+        f"{RME_DIR}/whitelist.bed",
+        f"{RME_DIR}/enhancers_whitelist.bed",
+        f"{RME_DIR}/quiescent_low_blacklist.bed",

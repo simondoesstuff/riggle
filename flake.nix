@@ -105,6 +105,7 @@
             # analysis
             uv
             samply
+            snakemake
           ];
 
           # Help the linker find libiconv on Darwin

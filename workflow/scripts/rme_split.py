@@ -1,31 +1,17 @@
-#!/usr/bin/env python3
+"""Split each EDACC ChromHMM source file into per-(cellType, chromatinState) beds.
 
-"""
-modern_chromhmm_splitter.py
-
-A modernized Python 3 script to "demultiplex" ChromHMM segmentation files.
-
-This script takes a collection of ChromHMM segmentation BED files (which
-contain all states for one sample) and splits them into separate BED files
-for each state, using human-readable names for both the sample and the state.
-
-It is a Python 3+ rewrite of an older Python 2 script from Ryan Layer.
+Snakemake script: protocol — accesses snakemake.input[0] (raw dir),
+snakemake.output[0] (split dir), snakemake.threads (workers).
 """
 
-import argparse
 import glob
 import gzip
+import multiprocessing
 import os
-import sys
 from contextlib import ExitStack
 from functools import partial
-from multiprocessing import Pool
 from pathlib import Path
 from typing import TextIO, cast
-
-# INFO: ------------------------------------------
-#         Cell Type, Chromatin State Maps
-# ------------------------------------------------
 
 states_map = {
     "1_TssA": "Active_TSS",
@@ -175,189 +161,80 @@ edacc_map = {
     "E129": "Osteoblasts",
 }
 
-# INFO: ----------------------
-#         Process File
-# ----------------------------
 
-
-def smart_open(path: Path, mode: str = "rt") -> TextIO:
-    """
-    A helper function to open .gz or plain text files transparently.
-    """
+def _smart_open(path: Path, mode: str = "rt") -> TextIO:
     if path.suffix == ".gz":
         return cast(TextIO, gzip.open(path, mode))
-    else:
-        return cast(TextIO, open(path, mode, encoding="utf-8"))
+    return cast(TextIO, open(path, mode, encoding="utf-8"))
 
 
-def process_file(
+def _process_file(
     input_file: Path,
     output_dir: Path,
     states_map: dict[str, str],
     edacc_map: dict[str, str],
 ) -> tuple[int, set[Path]]:
-    """
-    Processes a single ChromHMM segmentation file.
-
-    Splits the file into multiple output files (one per state) in the
-    output directory.
-
-    Args:
-        input_file: The Path object for the input BED.gz file.
-        output_dir: The directory to write the split files to.
-        states_map: A dictionary mapping state IDs (e.g., "1") to
-                    human-readable names (e.g., "Active_Promoter").
-        edacc_map: A dictionary mapping sample IDs (e.g., "E050") to
-                   human-readable names (e.g., "A549_Lung_Carcinoma").
-
-    Returns:
-        A tuple containing:
-        (int) The number of lines processed.
-        (set) A set of all output file Paths that were written to.
-    """
     print(f"Processing: {input_file.name}")
-    open_files: dict[str, TextIO] = dict()
+    open_files: dict[str, TextIO] = {}
     output_filepaths: set[Path] = set()
     processed_lines = 0
 
-    # Get the EDACC/Sample ID from the filename (e.g., "E050")
-    # E.g., "E050_15_core_segments.bed.gz" -> "E050"
     eid = input_file.name.split("_")[0]
-
     sample_name = edacc_map.get(eid)
     if not sample_name:
-        raise ValueError(
-            f"Warning: No EDACC name found for ID '{eid}' in {input_file.name}."
-        )
+        raise ValueError(f"No EDACC name for ID '{eid}' in {input_file.name}")
 
-    # Use ExitStack to manage all output file handles.
-    # This ensures all files are closed properly, even if errors occur.
-    with ExitStack() as stack, smart_open(input_file, "rt") as f_in:
+    with ExitStack() as stack, _smart_open(input_file, "rt") as f_in:
         for line_number, line in enumerate(f_in, 1):
-            # BED files are tab-delimited. The state is in column 4.
             toks = line.rstrip().split("\t")
             if len(toks) < 4:
-                # Fail fast on malformed lines
                 raise ValueError(
                     f"Malformed line in {input_file.name} (line {line_number}): "
-                    f"Expected 4+ columns, got {len(toks)}. Line: '{line.rstrip()}'"
+                    f"expected 4+ columns, got {len(toks)}"
                 )
-
             state_id = toks[3]
-
-            # Look up the human-readable state name
             state_name = states_map.get(state_id)
             if not state_name:
-                # Fail fast on unknown states.
-                # This makes it strict; it will not skip any lines.
                 raise ValueError(
-                    f"Unknown state ID in {input_file.name} (line {line_number}): "
-                    f"'{state_id}' not found in states_map. Line: '{line.rstrip()}'"
+                    f"Unknown state '{state_id}' in {input_file.name} (line {line_number})"
                 )
-
-            # Create a unique output filename, e.g., "A549_Lung_Carcinoma_Active_Promoter.bed"
             output_filename = f"{sample_name}_{state_name}.bed"
-
-            # If this is the first time we've seen this state for this file,
-            # open a new output file for it.
             if output_filename not in open_files:
                 out_path = output_dir / output_filename
-                # 'wt' = write text
                 f_out = stack.enter_context(open(out_path, "wt", encoding="utf-8"))
                 open_files[output_filename] = f_out
-                output_filepaths.add(out_path)  # Track the new file path
-                print(f"  -> Creating: {out_path.name}")
-
-            # Write the original line to the correct output file
+                output_filepaths.add(out_path)
             open_files[output_filename].write(line)
             processed_lines += 1
 
     return processed_lines, output_filepaths
 
 
-# INFO: ------------
-#         CLI
-# ------------------
+# --- Snakemake script: entry point ---
 
+raw_dir = snakemake.input[0]
+output_dir = Path(snakemake.output[0])
+num_processes = os.cpu_count()
 
-def main():
-    """
-    Main function to parse arguments and coordinate processing.
-    """
-    parser = argparse.ArgumentParser(
-        description="Splits ChromHMM segmentation files into per-state BED files.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+output_dir.mkdir(parents=True, exist_ok=True)
 
-    parser.add_argument(
-        "input_pattern",
-        type=str,
-        help="Glob pattern for input files (e.g., 'data/E*_segments.bed.gz')",
-    )
-    parser.add_argument(
-        "output_dir", type=Path, help="Directory to write the split BED files"
-    )
-    parser.add_argument(
-        "-p",
-        "--processes",
-        type=int,
-        default=None,
-        help="Number of processes to use. Defaults to all available cores.",
-    )
+input_files = [Path(f) for f in glob.glob(f"{raw_dir}/*_mnemonics.bed.gz")]
+if not input_files:
+    raise SystemExit(f"No *_mnemonics.bed.gz files found in {raw_dir}")
 
-    args = parser.parse_args()
+print(f"Found {len(input_files)} files to process with {num_processes} worker(s).")
 
-    # --- Create Output Directory ---
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+_process_partial = partial(
+    _process_file,
+    output_dir=output_dir,
+    states_map=states_map,
+    edacc_map=edacc_map,
+)
 
-    # --- Find Input Files ---
-    input_files = [Path(f) for f in glob.glob(args.input_pattern)]
-    if not input_files:
-        print(
-            f"Error: No files found matching pattern: {args.input_pattern}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+ctx = multiprocessing.get_context("fork")
+with ctx.Pool(processes=num_processes) as pool:
+    results = pool.map(_process_partial, input_files)
 
-    print(f"Found {len(input_files)} files to process.")
-
-    # --- Set up Parallel Processing ---
-
-    # Use 'partial' to "bake in" the arguments that are the same for
-    # every call to process_file. This is the standard way to use
-    # multiprocessing.Pool.map with a function that takes >1 argument.
-    process_file_partial = partial(
-        process_file,
-        output_dir=args.output_dir,
-        states_map=states_map,
-        edacc_map=edacc_map,
-    )
-
-    # Determine number of processes (use all available if not specified)
-    num_processes = args.processes or os.cpu_count()
-    print(f"Starting processing pool with {num_processes} worker(s)...")
-
-    # Use the Pool as a context manager (the modern, safe way)
-    with Pool(processes=num_processes) as pool:
-        # pool.map applies the function to each item in input_files
-        # and collects the return values.
-        results = pool.map(process_file_partial, input_files)
-
-    # --- Consolidate Results ---
-    total_lines = 0
-    all_output_files: set[Path] = set()
-    for res_lines, res_paths in results:
-        total_lines += res_lines
-        all_output_files.update(res_paths)
-
-    # --- Report Results ---
-    print("\n" + "=" * 30)
-    print("Processing Complete.")
-    print(f"Total lines processed: {total_lines}")
-    print(f"Total unique files created: {len(all_output_files)}")
-    print(f"Output files are in: {args.output_dir.resolve()}")
-    print("=" * 30)
-
-
-if __name__ == "__main__":
-    main()
+total_lines = sum(r for r, _ in results)
+total_files = len({p for _, paths in results for p in paths})
+print(f"Done: {total_lines} lines → {total_files} output files in {output_dir}")

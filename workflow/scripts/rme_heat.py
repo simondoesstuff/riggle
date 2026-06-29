@@ -138,7 +138,49 @@ def classify_bed_file(bed: Pathish) -> tuple[str, str]:
     raise ValueError(f'Unknown format, expecting "cellType_chrmState", got: {filename}')
 
 
+def parse_giggle_tsv(
+    score_path: Pathish, col: str = "fishers_right_tail"
+) -> tuple[list[str], list[float]]:
+    """Parse a giggle search TSV.  P-value columns are -log10 transformed."""
+    p_value_cols = {"fishers_two_tail", "fishers_left_tail", "fishers_right_tail"}
+    pairs: list[tuple[str, float]] = []
+    with open(score_path) as f:
+        header = f.readline().lstrip("#").rstrip("\n\t").split("\t")
+        try:
+            col_idx = header.index(col)
+            file_idx = header.index("file")
+        except ValueError:
+            raise ValueError(f"Column '{col}' not found in giggle header: {header}")
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n\t").split("\t")
+            if len(parts) <= max(col_idx, file_idx):
+                continue
+            name = Path(parts[file_idx]).name.split(".")[0]
+            try:
+                val = float(parts[col_idx])
+                if col in p_value_cols:
+                    if val <= 0:
+                        continue
+                    val = -math.log10(val)
+                pairs.append((name, val))
+            except ValueError:
+                continue
+    pairs.sort(key=lambda x: -x[1])
+    if not pairs:
+        return [], []
+    keys, values = zip(*pairs)
+    return list(keys), list(values)
+
+
 def parse_score_file(score_path: Pathish) -> tuple[list[str], list[float]]:
+    # Auto-detect giggle TSV by presence of 'fishers_right_tail' in header
+    with open(score_path) as f:
+        first_line = f.readline()
+    if "fishers_right_tail" in first_line:
+        return parse_giggle_tsv(score_path)
+
     def parse() -> Iterator[tuple[str, float]]:
         with open(score_path) as f:
             for line in f:
