@@ -57,12 +57,11 @@
           pname = "liftOver";
           version = "latest";
 
-          # hashes may require adjustment
           src =
             if pkgs.stdenv.isDarwin then
               pkgs.fetchurl {
-                url = "https://hgdownload.soe.ucsc.edu/admin/exe/macOSX.x86_64/liftOver";
-                sha256 = "sha256-4yXbLOxjyXSvJsLdnlW70vOZ5K14PWnDahdGGiFxh7Y=";
+                url = "https://hgdownload.soe.ucsc.edu/admin/exe/macOSX.arm64/liftOver";
+                sha256 = "sha256-e6uQT92vzWiK3WolABoXy0DiGqFtuwa4Z2W3Kc7kEOw=";
               }
             else
               pkgs.fetchurl {
@@ -73,19 +72,28 @@
           # Since we are fetching a bare binary, we need to skip the unpack phase
           dontUnpack = true;
 
-          # For Linux, we often need to patch the binary to find the right libraries
           nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.autoPatchelfHook ];
-          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [
-            pkgs.zlib
-            pkgs.openssl
-            pkgs.libpng
-          ];
+          buildInputs =
+            pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.zlib
+              pkgs.openssl
+              pkgs.libpng
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [ pkgs.xz ];
 
-          installPhase = ''
-            mkdir -p $out/bin
-            cp $src $out/bin/liftOver
-            chmod +x $out/bin/liftOver
-          '';
+          installPhase =
+            ''
+              mkdir -p $out/bin
+              cp $src $out/bin/liftOver
+              chmod +x $out/bin/liftOver
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              install_name_tool -change \
+                /opt/homebrew/opt/xz/lib/liblzma.5.dylib \
+                ${pkgs.xz.out}/lib/liblzma.5.dylib \
+                $out/bin/liftOver
+              codesign -s - $out/bin/liftOver 2>/dev/null || true
+            '';
         };
       in
       {
