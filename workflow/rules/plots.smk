@@ -22,3 +22,41 @@ rule scatter_bed_pvals:
         " --giggle data/giggle"
         " --bits data/bits/{wildcards.trials}"
         " -o {output} --no-show"
+
+
+rule scatter_mc:
+    """Per-bed -log10(p) scatter replacing BITS with Monte Carlo (10k trials).
+
+    Three panels: chuckle vs giggle, chuckle vs MC, giggle vs MC.
+    """
+    input:
+        chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
+        giggle="data/giggle/{trait}.tsv",
+        mc=f"{MC_DIR}/{{trait}}.tsv",
+    output:
+        "data/plots/scatter_mc_{trait}.png",
+    params:
+        mc_trials=10000,
+    shell:
+        "uv run workflow/scripts/tool_scatter.py"
+        " --per-bed {wildcards.trait}"
+        " --chuckle {CHUCKLE_DIR}"
+        " --giggle data/giggle"
+        " --mc {MC_DIR}"
+        " --mc-trials {params.mc_trials}"
+        " -o {output} --no-show"
+
+
+rule mc_heatmap:
+    """Heatmap of chuckle vs MC Spearman correlation across p-value thresholds and trial counts."""
+    input:
+        chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
+        mc=f"{MC_DIR}/{{trait}}.tsv",
+    output:
+        "data/plots/mc_heatmap_{trait}.png",
+    shell:
+        "uv run workflow/scripts/mc_heatmap.py"
+        " --chuckle {input.chuckle}"
+        " --mc {input.mc}"
+        " --trait {wildcards.trait}"
+        " -o {output} --no-show"

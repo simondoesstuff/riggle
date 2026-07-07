@@ -27,6 +27,7 @@ include: "rules/roadmap_epigenomics.smk"
 include: "rules/bits.smk"
 include: "rules/giggle.smk"
 include: "rules/chuckle.smk"
+include: "rules/montecarlo.smk"
 include: "rules/plots.smk"
 include: "rules/bench.smk"
 

@@ -29,6 +29,7 @@ _TOOL_COLORS = {
     "bits": "#e07b54",
     "giggle": "#54a0e0",
     "chuckle": "#7be07b",
+    "mc": "#e0c854",
 }
 
 
@@ -87,6 +88,33 @@ def load_giggle_per_bed(tsv_path: str, col: str = "fishers_right_tail") -> dict[
             result[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass
+    return result
+
+
+def load_mc_per_bed(tsv_path: str, trials: int) -> dict[str, float]:
+    """Load MC p-values for a specific trial milestone from a multi-milestone TSV."""
+    # Floor at 1/trials: empirical p can't be smaller than one exceedance out of N.
+    # Using _TINY here produces -log10(p) ≈ 308 for p=0 hits, blowing up the axis.
+    p_floor = 1.0 / trials
+    result: dict[str, float] = {}
+    in_section = False
+    with open(tsv_path) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith("# milestone="):
+                parts = dict(tok.split("=") for tok in line[2:].split())
+                in_section = int(parts.get("trials", 0)) == trials
+                continue
+            if not in_section or not line or line.startswith("db_name"):
+                continue
+            cols = line.split("\t")
+            if len(cols) >= 3:
+                name = _strip_name(Path(cols[0]).name)
+                try:
+                    p = max(float(cols[2]), p_floor)
+                    result[name] = -math.log10(p)
+                except ValueError:
+                    pass
     return result
 
 
@@ -159,6 +187,8 @@ def plot_pval_scatter(
     giggle_tsv: str | None = None,
     giggle_col: str = "fishers_right_tail",
     bits_tsv: str | None = None,
+    mc_tsv: str | None = None,
+    mc_trials: int = 10000,
     output_path: str | None = None,
     show: bool = True,
     raw_pval: bool = False,
@@ -173,6 +203,8 @@ def plot_pval_scatter(
         all_beds["giggle"] = load_giggle_per_bed(giggle_tsv, col=giggle_col)
     if bits_tsv:
         all_beds["bits"] = load_bits_per_bed(bits_tsv)
+    if mc_tsv:
+        all_beds["mc"] = load_mc_per_bed(mc_tsv, mc_trials)
 
     tools = list(all_beds)
     if len(tools) < 2:
@@ -227,6 +259,10 @@ def main() -> None:
                         help="giggle column to use as score (default: fishers_right_tail)")
     parser.add_argument("--bits", metavar="DIR",
                         help="Directory of BITS sweep TSVs (data/bits/<trials>/)")
+    parser.add_argument("--mc", metavar="DIR",
+                        help="Directory of MC multi-milestone TSVs (data/montecarlo/)")
+    parser.add_argument("--mc-trials", metavar="N", type=int, default=10000,
+                        help="Which trial milestone to use from the MC TSV (default: 10000)")
     parser.add_argument("-o", "--output", help="Output image path")
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--raw-pval", action="store_true",
@@ -237,11 +273,14 @@ def main() -> None:
     chuckle_json = str(Path(args.chuckle) / f"{trait}.json")
     giggle_tsv = str(Path(args.giggle) / f"{trait}.tsv") if args.giggle else None
     bits_tsv = str(Path(args.bits) / f"{trait}.tsv") if args.bits else None
+    mc_tsv = str(Path(args.mc) / f"{trait}.tsv") if args.mc else None
     plot_pval_scatter(
         trait, chuckle_json,
         giggle_tsv=giggle_tsv,
         giggle_col=args.giggle_col,
         bits_tsv=bits_tsv,
+        mc_tsv=mc_tsv,
+        mc_trials=args.mc_trials,
         output_path=args.output,
         show=not args.no_show,
         raw_pval=args.raw_pval,
