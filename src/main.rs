@@ -156,6 +156,7 @@ fn run_query(
                     overlap_count,
                     observed_bins: Some(pv.observed_bins),
                     p_value: Some(pv.p_value),
+                    llr: pv.llr,
                 }
             })
             .collect()
@@ -178,6 +179,7 @@ fn run_query(
                             overlap_count,
                             observed_bins: None,
                             p_value: None,
+                            llr: None,
                         }
                     })
                     .collect::<Vec<_>>()

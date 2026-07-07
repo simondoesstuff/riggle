@@ -286,6 +286,34 @@ pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) 
         .collect()
 }
 
+/// Fit a Negative Binomial to `samples` via method of moments and return the
+/// saddlepoint log-likelihood ratio at `x_obs`.
+///
+/// The tilted NB has its mean shifted to `x_obs`; the LLR is the rate function
+/// I(x_obs) = x_obs · log(x_obs/μ) + (x_obs + r) · log((r + μ)/(r + x_obs)).
+///
+/// Returns `None` when NB fitting is not feasible (μ ≤ 0, variance ≤ mean,
+/// or the observation is out of the valid domain).
+fn nb_llr(samples: &[Complex<f32>], x_obs: f32) -> Option<f64> {
+    let n = samples.len() as f64;
+    let mu: f64 = samples.iter().map(|c| c.re as f64).sum::<f64>() / n;
+    if mu <= 0.0 {
+        return None;
+    }
+    let var: f64 = samples.iter().map(|c| (c.re as f64 - mu).powi(2)).sum::<f64>() / n;
+    if var <= mu {
+        return None;
+    }
+    let r = mu * mu / (var - mu);
+    let x = x_obs as f64;
+    if x + r <= 0.0 {
+        return None;
+    }
+    let term1 = if x <= 0.0 { 0.0 } else { x * (x / mu).ln() };
+    let term2 = (x + r) * ((r + mu) / (r + x)).ln();
+    Some(term1 + term2)
+}
+
 /// Compute the right-tailed p-value for a (query, DB) pair given pre-built
 /// spectra for both sides (produced by [`build_db_spectra`]).
 ///
@@ -302,18 +330,20 @@ pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) 
 ///    `c[0]` (shift = 0) corresponds to the actual observed overlap.
 /// 5. `observed_bins` is the Parseval-normalised sum
 ///    Σ_chrom Re(Σ_k G_Q[k]·conj(G_B[k])) / N_chrom.
+/// 6. LLR: fit NB to the M shift samples via method of moments, then evaluate
+///    the saddlepoint log-likelihood ratio at the shift-0 observation.
 ///
 /// `variance_threshold` ∈ (0, 1]: fraction of total cross-correlation power
 /// to retain.  Use [`DEFAULT_VARIANCE_THRESHOLD`] for a sensible default.
 /// Lower values (e.g. 0.90) smooth the null distribution; 1.0 uses all
 /// coefficients.
 ///
-/// Returns `(observed_bins, p_value)` or `None` if no chromosomes are shared.
+/// Returns `(observed_bins, p_value, llr)` or `None` if no chromosomes are shared.
 pub fn compute_pvalue_cached(
     q_spectra: &[ChromDbSpec],
     db_spectra: &[ChromDbSpec],
     variance_threshold: f64,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, Option<f64>)> {
     // Full spectrum length = max shared-chromosome spectrum length.
     let m_full = db_spectra
         .iter()
@@ -378,15 +408,16 @@ pub fn compute_pvalue_cached(
     let obs_ref = c_total[0].re;
     let count_geq = c_total.iter().filter(|x| x.re >= obs_ref).count();
     let p_value = count_geq as f64 / m as f64;
+    let llr = nb_llr(&c_total, obs_ref);
 
-    Some((observed, p_value))
+    Some((observed, p_value, llr))
 }
 
 /// Convenience: compute p-value directly from two BedMaps (builds spectra inline).
 /// Uses [`DEFAULT_VARIANCE_THRESHOLD`].
 /// Use [`build_db_spectra`] + [`compute_pvalue_cached`] when either file is
 /// compared against multiple partners (amortises the O(N log N) forward FFT).
-pub fn compute_pvalue(query_bed: &BedMap, db_dm: &DepthMap) -> Option<(f64, f64)> {
+pub fn compute_pvalue(query_bed: &BedMap, db_dm: &DepthMap) -> Option<(f64, f64, Option<f64>)> {
     let db_spectra = build_db_spectra(db_dm);
     let q_dm = DepthMap::build(query_bed);
     let q_spectra = build_db_spectra(&q_dm);
@@ -536,9 +567,10 @@ mod tests {
         // Use threshold=1.0 (full spectrum) to get enough IFFT samples for a
         // tight empirical p-value — the default threshold is tuned for biology,
         // not for this synthetic single-peak test.
-        let (observed, p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
+        let (observed, p_value, llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
         assert!(observed > 50_000.0, "observed={observed}");
         assert!(p_value < 0.1, "p_value={p_value}");
+        assert!(llr.map_or(true, |l| l >= 0.0), "llr={llr:?}");
     }
 
     #[test]
@@ -577,7 +609,7 @@ mod tests {
 
         let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
         let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        let (observed, p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
+        let (observed, p_value, _llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
 
         assert!(observed > 50_000.0, "observed={observed}");
         assert!(p_value < 0.1, "p_value={p_value}");
@@ -601,7 +633,7 @@ mod tests {
         let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
         // chr22 is present in the blacklist mask (all bins blocked), so it is
         // not excluded from spectra — but all bins are zero, so observed ≈ 0.
-        let (observed, _p_value) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
+        let (observed, _p_value, _llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
         assert!(observed.abs() < 1.0, "observed should be ~0 after full blacklist, got {observed}");
     }
 
@@ -629,12 +661,48 @@ mod tests {
         let q_dm = DepthMap::build(&bed);
         let q_spectra = build_db_spectra(&q_dm);
 
-        let (obs_cached, pv_cached) =
+        let (obs_cached, pv_cached, _) =
             compute_pvalue_cached(&q_spectra, &db_spectra, DEFAULT_VARIANCE_THRESHOLD).unwrap();
-        let (obs_direct, pv_direct) = compute_pvalue(&bed, &dm).unwrap();
+        let (obs_direct, pv_direct, _) = compute_pvalue(&bed, &dm).unwrap();
 
         assert!((obs_cached - obs_direct).abs() < 1.0, "obs mismatch");
         assert!((pv_cached - pv_direct).abs() < 0.05, "pv mismatch");
+    }
+
+    #[test]
+    fn test_nb_llr_zero_at_mean() {
+        // LLR should be exactly 0 when observation equals the null mean.
+        // Construct samples with mean=4 and variance=8 (r=2, p=0.5).
+        let samples: Vec<Complex<f32>> = (0..1000)
+            .map(|i| Complex::new(if i % 2 == 0 { 8.0f32 } else { 0.0f32 }, 0.0))
+            .collect();
+        let x_obs = 4.0f32; // equals the mean
+        let llr = nb_llr(&samples, x_obs).unwrap();
+        assert!(llr.abs() < 1e-3, "LLR at mean should be ~0, got {llr}");
+    }
+
+    #[test]
+    fn test_nb_llr_increases_with_enrichment() {
+        // LLR should increase as x_obs grows beyond the mean.
+        let samples: Vec<Complex<f32>> = (0..1000)
+            .map(|i| Complex::new(if i % 2 == 0 { 8.0f32 } else { 0.0f32 }, 0.0))
+            .collect();
+        let llr_at_mean = nb_llr(&samples, 4.0).unwrap();
+        let llr_enriched = nb_llr(&samples, 20.0).unwrap();
+        assert!(
+            llr_enriched > llr_at_mean,
+            "LLR should increase with enrichment: {llr_at_mean} vs {llr_enriched}"
+        );
+        assert!(llr_enriched > 0.0, "LLR should be positive for enrichment");
+    }
+
+    #[test]
+    fn test_nb_llr_none_for_underdispersed() {
+        // Samples with variance < mean → NB not applicable.
+        let samples: Vec<Complex<f32>> = (0..100)
+            .map(|_| Complex::new(5.0f32, 0.0))
+            .collect();
+        assert!(nb_llr(&samples, 6.0).is_none());
     }
 
     /// Verify fractional spike distribution for a sub-bin interval.

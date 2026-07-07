@@ -101,6 +101,9 @@ pub struct PValueResult {
     pub observed_bins: f64,
     /// Right-tailed p-value under the rigid-body shift null model.
     pub p_value: f64,
+    /// Saddlepoint LLR under a NB null fitted to the shift samples.
+    /// None when the NB fit is not feasible (e.g. underdispersed null).
+    pub llr: Option<f64>,
 }
 
 /// Output of a query operation
@@ -303,6 +306,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                         db_sid: d_sid as u32,
                         observed_bins: 0.0,
                         p_value: 1.0,
+                        llr: Some(0.0),
                     });
                 }
             }
@@ -399,13 +403,14 @@ fn compute_fourier_pvalues(
                 .iter()
                 .filter_map(|&q_sid| {
                     let q_spec = query_spectra.get(&q_sid)?;
-                    let (observed_bins, p_value) =
+                    let (observed_bins, p_value, llr) =
                         compute_pvalue_cached(q_spec, &db_spectra, variance_threshold)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,
                         observed_bins,
                         p_value,
+                        llr,
                     })
                 })
                 .collect()

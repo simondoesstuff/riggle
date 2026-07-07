@@ -174,12 +174,14 @@ def parse_giggle_tsv(
     return list(keys), list(values)
 
 
-def parse_score_file(score_path: Pathish) -> tuple[list[str], list[float]]:
+def parse_score_file(
+    score_path: Pathish, col: str = "fishers_right_tail"
+) -> tuple[list[str], list[float]]:
     # Auto-detect giggle TSV by presence of 'fishers_right_tail' in header
     with open(score_path) as f:
         first_line = f.readline()
     if "fishers_right_tail" in first_line:
-        return parse_giggle_tsv(score_path)
+        return parse_giggle_tsv(score_path, col=col)
 
     def parse() -> Iterator[tuple[str, float]]:
         with open(score_path) as f:
@@ -209,6 +211,11 @@ def parse_json_file(
         else next(v for v in data.values() if isinstance(v, list))
     )
 
+    # Filter out records where score_field is None (e.g. llr not computed)
+    records = [r for r in records if r.get(score_field) is not None]
+    if not records:
+        return [], []
+
     # Find the file-path-like field with the most unique values (skip score_field)
     first = records[0]
     path_fields = [
@@ -229,7 +236,7 @@ def parse_json_file(
         for r in records
     ]
 
-    # p_value-like fields: log
+    # p_value-like fields: -log transform so higher = more significant
     if "p_val" in score_field.lower() or "pval" in score_field.lower():
         pairs = [(a, -math.log(b) if b > 0 else float("inf")) for a, b in pairs]
 
@@ -245,7 +252,14 @@ def parse_input_file(
 ) -> tuple[list[str], list[float]]:
     if str(path).endswith(".json"):
         return parse_json_file(path, score_field)
-    return parse_score_file(path)
+    return parse_score_file(path, col=score_field)
+
+
+def _score_field_label(field: str) -> str:
+    if "p_val" in field.lower() or "pval" in field.lower():
+        return "−log p-value"
+    labels = {"combo_score": "Combo score", "llr": "LLR (NB saddlepoint)", "odds_ratio": "Odds ratio"}
+    return labels.get(field, field)
 
 
 # ==========================================
@@ -392,19 +406,22 @@ class _PlotData:
     data: np.ndarray
     ordered_cells: list[str]
     bed_to_category: dict[str, str]
+    cbar_label: str = "Score"
 
 
 def _prepare_plot_data(
     score_paths: tuple[Pathish, ...],
     names: tuple[str, ...],
     states: list[str] | None = None,
-    score_field: str = "p_value",
+    score_fields: list[str] | None = None,
 ) -> list[_PlotData]:
     col_labels = states if states is not None else chromatin_states
+    if score_fields is None:
+        score_fields = ["p_value"] * len(score_paths)
     result: list[_PlotData] = []
 
-    for path, name in zip(score_paths, names):
-        beds, scores = parse_input_file(path, score_field)
+    for path, name, sf in zip(score_paths, names, score_fields):
+        beds, scores = parse_input_file(path, sf)
         cell_types: set[str] = set()
         parsed_data: dict[tuple[str, str], float] = {}
 
@@ -437,6 +454,7 @@ def _prepare_plot_data(
                 data=data,
                 ordered_cells=ordered_cells,
                 bed_to_category=bed_to_category,
+                cbar_label=_score_field_label(sf),
             )
         )
 
@@ -449,13 +467,13 @@ def plot_rme_similarity(
     output_path: Pathish | None = None,
     show: bool = True,
     states: list[str] | None = None,
-    score_field: str = "p_value",
+    score_fields: list[str] | None = None,
 ) -> None:
     if len(score_paths) != len(names):
         raise ValueError("Must provide the same number of score paths and names.")
 
     plot_data_list = _prepare_plot_data(
-        score_paths, names, states=states, score_field=score_field
+        score_paths, names, states=states, score_fields=score_fields
     )
     if not plot_data_list:
         print("No valid data to plot.", file=sys.stderr)
@@ -486,6 +504,7 @@ def plot_rme_similarity(
             ),
             col_config=_AxisConfig(labels=col_labels),
             title=pd.name,
+            cbar_label=pd.cbar_label,
         ).plot(fig, axes[0, idx])
 
     if output_path:
@@ -524,10 +543,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--score-field",
-        default="p_value",
+        default=None,
         help=(
-            "Field name to use as the score when parsing JSON inputs (default: p_value). "
-            "Fields containing 'p_val' are automatically negated so lower p-value → higher score."
+            "Score field for all inputs (default: p_value for JSON, combo_score for TSV). "
+            "Fields containing 'p_val' are automatically −log-transformed."
+        ),
+    )
+    parser.add_argument(
+        "--score-fields",
+        nargs="+",
+        default=None,
+        help=(
+            "Per-input score fields (one per --scores entry). "
+            "Overrides --score-field. "
+            "For JSON: a key name (e.g. p_value, llr). "
+            "For giggle TSV: a column name (e.g. combo_score, fishers_right_tail)."
         ),
     )
     args = parser.parse_args()
@@ -536,13 +566,26 @@ def main() -> None:
         print("Error: --scores and --names must have the same count.", file=sys.stderr)
         sys.exit(1)
 
+    if args.score_fields is not None:
+        if len(args.score_fields) != len(args.scores):
+            print(
+                "Error: --score-fields must have the same count as --scores.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        score_fields = args.score_fields
+    elif args.score_field is not None:
+        score_fields = [args.score_field] * len(args.scores)
+    else:
+        score_fields = None  # _prepare_plot_data uses per-format defaults
+
     plot_rme_similarity(
         tuple(args.scores),
         tuple(args.names),
         output_path=args.output,
         show=not args.no_show,
         states=args.states,
-        score_field=args.score_field,
+        score_fields=score_fields,
     )
 
 

@@ -6,6 +6,17 @@
 
 GWAS_TRAITS = glob_wildcards("data/gwas/{trait}.bed").trait
 
+RME_HEAT_TARGETS = [
+    "data/plots/rme_heat_Rheumatoid_arthritis.png",
+    "data/plots/rme_heat_Alzheimers_combined.png",
+]
+
+
+rule rme_heat_all:
+    """Produce RME heatmaps for the default trait set."""
+    input:
+        RME_HEAT_TARGETS,
+
 
 rule scatter_bed_pvals:
     """Per-bed -log10(p) scatter for one trait: all pairwise tool comparisons."""
@@ -44,6 +55,70 @@ rule scatter_mc:
         " --giggle data/giggle"
         " --mc {MC_DIR}"
         " --mc-trials {params.mc_trials}"
+        " -o {output} --no-show"
+
+
+rule rme_heat:
+    """Side-by-side RME heatmap: chuckle (−log p-value) and giggle (combo score).
+
+    Tissue types on the vertical axis (grouped by cell category), chromatin
+    states on the horizontal axis.  Any GWAS trait with both chuckle and giggle
+    outputs is supported via the wildcard.
+
+    Example:
+        snakemake data/plots/rme_heat_Rheumatoid_arthritis.png
+        snakemake data/plots/rme_heat_Alzheimers_combined.png
+    """
+    input:
+        chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
+        giggle="data/giggle/{trait}.tsv",
+    output:
+        "data/plots/rme_heat_{trait}.png",
+    shell:
+        "uv run workflow/scripts/rme_heat.py"
+        " --scores {input.chuckle} {input.giggle}"
+        " --names 'Chuckle (p-value)' 'Giggle (combo score)'"
+        " --score-fields p_value combo_score"
+        " -o {output} --no-show"
+
+
+RME_HEAT_STATES = [
+    "Enhancers",
+    "Genic_enhancers",
+    "Flanking_Active_TSS",
+    "Bivalent_Enhancer",
+    "Repressed_PolyComb",
+    "Weak_Repressed_PolyComb",
+    "Flanking_Bivalent_TSS_Enh",
+    "Bivalent_Poised_TSS",
+    "Strong_transcription",
+    "ZNF_genes_and_repeats",
+]
+
+
+rule rme_heat_full:
+    """Four-panel RME heatmap: giggle p-value, giggle combo score,
+    chuckle p-value, chuckle LLR (NB saddlepoint).
+
+    Columns restricted to the enhancer-centric state subset in RME_HEAT_STATES.
+    Requires a chuckle JSON built with the current binary (llr field present).
+
+    Example:
+        snakemake data/plots/rme_heat_full_Rheumatoid_arthritis.png
+    """
+    input:
+        chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
+        giggle="data/giggle/{trait}.tsv",
+    output:
+        "data/plots/rme_heat_full_{trait}.png",
+    params:
+        states=" ".join(RME_HEAT_STATES),
+    shell:
+        "uv run workflow/scripts/rme_heat.py"
+        " --scores {input.giggle} {input.giggle} {input.chuckle} {input.chuckle}"
+        " --names 'Giggle (p-value)' 'Giggle (combo score)' 'Chuckle (p-value)' 'Chuckle (LLR)'"
+        " --score-fields fishers_right_tail combo_score p_value llr"
+        " --states {params.states}"
         " -o {output} --no-show"
 
 
