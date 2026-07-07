@@ -9,5 +9,7 @@ dependencies = [
     "ncls>=0.0.70",
     "numpy>=2.4.4",
     "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "tqdm>=4.68.4",
     "xlrd>=1.2,<2",
 ]
