@@ -9,6 +9,7 @@ GWAS_TRAITS = glob_wildcards("data/gwas/{trait}.bed").trait
 RME_HEAT_TARGETS = [
     "data/plots/rme_heat_Rheumatoid_arthritis.png",
     "data/plots/rme_heat_Alzheimers_combined.png",
+    "data/plots/rme_heat_myod_myotube.png",
 ]
 
 
@@ -58,6 +59,25 @@ rule scatter_mc:
         " -o {output} --no-show"
 
 
+# INFO: ------------------------
+# 			  RME Heatmaps
+# ------------------------------
+
+
+RME_HEAT_STATES = [
+    "Enhancers",
+    "Genic_enhancers",
+    "Flanking_Active_TSS",
+    "Bivalent_Enhancer",
+    "Repressed_PolyComb",
+    "Weak_Repressed_PolyComb",
+    "Flanking_Bivalent_TSS_Enh",
+    "Bivalent_Poised_TSS",
+    "Strong_transcription",
+    "ZNF_genes_and_repeats",
+]
+
+
 rule rme_heat:
     """Side-by-side RME heatmap: chuckle (−log p-value) and giggle (combo score).
 
@@ -74,26 +94,15 @@ rule rme_heat:
         giggle="data/giggle/{trait}.tsv",
     output:
         "data/plots/rme_heat_{trait}.png",
+    params:
+        states=" ".join(RME_HEAT_STATES),
     shell:
         "uv run workflow/scripts/rme_heat.py"
         " --scores {input.chuckle} {input.giggle}"
-        " --names 'Chuckle (p-value)' 'Giggle (combo score)'"
-        " --score-fields p_value combo_score"
+        " --names 'Chuckle (LLR)' 'Giggle (combo score)'"
+        " --score-fields llr combo_score"
+        " --states {params.states}"
         " -o {output} --no-show"
-
-
-RME_HEAT_STATES = [
-    "Enhancers",
-    "Genic_enhancers",
-    "Flanking_Active_TSS",
-    "Bivalent_Enhancer",
-    "Repressed_PolyComb",
-    "Weak_Repressed_PolyComb",
-    "Flanking_Bivalent_TSS_Enh",
-    "Bivalent_Poised_TSS",
-    "Strong_transcription",
-    "ZNF_genes_and_repeats",
-]
 
 
 rule rme_heat_full:

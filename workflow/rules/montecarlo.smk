@@ -36,10 +36,10 @@ rule montecarlo_query:
     chuckle's null model.
     """
     input:
-        query="data/gwas/{trait}.bed",
+        query="data/queries/{trait}.bed",
         bin=MC_BIN,
         index=CHUCKLE_INDEX,
-        whitelist=f"{RME_DIR}/whitelist.bed",
+        whitelist=ancient(f"{RME_DIR}/whitelist.bed"),
     output:
         f"{MC_DIR}/{{trait}}.tsv",
     params:

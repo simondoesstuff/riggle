@@ -22,7 +22,7 @@ def _bits_all_beds(wildcards):
 rule bits_sweep:
     """BITS Monte Carlo sweep: one GWAS trait × all RME beds → TSV."""
     input:
-        query="data/gwas/{trait}.bed",
+        query="data/queries/{trait}.bed",
         beds=_bits_all_beds,
         universe=f"{RME_DIR}/whitelist.bed",
     output:

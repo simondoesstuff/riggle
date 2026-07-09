@@ -46,10 +46,10 @@ rule chuckle_index:
 rule chuckle_query:
     """Query chuckle RME index for one GWAS trait → JSON with per-bed p-values."""
     input:
-        query="data/gwas/{trait}.bed",
+        query="data/queries/{trait}.bed",
         bin=CHUCKLE_BIN,
         index=CHUCKLE_INDEX,
-        whitelist=f"{RME_DIR}/whitelist.bed",
+        whitelist=ancient(f"{RME_DIR}/whitelist.bed"),
     output:
         f"{CHUCKLE_DIR}/{{trait}}.json",
     resources:

@@ -3,7 +3,7 @@
 # Source: Sarthy et al., Seattle Children's Research Institute.
 #   Part of series GSE50413 / GSE50415.
 #   Cell line: MB135 (primary human myoblasts) differentiated into myotubes
-#   by serum withdrawal (1% horse serum + insulin + transferrin, 5 days).
+#   by serum withdrawal (1% horse serum + insulin + transferring, 5 days).
 #   Antibody: MyoD (ChIP-Seq).
 #
 # Reads were aligned to hg19 with BWA 0.5.9; peaks called with an in-house

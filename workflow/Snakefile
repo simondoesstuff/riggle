@@ -22,8 +22,31 @@
 #   snakemake bench_all
 #   snakemake data/plots/bench_index.png
 
+# Registry for non-GWAS query BED files.  Rule files add entries like:
+#   QUERY_BEDS["myod_myotube"] = "data/myod_myotube/peaks.bed.gz"
+# GWAS traits fall back to data/gwas/{trait}.bed automatically.
+QUERY_BEDS: dict[str, str] = {}
+
+
+def _get_query_source(wildcards):
+    return QUERY_BEDS.get(wildcards.trait, f"data/gwas/{wildcards.trait}.bed")
+
+
+rule stage_query:
+    """Normalize any query BED (plain or bgzipped) to data/queries/{trait}.bed.
+    Downstream rules (chuckle, giggle, bits) all pull from this canonical path.
+    """
+    input:
+        _get_query_source,
+    output:
+        "data/queries/{trait}.bed",
+    shell:
+        "zcat -f {input} > {output}"
+
+
 include: "rules/gwas.smk"
 include: "rules/roadmap_epigenomics.smk"
+include: "rules/myod_myotube.smk"
 include: "rules/bits.smk"
 include: "rules/giggle.smk"
 include: "rules/chuckle.smk"

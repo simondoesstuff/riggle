@@ -39,7 +39,7 @@ rule giggle_index:
 rule giggle_bgzip_query:
     """Bgzip a GWAS query BED so giggle can read it."""
     input:
-        "data/gwas/{trait}.bed",
+        "data/queries/{trait}.bed",
     output:
         temp(f"{GIGGLE_DIR}/queries/{{trait}}.bed.gz"),
     shell:
