@@ -13,9 +13,13 @@ use crate::io::layer::LayerError;
 /// which equals the index of the first interval with `start >= t * tile_size`.
 ///
 /// Entries are `u64` to support layer sizes beyond the u32 range.
+/// Layout: flat little-endian `u64[]`, 8 bytes per entry, 8 entries per cache
+/// line.  Sorted query batches access it sequentially, so the OS read-ahead
+/// triggered by `MADV_SEQUENTIAL` keeps the working set warm.
 pub struct MappedJumpTable {
     mmap: Mmap,
     pub tile_size: u32,
+    num_tiles: usize,
 }
 
 impl MappedJumpTable {
@@ -27,7 +31,11 @@ impl MappedJumpTable {
             return Err(LayerError::InvalidIndexSize(size));
         }
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { mmap, tile_size })
+        // Queries arrive sorted, so accesses are roughly sequential.
+        // MADV_SEQUENTIAL increases OS read-ahead to keep pages warm.
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let num_tiles = (size / 8) as usize;
+        Ok(Self { mmap, tile_size, num_tiles })
     }
 
     /// Look up the approximate first interval index for a target coordinate.
@@ -36,9 +44,8 @@ impl MappedJumpTable {
     /// the true position have `start < target`, so the caller must scan forward.
     #[inline]
     pub fn lookup(&self, target: u32) -> usize {
-        let num_tiles = self.mmap.len() / 8;
         let tile_idx = (target / self.tile_size) as usize;
-        let effective_idx = tile_idx.min(num_tiles - 1);
+        let effective_idx = tile_idx.min(self.num_tiles - 1);
         let off = effective_idx * 8;
         u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap()) as usize
     }
