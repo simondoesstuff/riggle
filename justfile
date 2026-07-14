@@ -1,5 +1,5 @@
 run *args='-h':
-	cargo run --release --bin riggle -- {{args}}
+	cargo run --release --bin chuckle -- {{args}}
 
 stress *args='-h':
 	cargo run --release --bin stress -- {{args}}

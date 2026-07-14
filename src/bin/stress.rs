@@ -11,14 +11,14 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use tempfile::TempDir;
 
-use riggle::bench::{
+use chuckle::bench::{
     BedGenConfig, TimingResult, analyze_index_size, generate_bed_file, generate_bed_files_parallel,
 };
-use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
+use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "stress")]
-#[command(about = "Stress test Riggle at scale")]
+#[command(about = "Stress test Chuckle at scale")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -330,7 +330,7 @@ fn run_full_suite(scale: usize) {
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!(
-        "║           RIGGLE STRESS TEST SUITE - {}M SCALE             ║",
+        "║           CHUCKLE STRESS TEST SUITE - {}M SCALE            ║",
         scale
     );
     println!("╚══════════════════════════════════════════════════════════════╝");

@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use riggle::io::Meta;
-use riggle::stats::{StatResult, StatsOutput};
-use riggle::fourier::DEFAULT_VARIANCE_THRESHOLD;
-use riggle::fourier::FilterMode;
-use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
+use chuckle::io::Meta;
+use chuckle::stats::{StatResult, StatsOutput};
+use chuckle::fourier::DEFAULT_VARIANCE_THRESHOLD;
+use chuckle::fourier::FilterMode;
+use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
-#[command(name = "riggle")]
+#[command(name = "chuckle")]
 #[command(about = "Statistical interval intersection engine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -48,7 +48,7 @@ enum Commands {
         output: PathBuf,
 
         /// Compute FFT-based p-values for all overlapping pairs.
-        /// Requires that the database was built with this version of riggle
+        /// Requires that the database was built with this version of chuckle
         /// (Fourier spectra must be cached under {db}/fourier/).
         #[arg(long)]
         stats: bool,

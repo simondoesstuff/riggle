@@ -25,14 +25,14 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tempfile::TempDir;
 
-use riggle::fourier::{BedMap, hg38_chrom_sizes, parse_bed_as_map};
-use riggle::tasks::{QueryConfig, query_database};
+use chuckle::fourier::{BedMap, hg38_chrom_sizes, parse_bed_as_map};
+use chuckle::tasks::{QueryConfig, query_database};
 
 #[derive(Parser)]
 #[command(name = "montecarlo")]
 #[command(about = "Monte Carlo shift permutation p-value for interval overlap")]
 struct Cli {
-    /// Path to the riggle database directory
+    /// Path to the chuckle database directory
     #[arg(short, long)]
     db: PathBuf,
 

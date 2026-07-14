@@ -228,6 +228,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chuckle"
+version = "0.1.0"
+dependencies = [
+ "bitvec",
+ "clap",
+ "criterion",
+ "faer",
+ "flate2",
+ "indicatif",
+ "memmap2",
+ "rand",
+ "rayon",
+ "realfft",
+ "rend 0.4.2",
+ "rkyv",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "sprs",
+ "tempfile",
+ "thiserror 2.0.18",
+ "voracious_radix_sort",
+ "wide",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,32 +1518,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cadadef317c2f20755a64d7fdc48f9e7178ee6b0e1f7fce33fa60f1d68a276e6"
 dependencies = [
  "bytecheck 0.8.2",
-]
-
-[[package]]
-name = "riggle"
-version = "0.1.0"
-dependencies = [
- "bitvec",
- "clap",
- "criterion",
- "faer",
- "flate2",
- "indicatif",
- "memmap2",
- "rand",
- "rayon",
- "realfft",
- "rend 0.4.2",
- "rkyv",
- "rustfft",
- "serde",
- "serde_json",
- "sprs",
- "tempfile",
- "thiserror 2.0.18",
- "voracious_radix_sort",
- "wide",
 ]
 
 [[package]]

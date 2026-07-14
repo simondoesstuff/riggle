@@ -1,14 +1,14 @@
-## Riggle Technical Specification: Ingestion & Indexing Algorithms
+## Chuckle Technical Specification: Ingestion & Indexing Algorithms
 
 ## 1. Unified Interval Ingestion Pipeline
 
-Both the indexing and query pipelines must resolve raw input files into a structured, layer-partitioned memory layout before further processing. To guarantee consistency and maximize code reuse, Riggle utilizes a unified ingestion routine for all incoming interval data.
+Both the indexing and query pipelines must resolve raw input files into a structured, layer-partitioned memory layout before further processing. To guarantee consistency and maximize code reuse, Chuckle utilizes a unified ingestion routine for all incoming interval data.
 
 Before processing begins, the entrypoint parses the global `meta.json` to load the layer configuration (specifically `min_size` and `growth_factor`), which dictates how intervals will be spatially partitioned.
 
 ### The Ingestion Flow
 
-1.  **Parallel Flat-Mapping:** A batch of input files (TSVs) is read and parsed in parallel. Every valid record is transformed into the universal Riggle primitive: `(start, end, sid)`. The parser pairs each interval with its corresponding `shardName` (e.g., chromosome or coordinate space identifier).
+1.  **Parallel Flat-Mapping:** A batch of input files (TSVs) is read and parsed in parallel. Every valid record is transformed into the universal Chuckle primitive: `(start, end, sid)`. The parser pairs each interval with its corresponding `shardName` (e.g., chromosome or coordinate space identifier).
 2.  **Layer Assignment:** Using the parsed layer configuration, each interval's size (`end - start`) is evaluated to determine its target `layerID`.
 3.  **Partitioning & Grouping:** The engine groups the flat-mapped intervals by their target destination.
 4.  **The Output:** The pipeline yields a mapping for the entire batch:
@@ -18,9 +18,9 @@ Before processing begins, the entrypoint parses the global `meta.json` to load t
 
 ## 2. Parallel Sort-Merge Strategy
 
-Riggle requires strictly sorted intervals to function efficiently. Before the mapped data can be merged into the index or traversed during a query, the vectors within the `{ (shard, layerID) -> vec<Interval> }` map must be sorted by their `start` coordinate.
+Chuckle requires strictly sorted intervals to function efficiently. Before the mapped data can be merged into the index or traversed during a query, the vectors within the `{ (shard, layerID) -> vec<Interval> }` map must be sorted by their `start` coordinate.
 
-To achieve maximum throughput, Riggle employs a nested parallel sort-merge strategy:
+To achieve maximum throughput, Chuckle employs a nested parallel sort-merge strategy:
 
 - **Outer Parallelism:** The engine parallelizes across the map entries (the distinct `(shard, layerID)` pairs) using nested `iter_par()` calls.
 - **Inner Parallelism (Voracious Radix):** Within each vector, chunks are sorted utilizing **`voracious_radix_sort`**. This provides a significant performance boost over standard comparison sorts for flat coordinate data, rapidly ordering the `(start, end, sid)` tuples.
@@ -46,7 +46,7 @@ To solve this, the Index Writer thread uses an in-place **Extend & Reverse-Shift
 ### Step-by-Step Merge Process
 
 1.  **Memmap Extension:** The existing memory-mapped file for the target `(shard, layerID)` is extended on disk to accommodate the exact byte size of the incoming `sorted_ivs`. The new space at the end of the file is initially zero-filled.
-2.  **Chunked Reading:** Instead of loading the whole file, Riggle reads the existing data in discrete, memory-safe chunks.
+2.  **Chunked Reading:** Instead of loading the whole file, Chuckle reads the existing data in discrete, memory-safe chunks.
 3.  **Reverse Merge & Overwrite (Down-Shift):** To prevent overwriting unread existing data, the merge is executed from **bottom-to-top** (end-to-start).
     - The engine simultaneously iterates the layer memmap and `sorted_ivs` in reverse order.
     - Using the merge routine (as used in merge sort), a sorted intermediate buffer is accumulated.

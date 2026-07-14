@@ -1,4 +1,4 @@
-//! Benchmarks for Riggle build and query pipelines
+//! Benchmarks for Chuckle build and query pipelines
 //!
 //! Run with: cargo bench
 //! Results saved to target/criterion/
@@ -9,10 +9,10 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
 
-use riggle::bench::{
+use chuckle::bench::{
     BedGenConfig, analyze_index_size, generate_bed_file, generate_bed_files_parallel,
 };
-use riggle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
+use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 /// Benchmark database building at various scales
 fn bench_build(c: &mut Criterion) {

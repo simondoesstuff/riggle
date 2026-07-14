@@ -1,8 +1,8 @@
-## Riggle Technical Specification: Query Architecture
+## Chuckle Technical Specification: Query Architecture
 
 ### System Architecture Overview
 
-Riggle's query engine computes dense intersection statistics across entire sets without allocating intermediate overlapping intervals. It leverages massive bounded exponential layer memmaps for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, a bitset-accelerated sparse accumulator for zero-allocation scaling, and a binary-search fast-forward heuristic to aggressively bypass dead space.
+Chuckle's query engine computes dense intersection statistics across entire sets without allocating intermediate overlapping intervals. It leverages massive bounded exponential layer memmaps for optimal disk I/O, a single-pass dual-active-set sweep for cache efficiency, a bitset-accelerated sparse accumulator for zero-allocation scaling, and a binary-search fast-forward heuristic to aggressively bypass dead space.
 
 ---
 

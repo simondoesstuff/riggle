@@ -16,7 +16,7 @@ use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use rayon::prelude::*;
-use riggle::bench::nat_cmp;
+use chuckle::bench::nat_cmp;
 use voracious_radix_sort::{RadixSort, Radixable};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ fn is_header(line: &str) -> bool {
 }
 
 /// Extract (chrom, start, end) from a BED line using the same flexible column
-/// detection as the rest of riggle: first non-integer column → chrom, first two
+/// detection as the rest of chuckle: first non-integer column → chrom, first two
 /// integer columns → (start, end).
 ///
 /// Returns `None` for empty, header, or unparsable lines.

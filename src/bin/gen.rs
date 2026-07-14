@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use riggle::bench::{BedGenConfig, TimingResult, generate_bed_file, generate_bed_files_parallel};
+use chuckle::bench::{BedGenConfig, TimingResult, generate_bed_file, generate_bed_files_parallel};
 
 /// CLI tool for generating synthetic BED files for benchmarks and stress tests
 #[derive(Parser, Debug)]

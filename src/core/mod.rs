@@ -1,6 +1,6 @@
 use voracious_radix_sort::Radixable;
 
-/// The universal interval primitive used everywhere in Riggle.
+/// The universal interval primitive used everywhere in Chuckle.
 ///
 /// At index time, `sid` is the Database SID (D_SID) identifying the source file.
 /// At query time, `sid` is the Query SID (Q_SID) identifying the query file.

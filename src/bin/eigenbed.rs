@@ -23,8 +23,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sprs::TriMat;
 
-use riggle::bench::nat_cmp;
-use riggle::io::{BedParseError, parse_bed_file};
+use chuckle::bench::nat_cmp;
+use chuckle::io::{BedParseError, parse_bed_file};
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -215,7 +215,7 @@ fn cmd_index(
     pb_parse.set_message("parsing BED files");
 
     // Parse every BED file in parallel; retain the file-index→intervals mapping.
-    let parsed: Vec<(usize, HashMap<String, Vec<riggle::core::Interval>>)> = beds
+    let parsed: Vec<(usize, HashMap<String, Vec<chuckle::core::Interval>>)> = beds
         .par_iter()
         .enumerate()
         .map(|(sid, path)| {

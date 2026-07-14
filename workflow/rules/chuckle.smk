@@ -12,7 +12,7 @@ import os
 
 CHUCKLE_DIR = "data/chuckle"
 CHUCKLE_INDEX = "data/rme_chuckle"
-CHUCKLE_BIN = "target/release/riggle"  # binary name unchanged from Rust crate
+CHUCKLE_BIN = "target/release/chuckle"
 
 
 rule chuckle_build:
@@ -23,7 +23,7 @@ rule chuckle_build:
     output:
         CHUCKLE_BIN,
     shell:
-        "cargo build --release --bin riggle"
+        "cargo build --release --bin chuckle"
 
 
 rule chuckle_index:

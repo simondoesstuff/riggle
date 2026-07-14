@@ -1,12 +1,12 @@
-## Riggle Technical Specification: System Overview
+## Chuckle Technical Specification: System Overview
 
 ## 1. Core Paradigm
 
-Riggle is a domain-agnostic, statistical interval intersection engine focused strictly on **set-level analysis**. While capable of handling genomic data, Riggle is generalized for any 1D coordinate system. It prioritizes memory-bandwidth and zero-copy access to rapidly compute intersection counts across sets, powering downstream statistical analysis. Riggle is not concerned with returning individual overlapping intervals or calculating internal interval densities.
+Chuckle is a domain-agnostic, statistical interval intersection engine focused strictly on **set-level analysis**. While capable of handling genomic data, Chuckle is generalized for any 1D coordinate system. It prioritizes memory-bandwidth and zero-copy access to rapidly compute intersection counts across sets, powering downstream statistical analysis. Chuckle is not concerned with returning individual overlapping intervals or calculating internal interval densities.
 
 ### The Universal Primitive
 
-Everywhere in the Riggle codebase, an interval is universally represented as a simple, flat tuple: **`(start, end, sid)`**.
+Everywhere in the Chuckle codebase, an interval is universally represented as a simple, flat tuple: **`(start, end, sid)`**.
 
 The meaning of the SetID (`sid`) depends entirely on the operational context:
 
@@ -55,7 +55,7 @@ The indexer processes a batch of interval TSV files into the memmap structure th
 
 Queries operate strictly at the set level to generate the final statistical matrix:
 
-1.  **Batch Preparation (Flatten & Tag):** A batch of query interval files is ingested and flattened. Each query interval is tagged with its originating **Query SID**, forming the standard `(start, end, sid)` tuple. This uniform structure allows Riggle to execute raw interval mathematics at maximum speed while preserving the mapping necessary to accumulate set-level statistics.
+1.  **Batch Preparation (Flatten & Tag):** A batch of query interval files is ingested and flattened. Each query interval is tagged with its originating **Query SID**, forming the standard `(start, end, sid)` tuple. This uniform structure allows Chuckle to execute raw interval mathematics at maximum speed while preserving the mapping necessary to accumulate set-level statistics.
 2.  **Parallel Map-Reduce:**
     - **Map:** The `(start, end, sid)` query intervals are dispatched in parallel across the relevant shards and layer memmaps to compute raw intersection counts.
     - **Reduce:** Results are aggregated across the engine.

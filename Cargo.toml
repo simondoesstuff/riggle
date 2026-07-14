@@ -1,5 +1,5 @@
 [package]
-name = "riggle"
+name = "chuckle"
 version = "0.1.0"
 edition = "2024"
 
@@ -28,5 +28,5 @@ rend = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "riggle_bench"
+name = "chuckle_bench"
 harness = false

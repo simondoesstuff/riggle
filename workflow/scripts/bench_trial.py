@@ -1,6 +1,6 @@
 """At-scale benchmark trial — Snakemake script: protocol.
 
-Times index build, query, and measures index size for Riggle, IGD, and Giggle
+Times index build, query, and measures index size for Chuckle, IGD, and Giggle
 on a single (src_files, src_records, qry_records) configuration.  Writes a
 structured JSON to snakemake.output[0] so results can be aggregated and plotted
 without parsing terminal text.
@@ -81,10 +81,10 @@ try:
 
     # --- Chuckle ---
     print("Chuckle: building index...")
-    idx = os.path.join(work, "riggle_idx")
+    idx = os.path.join(work, "chuckle_idx")
     idx_s, idx_to, idx_fail = run_timed(
         [
-            "cargo", "run", "--release", "--bin", "riggle", "--",
+            "cargo", "run", "--release", "--bin", "chuckle", "--",
             "add", "-i", src_dir, "-d", idx, "--batch-size", str(batch_size),
         ],
         timeout,
@@ -94,7 +94,7 @@ try:
         print("Chuckle: querying...")
         qry_s, qry_to, _ = run_timed(
             [
-                "cargo", "run", "--release", "--bin", "riggle", "--",
+                "cargo", "run", "--release", "--bin", "chuckle", "--",
                 "query", "-d", idx, "-q", qry_file, "-o", "/dev/null",
                 "--batch-size", str(batch_size),
             ],
