@@ -3,11 +3,16 @@
 # Downloads Supplementary Table 1 as XLS, splits into per-trait hg19 BED files,
 # then liftovers each to hg38.  Final artifacts: data/gwas/{trait}.bed
 #
+# Disease→tissue mapping (Disease Ontology):
+#   snakemake data/gwas/disease_tissue.json
+#
 # Regenerate all GWAS beds:
 #   snakemake gwas_all
 
 GWAS_DIR = "data/gwas"
 GWAS_RAW = f"{GWAS_DIR}/raw"
+DOID_DIR = "data/doid"
+DOID_OBO_URL = "https://raw.githubusercontent.com/DiseaseOntology/HumanDiseaseOntology/main/src/ontology/doid.obo"
 GWAS_XLS_URL = (
     "https://www.nature.com/nature/journal/v518/n7539/extref/nature13835-s1.xls"
 )
@@ -68,3 +73,25 @@ rule gwas_all:
     """Build all hg38 GWAS trait BED files."""
     input:
         _all_gwas_beds,
+
+
+rule gwas_download_doid:
+    """Download Disease Ontology OBO (stored outside data/gwas)."""
+    output:
+        f"{DOID_DIR}/doid.obo",
+    params:
+        url=DOID_OBO_URL,
+    shell:
+        "mkdir -p {DOID_DIR} && wget -q --show-progress '{params.url}' -O {output}"
+
+
+rule gwas_disease_tissue:
+    """Map each GWAS trait to macro tissue categories via DOID is_a hierarchy."""
+    input:
+        doid=f"{DOID_DIR}/doid.obo",
+        hg19_dir=f"{GWAS_DIR}/hg19",
+    output:
+        f"{GWAS_DIR}/disease_tissue.json",
+    shell:
+        "uv run workflow/scripts/gwas_disease_tissue.py {input.doid} {input.hg19_dir} {output}"
+
