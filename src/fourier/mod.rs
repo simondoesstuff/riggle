@@ -162,6 +162,10 @@ pub struct ChromDbSpec {
     pub v: f64,
     /// G_B[k] for k = 0..m (coverage spectrum, truncated to m frequencies).
     pub spec: Vec<Complex<f32>>,
+    /// Mean coverage per bin (over n_bins, after masking).
+    pub cov_mean: f64,
+    /// Variance of coverage per bin (over n_bins, after masking).
+    pub cov_var: f64,
 }
 
 /// Sparse Dirac impulse train (derivative coverage) for one chromosome.
@@ -274,44 +278,82 @@ pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) 
                     None => return None, // chromosome excluded by filter
                 },
             };
-            let spec = chrom_coverage_spectrum(cdm, mask);
+            let (spec, cov_mean, cov_var) = chrom_coverage_spectrum(cdm, mask);
             Some(ChromDbSpec {
                 chrom: cdm.chrom.clone(),
                 n: cdm.n(),
                 n_bins: cdm.n_bins,
                 v: cdm.v(),
                 spec,
+                cov_mean,
+                cov_var,
             })
         })
         .collect()
 }
 
-/// Fit a Negative Binomial to `samples` via method of moments and return the
-/// saddlepoint log-likelihood ratio at `x_obs`.
+/// Analytic LLR for overlap enrichment using cumulant addition.
 ///
-/// The tilted NB has its mean shifted to `x_obs`; the LLR is the rate function
-/// I(x_obs) = x_obs · log(x_obs/μ) + (x_obs + r) · log((r + μ)/(r + x_obs)).
+/// Under the NB null, the overlap distribution has moments derived from the
+/// per-bin coverage moments of the two signals (summed across shared chromosomes):
+///   μ = μ_Q + μ_R,  σ² = σ²_Q + σ²_R
 ///
-/// Returns `None` when NB fitting is not feasible (μ ≤ 0, variance ≤ mean,
-/// or the observation is out of the valid domain).
-fn nb_llr(samples: &[Complex<f32>], x_obs: f32) -> Option<f64> {
-    let n = samples.len() as f64;
-    let mu: f64 = samples.iter().map(|c| c.re as f64).sum::<f64>() / n;
-    if mu <= 0.0 {
+/// NB parameters:  p = μ/σ²,  r = μ²/(σ²−μ)
+///
+/// The exponentially tilted NB with mean equal to the observation `o` keeps
+/// the same dispersion `r` but shifts the success probability to:
+///   p_o = r / (r + o)
+///
+/// The LLR is then:
+///   LLR(o) = o·θ + r·ln(p_o/p)   where  θ = ln((1−p_o)/(1−p))
+///
+/// Returns `None` when the NB fit is not feasible (μ ≤ 0, σ² ≤ μ, or
+/// probabilities outside (0,1)).
+fn analytic_nb_llr(
+    q_spectra: &[ChromDbSpec],
+    db_spectra: &[ChromDbSpec],
+    observed: f64,
+) -> Option<f64> {
+    let mut mu_q = 0.0f64;
+    let mut var_q = 0.0f64;
+    let mut mu_r = 0.0f64;
+    let mut var_r = 0.0f64;
+    let mut any_shared = false;
+
+    for db_cs in db_spectra {
+        let q_cs = match q_spectra.iter().find(|s| s.chrom == db_cs.chrom) {
+            Some(s) => s,
+            None => continue,
+        };
+        let n = q_cs.n_bins.min(db_cs.n_bins) as f64;
+        mu_q  += q_cs.cov_mean  * n;
+        var_q += q_cs.cov_var   * n;
+        mu_r  += db_cs.cov_mean * n;
+        var_r += db_cs.cov_var  * n;
+        any_shared = true;
+    }
+
+    if !any_shared {
         return None;
     }
-    let var: f64 = samples.iter().map(|c| (c.re as f64 - mu).powi(2)).sum::<f64>() / n;
-    if var <= mu {
+
+    let mu  = mu_q  + mu_r;
+    let var = var_q + var_r;
+
+    if mu <= 0.0 || var <= mu {
         return None;
     }
-    let r = mu * mu / (var - mu);
-    let x = x_obs as f64;
-    if x + r <= 0.0 {
+
+    let r   = mu * mu / (var - mu);
+    let p   = mu / var;
+    let p_o = r / (r + observed);
+
+    if !(0.0 < p && p < 1.0 && 0.0 < p_o && p_o < 1.0) {
         return None;
     }
-    let term1 = if x <= 0.0 { 0.0 } else { x * (x / mu).ln() };
-    let term2 = (x + r) * ((r + mu) / (r + x)).ln();
-    Some(term1 + term2)
+
+    let theta = ((1.0 - p_o) / (1.0 - p)).ln();
+    Some(observed * theta + r * (p_o / p).ln())
 }
 
 /// Compute the right-tailed p-value for a (query, DB) pair given pre-built
@@ -408,7 +450,7 @@ pub fn compute_pvalue_cached(
     let obs_ref = c_total[0].re;
     let count_geq = c_total.iter().filter(|x| x.re >= obs_ref).count();
     let p_value = count_geq as f64 / m as f64;
-    let llr = nb_llr(&c_total, obs_ref);
+    let llr = analytic_nb_llr(q_spectra, db_spectra, observed);
 
     Some((observed, p_value, llr))
 }
@@ -490,14 +532,15 @@ fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>)
 
 /// Build a real-valued coverage array of length `n = cdm.n()` via prefix sum
 /// of the impulse train, optionally mask it, then forward-FFT it with
-/// `realfft`, returning all n/2+1 complex coefficients.
+/// `realfft`, returning all n/2+1 complex coefficients plus the mean and
+/// variance of coverage over the `n_bins` real bins (after masking).
 ///
 /// When `mask` is `Some(m)`, bins whose entry in `m` is `false` are zeroed
 /// after the prefix sum but before the FFT.  Bins beyond `m.len()` are already
 /// zero-padded by `make_input_vec`.
 ///
 /// Cost: O(N) build + O(N) mask application + O(N log N) FFT.
-fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> Vec<Complex<f32>> {
+fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> (Vec<Complex<f32>>, f64, f64) {
     let n = cdm.n();
 
     let fft = REAL_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
@@ -539,10 +582,20 @@ fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> Vec<Co
         // Bins beyond mask.len() are already 0.0 (zero-padded by make_input_vec).
     }
 
+    // Compute mean and variance over the real (non-padded) bins.
+    let nb = cdm.n_bins as f64;
+    let sum: f64 = indata[..cdm.n_bins].iter().map(|&x| x as f64).sum();
+    let mean = sum / nb;
+    let var: f64 = indata[..cdm.n_bins]
+        .iter()
+        .map(|&x| { let d = x as f64 - mean; d * d })
+        .sum::<f64>()
+        / nb;
+
     let mut spectrum = fft.make_output_vec(); // complex, length n/2+1
     fft.process(&mut indata, &mut spectrum).unwrap();
 
-    spectrum
+    (spectrum, mean, var)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -669,40 +722,54 @@ mod tests {
         assert!((pv_cached - pv_direct).abs() < 0.05, "pv mismatch");
     }
 
-    #[test]
-    fn test_nb_llr_zero_at_mean() {
-        // LLR should be exactly 0 when observation equals the null mean.
-        // Construct samples with mean=4 and variance=8 (r=2, p=0.5).
-        let samples: Vec<Complex<f32>> = (0..1000)
-            .map(|i| Complex::new(if i % 2 == 0 { 8.0f32 } else { 0.0f32 }, 0.0))
-            .collect();
-        let x_obs = 4.0f32; // equals the mean
-        let llr = nb_llr(&samples, x_obs).unwrap();
-        assert!(llr.abs() < 1e-3, "LLR at mean should be ~0, got {llr}");
+    /// Build minimal ChromDbSpec stubs for testing analytic_nb_llr.
+    fn make_spec(chrom: &str, n_bins: usize, cov_mean: f64, cov_var: f64) -> ChromDbSpec {
+        ChromDbSpec {
+            chrom: chrom.to_string(),
+            n: n_bins.next_power_of_two(),
+            n_bins,
+            v: 0.0,
+            spec: vec![],
+            cov_mean,
+            cov_var,
+        }
     }
 
     #[test]
-    fn test_nb_llr_increases_with_enrichment() {
-        // LLR should increase as x_obs grows beyond the mean.
-        let samples: Vec<Complex<f32>> = (0..1000)
-            .map(|i| Complex::new(if i % 2 == 0 { 8.0f32 } else { 0.0f32 }, 0.0))
-            .collect();
-        let llr_at_mean = nb_llr(&samples, 4.0).unwrap();
-        let llr_enriched = nb_llr(&samples, 20.0).unwrap();
-        assert!(
-            llr_enriched > llr_at_mean,
-            "LLR should increase with enrichment: {llr_at_mean} vs {llr_enriched}"
-        );
-        assert!(llr_enriched > 0.0, "LLR should be positive for enrichment");
+    fn test_analytic_nb_llr_zero_at_null_mean() {
+        // When o = μ_Q + μ_R, the tilted distribution is the null → LLR ≈ 0.
+        // μ_Q = 2.0 * 1000 = 2000, σ²_Q = 4.0 * 1000 = 4000
+        // μ_R = 2.0 * 1000 = 2000, σ²_R = 4.0 * 1000 = 4000
+        // μ = 4000, σ² = 8000 → p = 0.5, r = 2000, observed = 4000
+        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
+        let r = vec![make_spec("chr1", 1000, 2.0, 4.0)];
+        let mu = 4000.0; // observed = null mean
+        let llr = analytic_nb_llr(&q, &r, mu).unwrap();
+        assert!(llr.abs() < 1e-6, "LLR at null mean should be 0, got {llr}");
     }
 
     #[test]
-    fn test_nb_llr_none_for_underdispersed() {
-        // Samples with variance < mean → NB not applicable.
-        let samples: Vec<Complex<f32>> = (0..100)
-            .map(|_| Complex::new(5.0f32, 0.0))
-            .collect();
-        assert!(nb_llr(&samples, 6.0).is_none());
+    fn test_analytic_nb_llr_positive_for_enrichment() {
+        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
+        let r = vec![make_spec("chr1", 1000, 2.0, 4.0)];
+        let mu = 4000.0;
+        let llr_enriched = analytic_nb_llr(&q, &r, mu * 5.0).unwrap();
+        assert!(llr_enriched > 0.0, "LLR above null mean should be positive, got {llr_enriched}");
+    }
+
+    #[test]
+    fn test_analytic_nb_llr_none_underdispersed() {
+        // var ≤ mu → NB not applicable.
+        let q = vec![make_spec("chr1", 1000, 2.0, 1.0)]; // var=1000 < mu=2000
+        let r = vec![make_spec("chr1", 1000, 0.0, 0.0)];
+        assert!(analytic_nb_llr(&q, &r, 1.0).is_none());
+    }
+
+    #[test]
+    fn test_analytic_nb_llr_none_no_shared_chrom() {
+        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
+        let r = vec![make_spec("chr2", 1000, 2.0, 4.0)];
+        assert!(analytic_nb_llr(&q, &r, 1.0).is_none());
     }
 
     /// Verify fractional spike distribution for a sub-bin interval.
