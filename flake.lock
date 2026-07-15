@@ -117,6 +117,22 @@
         "type": "github"
       }
     },
+    "regioners-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1698335665,
+        "narHash": "sha256-BIPOgmsN9FpbuBGlCkCq55lMWrh7sxdewTOFoOcxH20=",
+        "owner": "ACEnglish",
+        "repo": "regioners",
+        "rev": "7ea628ea37a62aa3fac0bc29fbf0c9f367e300eb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ACEnglish",
+        "repo": "regioners",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "bits": "bits",
@@ -124,6 +140,7 @@
         "giggle": "giggle",
         "igd-src": "igd-src",
         "nixpkgs": "nixpkgs_3",
+        "regioners-src": "regioners-src",
         "treefmt-nix": "treefmt-nix"
       }
     },

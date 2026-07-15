@@ -15,6 +15,10 @@
       url = "github:databio/iGD";
       flake = false;
     };
+    regioners-src = {
+      url = "github:ACEnglish/regioners";
+      flake = false;
+    };
   };
 
   outputs =
@@ -25,6 +29,7 @@
       giggle,
       bits,
       igd-src,
+      regioners-src,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -50,6 +55,13 @@
             mkdir -p $out/bin
             cp bin/igd $out/bin/
           '';
+        };
+
+        regioners = pkgs.rustPlatform.buildRustPackage {
+          pname = "regioners";
+          version = "0.3.1";
+          src = regioners-src;
+          cargoLock.lockFile = "${regioners-src}/Cargo.lock";
         };
 
         # for non-nix users https://hgdownload.gi.ucsc.edu/downloads.html#utilities_downloads
@@ -107,6 +119,7 @@
             bits.packages.${system}.default
             igd
             liftOver
+            regioners
             # misc
             just
             libiconv

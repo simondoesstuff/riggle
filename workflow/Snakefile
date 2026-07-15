@@ -18,6 +18,9 @@
 #   snakemake data/plots/scatter_Rheumatoid_arthritis_100_per_bed.png
 #   snakemake data/plots/scatter_all_tools_100.png   # needs chuckle data for all traits
 #
+# regioners (all 39 traits × all 3 methods, 100 trials):
+#   snakemake -j4 regioners_all
+#
 # Benchmarks (quick scale):
 #   snakemake bench_all
 #   snakemake data/plots/bench_index.png
@@ -51,6 +54,7 @@ include: "rules/bits.smk"
 include: "rules/giggle.smk"
 include: "rules/chuckle.smk"
 include: "rules/montecarlo.smk"
+include: "rules/regioners.smk"
 include: "rules/plots.smk"
 include: "rules/bench.smk"
 

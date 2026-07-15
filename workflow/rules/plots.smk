@@ -4,17 +4,30 @@
 # Usage example:
 #   snakemake data/plots/scatter_bed_pvals_Rheumatoid_arthritis_1000.png
 
+from pathlib import Path
+
 GWAS_TRAITS = glob_wildcards("data/gwas/{trait}.bed").trait
 
-RME_HEAT_TARGETS = [
-    "data/plots/rme_heat_Rheumatoid_arthritis.png",
-    "data/plots/rme_heat_Alzheimers_combined.png",
-    "data/plots/rme_heat_myod_myotube.png",
-]
+# Traits that have both an existing chuckle JSON and all three regioners TSVs.
+# Derived from existing files rather than GWAS_TRAITS to avoid triggering
+# expensive chuckle rebuilds for traits not yet queried (e.g. Type_1_diabetes).
+_REGIONERS_TRAITS = sorted(
+    p.stem
+    for p in Path(CHUCKLE_DIR).glob("*.json")
+    if all(
+        Path(f"{REGIONERS_DIR}/{m}/{p.stem}.tsv").exists()
+        for m in ["shuffle", "circle", "novl"]
+    )
+)
+
+RME_HEAT_TARGETS = expand(
+    "data/plots/rme_heat_{trait}.png",
+    trait=GWAS_TRAITS + ["myod_myotube"],
+)
 
 
 rule rme_heat_all:
-    """Produce RME heatmaps for the default trait set."""
+    """Produce RME heatmaps for all GWAS traits."""
     input:
         RME_HEAT_TARGETS,
 
@@ -33,6 +46,40 @@ rule scatter_bed_pvals:
         " --chuckle {CHUCKLE_DIR}"
         " --giggle data/giggle"
         " --bits data/bits/{wildcards.trials}"
+        " -o {output} --no-show"
+
+
+rule scatter_regioners:
+    """2×3 scatter: chuckle vs each regioners method (-log10 and raw p-value rows)."""
+    input:
+        chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
+        shuffle=f"{REGIONERS_DIR}/shuffle/{{trait}}.tsv",
+        circle=f"{REGIONERS_DIR}/circle/{{trait}}.tsv",
+        novl=f"{REGIONERS_DIR}/novl/{{trait}}.tsv",
+    output:
+        "data/plots/scatter_regioners_{trait}.png",
+    shell:
+        "uv run workflow/scripts/regioners_scatter.py"
+        " --trait {wildcards.trait}"
+        " --chuckle {CHUCKLE_DIR}"
+        " --regioners {REGIONERS_DIR}"
+        " -o {output} --no-show"
+
+
+rule scatter_regioners_all:
+    """2×3 scatter across all GWAS traits combined: chuckle vs each regioners method."""
+    input:
+        chuckle=expand(f"{CHUCKLE_DIR}/{{trait}}.json", trait=_REGIONERS_TRAITS),
+        shuffle=expand(f"{REGIONERS_DIR}/shuffle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+        circle=expand(f"{REGIONERS_DIR}/circle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+        novl=expand(f"{REGIONERS_DIR}/novl/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+    output:
+        "data/plots/scatter_regioners_all.png",
+    shell:
+        "uv run workflow/scripts/regioners_scatter.py"
+        " --all-traits"
+        " --chuckle {CHUCKLE_DIR}"
+        " --regioners {REGIONERS_DIR}"
         " -o {output} --no-show"
 
 
