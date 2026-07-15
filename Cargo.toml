@@ -19,8 +19,6 @@ thiserror = "2.0"
 voracious_radix_sort = "1.2.0"
 wide = "0.7.33"
 flate2 = "1.1.9"
-rustfft = "6.2"
-realfft = "3"
 rkyv = "0.8"
 rend = "0.4"
 

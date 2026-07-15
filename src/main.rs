@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 
 use chuckle::io::Meta;
 use chuckle::stats::{StatResult, StatsOutput};
-use chuckle::fourier::DEFAULT_VARIANCE_THRESHOLD;
 use chuckle::fourier::FilterMode;
 use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
@@ -47,21 +46,13 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Compute FFT-based p-values for all overlapping pairs.
-        /// Requires that the database was built with this version of chuckle
-        /// (Fourier spectra must be cached under {db}/fourier/).
+        /// Compute analytic NB p-values and LLR for all overlapping pairs.
         #[arg(long)]
         stats: bool,
 
         /// Maximum number of query files to hold in memory at once (default: all)
         #[arg(long)]
         batch_size: Option<usize>,
-
-        /// Fraction of cross-correlation power to retain before the IFFT (0 < v ≤ 1).
-        /// 1.0 uses the full spectrum; lower values (e.g. 0.90) act as a smoothing
-        /// regulariser that can sharpen biological signal.
-        #[arg(long, default_value_t = DEFAULT_VARIANCE_THRESHOLD)]
-        variance_threshold: f64,
 
         /// Whitelist BED: only tiles covered by this file contribute to the p-value
         /// calculation; chromosomes absent from the file are excluded entirely.
@@ -89,8 +80,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
-        Commands::Query { db, query, output, stats, batch_size, variance_threshold, whitelist, blacklist } => {
-            run_query(db, query, output, stats, batch_size, variance_threshold, whitelist, blacklist)
+        Commands::Query { db, query, output, stats, batch_size, whitelist, blacklist } => {
+            run_query(db, query, output, stats, batch_size, whitelist, blacklist)
         }
         Commands::Info { db } => run_info(db),
     };
@@ -118,14 +109,12 @@ fn run_query(
     output: PathBuf,
     stats: bool,
     batch_size: Option<usize>,
-    variance_threshold: f64,
     whitelist: Option<PathBuf>,
     blacklist: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = QueryConfig::new(db, query);
     config.batch_size = batch_size;
     config.stats = stats;
-    config.variance_threshold = variance_threshold;
     config.filter = whitelist.map(|p| (p, FilterMode::Whitelist))
         .or_else(|| blacklist.map(|p| (p, FilterMode::Blacklist)));
     let result = query_database(&config)?;

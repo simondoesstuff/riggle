@@ -1,47 +1,53 @@
-//! Fourier-based p-value for genomic interval overlap.
+//! Analytic NB statistics for genomic interval overlap.
 //!
 //! # Index time
 //! [`DepthMap::build`] records a per-chromosome sparse Dirac impulse train
 //! (the derivative of coverage: +1 at each interval start, −1 at each end).
-//! Storage is O(K) for K intervals.  Saved to `{db}/depthmap/{sid}.bin`.
+//! Storage is O(K) for K intervals.  Saved to `{db}/depthmap.rkyv`.
 //!
-//! # Query time (two-phase)
-//! Phase A — build DB coverage spectra once per DB file (cached):
-//!   [`build_db_spectra`] converts each chromosome's impulse train to a
-//!   truncated coverage spectrum G_B[k] via `realfft` (real→complex FFT).
-//!   Coverage is built O(N) via prefix sum of the impulse train, then FFT'd
-//!   in O(N log N).  Only the first M coefficients are stored.
+//! # Query time
+//! 1. [`build_chrom_cov_data_with_filter`] converts each DB chromosome's impulse
+//!    train to a per-bin coverage array g[j] via prefix sum — O(N_bins) — and
+//!    computes the mean depth and the sample variance of sliding window sums at
+//!    each power-of-2 scale from 1 to 2^(MAX_SLIDING_LOG2−1) bins.
+//! 2. [`build_query_chrom_data`] extracts per-chromosome interval lengths (in
+//!    100 bp bins) from the raw BED intervals of the query file.
+//! 3. [`compute_analytic_stats`] fits a negative-binomial (NB) null by summing
+//!    independent contributions from each query interval.
 //!
-//! Phase B — per (query, DB) pair:
-//!   1. Build query spectrum G_Q[k] (same real FFT pipeline).
-//!   2. Accumulate cross-correlation: C_total[k] += G_Q[k] · conj(G_B[k])
-//!      over all shared chromosomes.
-//!   3. Single M-length complex IFFT → M samples c[s] of total overlap vs
-//!      a circular shift of s·(N/M) bins.
-//!   4. Empirical right-tailed p-value: P(overlap ≥ observed) =
-//!      fraction of the M shift samples with c[s] ≥ c[0].
+//! # Null model (free-relative-gap / independent-interval)
+//! Each query interval slides independently over the DB (its gaps relative to
+//! other query intervals are free).  For query interval i of length l_i (bins)
+//! on a chromosome where the DB has mean depth μ_B:
 //!
-//! # Frequency truncation (variance-adaptive)
-//! All N/2+1 cross-correlation coefficients are accumulated first.  Then the
-//! cumulative power Σ_{k=0}^{M-1} |C[k]|² is scanned in ascending-frequency
-//! order until it reaches `variance_threshold × total_power`.  Only those M
-//! coefficients are passed to the IFFT, giving M shift samples at coarser
-//! resolution.  Lower thresholds (e.g. 0.90) act as a smoothing regulariser;
-//! higher thresholds (e.g. 0.9999) approach the full-spectrum result.
+//!   μ_i  = l_i · μ_B
+//!   σ²_i = Var_s(g_B)   (sample variance of s-bin sliding-window sums over the
+//!                         DB coverage array, where s = 2^round(log2(l_i)))
 //!
-//! # Null model
-//! All chromosomes are shifted by the same sample index s simultaneously.
-//! This is equivalent to adding cross-correlation spectra before the IFFT
-//! (linearity of IFFT) and gives a single M-sample null distribution for
-//! the combined multi-chromosome overlap.
+//! The sliding-window variance captures the true cluster structure of the DB:
+//! when DB intervals are longer than s, windows are bimodal (all-on / all-off),
+//! giving high variance (overdispersion) even for binary coverage.
+//!
+//! Genome-wide null moments are the sum across all intervals and chromosomes:
+//!   μ = Σ_i μ_i,  σ² = Σ_i σ²_i
+//!
+//! NB parameters: p = μ/σ², r = μ²/(σ²−μ).  Requires σ² > μ (overdispersion);
+//! returns None otherwise (e.g., point-like queries against Bernoulli DB).
+//!
+//! LLR at observation o (exponential tilting to mean o):
+//!   LLR(o) = o·θ + r·ln(p_o/p)   where θ = ln((1−p_o)/(1−p)), p_o = r/(r+o).
+//!
+//! P-value: Wilks' approximation — 2·LLR ≈ χ²(1), so
+//!   p = erfc(√LLR) / 2.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
 use rayon::prelude::*;
-use realfft::RealFftPlanner;
-use rustfft::{FftPlanner, num_complex::Complex};
+
+/// Number of power-of-2 sliding-window scales precomputed per DB chromosome.
+/// Covers scales 2^0 = 1 bin (100 bp) through 2^13 = 8192 bins (≈ 820 kb).
+const MAX_SLIDING_LOG2: usize = 14;
 
 // ── FilterMask ────────────────────────────────────────────────────────────────
 
@@ -67,12 +73,6 @@ pub struct FilterMask {
 
 impl FilterMask {
     /// Build a `FilterMask` from a [`BedMap`] and a [`FilterMode`].
-    ///
-    /// **Whitelist**: only bins covered by `bed` are marked accessible; chromosomes
-    /// absent from `bed` are excluded entirely.
-    ///
-    /// **Blacklist**: all bins start accessible; bins covered by `bed` are marked
-    /// inaccessible.  Chromosomes absent from `bed` remain fully accessible.
     pub fn build(bed: &BedMap, mode: FilterMode) -> Self {
         let chrom_sizes: HashMap<&str, u32> = hg38_chrom_sizes().iter().copied().collect();
 
@@ -119,11 +119,7 @@ impl FilterMask {
         FilterMask { chroms, mode }
     }
 
-    /// Return the accessibility mask for `chrom` (`true` = bin contributes to FFT).
-    ///
-    /// For a whitelist, returns `None` if the chromosome was absent from the BED
-    /// (fully inaccessible).  For a blacklist, always returns `Some` since every
-    /// chromosome is represented.
+    /// Return the accessibility mask for `chrom` (`true` = bin contributes).
     pub fn get(&self, chrom: &str) -> Option<&[bool]> {
         self.chroms.get(chrom).map(Vec::as_slice)
     }
@@ -133,54 +129,42 @@ impl FilterMask {
     }
 }
 
-thread_local! {
-    static REAL_PLANNER: RefCell<RealFftPlanner<f32>> = RefCell::new(RealFftPlanner::new());
-    static COMPLEX_PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::new());
-}
-
 const BIN_SIZE: u32 = 100;
 
-/// Default fraction of cross-correlation power retained before the IFFT.
-/// Near 1.0, the truncation is nearly invisible; lower values (e.g. 0.90)
-/// act as a smoothing regulariser and can sharpen biological signal.
-pub const DEFAULT_VARIANCE_THRESHOLD: f64 = 1.0;
-
-// ── Public types ─────────────────────────────────────────────────────────────
+// ── Public types ──────────────────────────────────────────────────────────────
 
 /// Chromosome name → (start, end) interval pairs.
 pub type BedMap = HashMap<String, Vec<(u32, u32)>>;
 
-/// Precomputed coverage spectrum for one chromosome of one DB file.
-/// Produced by [`build_db_spectra`]; reused across multiple queries.
-pub struct ChromDbSpec {
+/// Per-chromosome coverage statistics for one DB file.
+/// Produced by [`build_chrom_cov_data_with_filter`]; reused across all queries.
+pub struct ChromCovData {
     pub chrom: String,
-    /// Padded length N = next power of two ≥ n_bins.
-    pub n: usize,
-    /// Number of 100 bp bins on this chromosome.
     pub n_bins: usize,
-    /// V = number of impulses (= 2 × interval count on this chromosome).
-    pub v: f64,
-    /// G_B[k] for k = 0..m (coverage spectrum, truncated to m frequencies).
-    pub spec: Vec<Complex<f32>>,
     /// Mean coverage per bin (over n_bins, after masking).
     pub cov_mean: f64,
-    /// Variance of coverage per bin (over n_bins, after masking).
-    pub cov_var: f64,
+    /// `sliding_vars[k]` = sample variance of `2^k`-bin sliding-window sums of g.
+    /// Zero for k where `2^k > n_bins`.  Index 0 equals the per-bin variance.
+    pub sliding_vars: [f64; MAX_SLIDING_LOG2],
+}
+
+/// Per-chromosome interval data for one query file.
+/// Produced by [`build_query_chrom_data`].
+pub struct QueryChromData {
+    pub chrom: String,
+    pub n_bins: usize,
+    /// Length of each interval on this chromosome, in 100 bp bins (may be fractional).
+    pub interval_lengths: Vec<f64>,
 }
 
 /// Sparse Dirac impulse train (derivative coverage) for one chromosome.
-///
-/// Spikes are stored as raw bp positions.  At query time each spike is
-/// fractionally distributed across two adjacent bins (linear interpolation
-/// between `floor(x/BIN)` and `floor(x/BIN)+1`) to eliminate aliasing for
-/// intervals smaller than `BIN_SIZE`.
 #[derive(Debug)]
 pub struct ChromDepthMap {
     pub chrom: String,
     pub n_bins: usize,
     /// Raw bp start positions with a +1 impulse (one per interval).
     pub pos_spikes: Vec<u32>,
-    /// Raw bp end positions with a -1 impulse (one per interval).
+    /// Raw bp end positions with a −1 impulse (one per interval).
     pub neg_spikes: Vec<u32>,
 }
 
@@ -189,19 +173,14 @@ impl ChromDepthMap {
     pub fn v(&self) -> f64 {
         (self.pos_spikes.len() + self.neg_spikes.len()) as f64
     }
+
     /// Total coverage in bins: Σ_interval (end − start) / BIN_SIZE.
-    ///
-    /// With fractional spike distribution, this equals
-    ///   Σ_pos (n_bins − x/BIN_SIZE) − Σ_neg (n_bins − x/BIN_SIZE).
     pub fn total_cov(&self) -> f64 {
         let n = self.n_bins as f64;
         let b = BIN_SIZE as f64;
         let pos: f64 = self.pos_spikes.iter().map(|&x| n - x as f64 / b).sum();
         let neg: f64 = self.neg_spikes.iter().map(|&x| n - x as f64 / b).sum();
         pos - neg
-    }
-    fn n(&self) -> usize {
-        self.n_bins.next_power_of_two()
     }
 }
 
@@ -242,32 +221,90 @@ impl DepthMap {
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 
-/// V for a BedMap: 2 × total interval count (one +1 and one −1 spike per interval).
+/// V for a BedMap: 2 × total interval count.
 pub fn bed_map_v(bed: &BedMap) -> f64 {
     bed.values().map(|v| 2 * v.len()).sum::<usize>() as f64
 }
 
-/// Build per-chromosome coverage spectra for a DepthMap.
-/// Stores all N/2+1 coefficients from the real forward FFT.
-/// Runs in parallel over chromosomes.
-pub fn build_db_spectra(dm: &DepthMap) -> Vec<ChromDbSpec> {
-    build_db_spectra_with_filter(dm, None)
+/// Build per-chromosome coverage data for a DepthMap.
+pub fn build_chrom_cov_data(dm: &DepthMap) -> Vec<ChromCovData> {
+    build_chrom_cov_data_with_filter(dm, None)
 }
 
-/// Like [`build_db_spectra`] but applies a [`FilterMask`] before the FFT.
+/// Mean interval length in 100 bp bins across all chromosomes in a query.
+pub fn mean_interval_bins(q_data: &[QueryChromData]) -> f64 {
+    let total_l: f64 = q_data.iter().flat_map(|c| c.interval_lengths.iter()).sum();
+    let total_n: usize = q_data.iter().map(|c| c.interval_lengths.len()).sum();
+    if total_n == 0 { 0.0 } else { total_l / total_n as f64 }
+}
+
+/// Build per-chromosome interval data from a raw BED map.
 ///
-/// For each chromosome:
-/// - If `filter` is `None`, the full coverage vector is used (same as
-///   [`build_db_spectra`]).
-/// - If `filter` is `Some(f)` and `f` has an entry for the chromosome, the
-///   coverage vector is multiplied element-wise by the boolean mask (non-
-///   whitelisted bins are zeroed out) before the forward FFT.
-/// - If `filter` is `Some(f)` but `f` has **no** entry for the chromosome, that
-///   chromosome is excluded entirely (no `ChromDbSpec` is emitted for it).
+/// Interval lengths are stored in 100 bp bins (may be fractional for short intervals).
+/// When a [`FilterMask`] is supplied in whitelist mode, chromosomes absent from
+/// the mask are excluded entirely (matching the DB-side filtering).
+pub fn build_query_chrom_data(bed: &BedMap, filter: Option<&FilterMask>) -> Vec<QueryChromData> {
+    hg38_chrom_sizes()
+        .iter()
+        .filter_map(|&(chrom, size)| {
+            // For whitelist: exclude chromosomes not in the filter.
+            // For blacklist: all hg38 chromosomes are present in the filter.
+            if let Some(f) = filter {
+                if f.get(chrom).is_none() {
+                    return None;
+                }
+            }
+            let ivs = bed.get(chrom)?;
+            if ivs.is_empty() {
+                return None;
+            }
+            let n_bins = ((size + BIN_SIZE - 1) / BIN_SIZE) as usize;
+            let interval_lengths = ivs
+                .iter()
+                .map(|&(s, e)| (e - s) as f64 / BIN_SIZE as f64)
+                .collect();
+            Some(QueryChromData {
+                chrom: chrom.to_string(),
+                n_bins,
+                interval_lengths,
+            })
+        })
+        .collect()
+}
+
+/// Exact base-pair overlap in 100 bp bins between two depth maps.
 ///
-/// This confines both the observed overlap and the shift-null distribution to
-/// the same accessible genomic space, implementing a positional prior.
-pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) -> Vec<ChromDbSpec> {
+/// Builds per-bin coverage arrays on the fly (no filter applied), computes the
+/// dot product over shared chromosomes, and discards the arrays.  Intended for
+/// the `pval` binary where no sweep count is available; the query pipeline uses
+/// the heuristic `sweep_count × mean_query_interval_bins` instead.
+pub fn coverage_dot_product(a_dm: &DepthMap, b_dm: &DepthMap) -> f64 {
+    let a_map: HashMap<&str, &ChromDepthMap> =
+        a_dm.chroms.iter().map(|c| (c.chrom.as_str(), c)).collect();
+    b_dm.chroms
+        .iter()
+        .filter_map(|b_cd| {
+            let a_cd = a_map.get(b_cd.chrom.as_str())?;
+            let (a_cov, _, _) = chrom_coverage_and_stats(a_cd, None);
+            let (b_cov, _, _) = chrom_coverage_and_stats(b_cd, None);
+            let n = a_cd.n_bins.min(b_cd.n_bins);
+            Some(
+                a_cov[..n]
+                    .iter()
+                    .zip(b_cov[..n].iter())
+                    .map(|(&a, &b)| a as f64 * b as f64)
+                    .sum::<f64>(),
+            )
+        })
+        .sum()
+}
+
+/// Like [`build_chrom_cov_data`] but applies a [`FilterMask`] before coverage
+/// computation.  Chromosomes absent from a whitelist are excluded entirely.
+pub fn build_chrom_cov_data_with_filter(
+    dm: &DepthMap,
+    filter: Option<&FilterMask>,
+) -> Vec<ChromCovData> {
     dm.chroms
         .par_iter()
         .filter_map(|cdm| {
@@ -275,203 +312,72 @@ pub fn build_db_spectra_with_filter(dm: &DepthMap, filter: Option<&FilterMask>) 
                 None => None,
                 Some(f) => match f.get(&cdm.chrom) {
                     Some(m) => Some(m),
-                    None => return None, // chromosome excluded by filter
+                    None => return None,
                 },
             };
-            let (spec, cov_mean, cov_var) = chrom_coverage_spectrum(cdm, mask);
-            Some(ChromDbSpec {
+            let (g, cov_mean, _) = chrom_coverage_and_stats(cdm, mask);
+            let sliding_vars = all_sliding_vars(&g);
+            Some(ChromCovData {
                 chrom: cdm.chrom.clone(),
-                n: cdm.n(),
                 n_bins: cdm.n_bins,
-                v: cdm.v(),
-                spec,
                 cov_mean,
-                cov_var,
+                sliding_vars,
             })
         })
         .collect()
 }
 
-/// Analytic LLR for overlap enrichment using cumulant addition.
+/// Compute analytic NB statistics for a (query, DB) pair.
 ///
-/// Under the NB null, the overlap distribution has moments derived from the
-/// per-bin coverage moments of the two signals (summed across shared chromosomes):
-///   μ = μ_Q + μ_R,  σ² = σ²_Q + σ²_R
+/// Returns `(p_value, llr)` or `None` if no chromosomes are shared.
 ///
-/// NB parameters:  p = μ/σ²,  r = μ²/(σ²−μ)
+/// Uses the free-relative-gap null: each query interval slides independently.
+/// For interval i of length l_i on chromosome c with DB mean μ_B and
+/// sliding-window variance at scale 2^round(log2(l_i)):
+///   μ_i  = l_i · μ_B,   σ²_i = sliding_vars[round(log2(l_i))]
+/// Summing over all intervals gives the genome-wide null moments.
 ///
-/// The exponentially tilted NB with mean equal to the observation `o` keeps
-/// the same dispersion `r` but shifts the success probability to:
-///   p_o = r / (r + o)
-///
-/// The LLR is then:
-///   LLR(o) = o·θ + r·ln(p_o/p)   where  θ = ln((1−p_o)/(1−p))
-///
-/// Returns `None` when the NB fit is not feasible (μ ≤ 0, σ² ≤ μ, or
-/// probabilities outside (0,1)).
-fn analytic_nb_llr(
-    q_spectra: &[ChromDbSpec],
-    db_spectra: &[ChromDbSpec],
+/// `observed` is the base-pair overlap in 100 bp bins supplied by the caller.
+/// In the query pipeline this is `sweep_count × mean_query_interval_bins`
+/// (a heuristic assuming full overlaps); for exact results use
+/// [`coverage_dot_product`].
+pub fn compute_analytic_stats(
+    q_data: &[QueryChromData],
+    db_data: &[ChromCovData],
     observed: f64,
-) -> Option<f64> {
-    let mut mu_q = 0.0f64;
-    let mut var_q = 0.0f64;
-    let mut mu_r = 0.0f64;
-    let mut var_r = 0.0f64;
+) -> Option<(f64, Option<f64>)> {
+    let db_map: HashMap<&str, &ChromCovData> =
+        db_data.iter().map(|c| (c.chrom.as_str(), c)).collect();
+
+    let mut mu_total = 0.0f64;
+    let mut var_total = 0.0f64;
     let mut any_shared = false;
 
-    for db_cs in db_spectra {
-        let q_cs = match q_spectra.iter().find(|s| s.chrom == db_cs.chrom) {
-            Some(s) => s,
+    for q_cd in q_data {
+        let db_cd = match db_map.get(q_cd.chrom.as_str()) {
+            Some(d) => d,
             None => continue,
         };
-        let n = q_cs.n_bins.min(db_cs.n_bins) as f64;
-        mu_q  += q_cs.cov_mean  * n;
-        var_q += q_cs.cov_var   * n;
-        mu_r  += db_cs.cov_mean * n;
-        var_r += db_cs.cov_var  * n;
-        any_shared = true;
+        let mu_b = db_cd.cov_mean;
+        for &l in &q_cd.interval_lengths {
+            let k = round_pow2_log2(l);
+            mu_total += l * mu_b;
+            var_total += db_cd.sliding_vars[k];
+            any_shared = true;
+        }
     }
 
     if !any_shared {
         return None;
     }
 
-    let mu  = mu_q  + mu_r;
-    let var = var_q + var_r;
-
-    if mu <= 0.0 || var <= mu {
-        return None;
-    }
-
-    let r   = mu * mu / (var - mu);
-    let p   = mu / var;
-    let p_o = r / (r + observed);
-
-    if !(0.0 < p && p < 1.0 && 0.0 < p_o && p_o < 1.0) {
-        return None;
-    }
-
-    let theta = ((1.0 - p_o) / (1.0 - p)).ln();
-    Some(observed * theta + r * (p_o / p).ln())
-}
-
-/// Compute the right-tailed p-value for a (query, DB) pair given pre-built
-/// spectra for both sides (produced by [`build_db_spectra`]).
-///
-/// ### Algorithm
-/// 1. For each chromosome present in both `q_spectra` and `db_spectra`,
-///    accumulate the cross-correlation: `C_total[k] += G_Q[k] · conj(G_B[k])`.
-///    This is a pure O(N) dot product — no FFTs happen here.
-/// 2. Scan `C_total` in ascending-frequency order, accumulating
-///    `|C_total[k]|²`.  Stop at the smallest M such that the cumulative power
-///    reaches `variance_threshold × total_power`.  Truncate to M coefficients.
-/// 3. M-length complex IFFT (via the thread-local planner) → M samples `c[s]`
-///    of total overlap vs a circular shift of `s` positions.
-/// 4. Empirical p-value = fraction of the M samples with `c[s] ≥ c[0]`.
-///    `c[0]` (shift = 0) corresponds to the actual observed overlap.
-/// 5. `observed_bins` is the Parseval-normalised sum
-///    Σ_chrom Re(Σ_k G_Q[k]·conj(G_B[k])) / N_chrom.
-/// 6. LLR: fit NB to the M shift samples via method of moments, then evaluate
-///    the saddlepoint log-likelihood ratio at the shift-0 observation.
-///
-/// `variance_threshold` ∈ (0, 1]: fraction of total cross-correlation power
-/// to retain.  Use [`DEFAULT_VARIANCE_THRESHOLD`] for a sensible default.
-/// Lower values (e.g. 0.90) smooth the null distribution; 1.0 uses all
-/// coefficients.
-///
-/// Returns `(observed_bins, p_value, llr)` or `None` if no chromosomes are shared.
-pub fn compute_pvalue_cached(
-    q_spectra: &[ChromDbSpec],
-    db_spectra: &[ChromDbSpec],
-    variance_threshold: f64,
-) -> Option<(f64, f64, Option<f64>)> {
-    // Full spectrum length = max shared-chromosome spectrum length.
-    let m_full = db_spectra
-        .iter()
-        .filter(|db_cs| q_spectra.iter().any(|s| s.chrom == db_cs.chrom))
-        .map(|db_cs| db_cs.spec.len())
-        .max()?;
-
-    let mut c_total: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); m_full];
-    let mut observed = 0.0f64;
-
-    for db_cs in db_spectra {
-        let q_spec = match q_spectra.iter().find(|s| s.chrom == db_cs.chrom) {
-            Some(s) => &s.spec,
-            None => continue,
-        };
-
-        let m_pair = m_full.min(db_cs.spec.len()).min(q_spec.len());
-
-        // O(N) cross-correlation accumulation — no FFT.
-        for k in 0..m_pair {
-            c_total[k] += q_spec[k] * db_cs.spec[k].conj();
-        }
-
-        // Parseval-normalised observed overlap for this chromosome (in bins).
-        let dot: f32 = q_spec[..m_pair]
-            .iter()
-            .zip(db_cs.spec[..m_pair].iter())
-            .map(|(q, b)| (q * b.conj()).re)
-            .sum();
-        observed += (dot / db_cs.n as f32) as f64;
-    }
-
-    // Variance-adaptive frequency cutoff: find the smallest M such that
-    // Σ_{k<M} |C_total[k]|² ≥ variance_threshold × total_power, then
-    // truncate. This keeps low-frequency structure and discards high-
-    // frequency noise, acting as a smoothing regulariser.
-    // Fast path: threshold ≥ 1 means "use everything" — skip the scan.
-    let m = if variance_threshold >= 1.0 {
-        m_full
-    } else {
-        let total_power: f32 = c_total.iter().map(|c| c.norm_sqr()).sum();
-        let target_power = total_power * variance_threshold as f32;
-        let mut cumulative_power = 0.0f32;
-        let mut cutoff = m_full;
-        for (k, c) in c_total.iter().enumerate() {
-            cumulative_power += c.norm_sqr();
-            if cumulative_power >= target_power {
-                cutoff = k + 1;
-                break;
-            }
-        }
-        cutoff
+    let llr = nb_llr(mu_total, var_total, observed);
+    let p_value = match llr {
+        Some(l) if l > 0.0 => erfc(l.sqrt()) * 0.5,
+        _ => 1.0,
     };
-    c_total.truncate(m);
 
-    // M-length complex IFFT via the thread-local planner (plan cache hit).
-    // c_total[s].re is proportional to the total overlap at shift s across
-    // all shared chromosomes. c_total[0].re is the actual observed overlap.
-    let ifft = COMPLEX_PLANNER.with(|p| p.borrow_mut().plan_fft_inverse(m));
-    ifft.process(&mut c_total);
-
-    let obs_ref = c_total[0].re;
-    let count_geq = c_total.iter().filter(|x| x.re >= obs_ref).count();
-    let p_value = count_geq as f64 / m as f64;
-    let llr = analytic_nb_llr(q_spectra, db_spectra, observed);
-
-    Some((observed, p_value, llr))
-}
-
-/// Convenience: compute p-value directly from two BedMaps (builds spectra inline).
-/// Uses [`DEFAULT_VARIANCE_THRESHOLD`].
-/// Use [`build_db_spectra`] + [`compute_pvalue_cached`] when either file is
-/// compared against multiple partners (amortises the O(N log N) forward FFT).
-pub fn compute_pvalue(query_bed: &BedMap, db_dm: &DepthMap) -> Option<(f64, f64, Option<f64>)> {
-    let db_spectra = build_db_spectra(db_dm);
-    let q_dm = DepthMap::build(query_bed);
-    let q_spectra = build_db_spectra(&q_dm);
-    compute_pvalue_cached(&q_spectra, &db_spectra, DEFAULT_VARIANCE_THRESHOLD)
-}
-
-/// Convert a `parse_bed_file` result into a [`BedMap`].
-pub fn intervals_to_bed_map(shards: &HashMap<String, Vec<crate::core::Interval>>) -> BedMap {
-    shards
-        .iter()
-        .map(|(k, ivs)| (k.clone(), ivs.iter().map(|iv| (iv.start, iv.end)).collect()))
-        .collect()
+    Some((p_value, llr))
 }
 
 /// Parse a BED file (plain or gzip) into a [`BedMap`].
@@ -481,6 +387,14 @@ pub fn parse_bed_as_map(path: &Path) -> Result<BedMap, crate::io::BedParseError>
         .into_iter()
         .map(|(k, ivs)| (k, ivs.into_iter().map(|iv| (iv.start, iv.end)).collect()))
         .collect())
+}
+
+/// Convert a `parse_bed_file` result into a [`BedMap`].
+pub fn intervals_to_bed_map(shards: &HashMap<String, Vec<crate::core::Interval>>) -> BedMap {
+    shards
+        .iter()
+        .map(|(k, ivs)| (k.clone(), ivs.iter().map(|iv| (iv.start, iv.end)).collect()))
+        .collect()
 }
 
 /// hg38 chromosome sizes.
@@ -515,10 +429,135 @@ pub fn hg38_chrom_sizes() -> &'static [(&'static str, u32)] {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Convert intervals to raw bp position vectors for fractional spike distribution.
+/// Round l (in bins) to the nearest power of 2 in log-space; return k = log2(scale).
+/// Clamped to [0, MAX_SLIDING_LOG2 − 1].
+fn round_pow2_log2(l: f64) -> usize {
+    if l <= 1.0 {
+        return 0;
+    }
+    (l.log2().round() as usize).min(MAX_SLIDING_LOG2 - 1)
+}
+
+/// Precompute sliding-window variance for every power-of-2 scale from 1 to 2^13.
 ///
-/// Positions are clamped to `[0, n_bins × BIN_SIZE]`; the fractional
-/// bin-split is applied later in [`chrom_coverage_spectrum`].
+/// Builds one prefix-sum array and sweeps it at each scale in O(N·MAX_SLIDING_LOG2).
+fn all_sliding_vars(g: &[f32]) -> [f64; MAX_SLIDING_LOG2] {
+    let n = g.len();
+    let mut prefix = vec![0.0f64; n + 1];
+    for i in 0..n {
+        prefix[i + 1] = prefix[i] + g[i] as f64;
+    }
+    let mut vars = [0.0f64; MAX_SLIDING_LOG2];
+    for k in 0..MAX_SLIDING_LOG2 {
+        let scale = 1usize << k;
+        if scale > n {
+            break;
+        }
+        let n_windows = (n - scale + 1) as f64;
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for i in 0..=(n - scale) {
+            let f = prefix[i + scale] - prefix[i];
+            sum += f;
+            sum_sq += f * f;
+        }
+        let mean = sum / n_windows;
+        vars[k] = sum_sq / n_windows - mean * mean;
+    }
+    vars
+}
+
+/// Saddlepoint LLR for the NB null tilted to the observation `o`.
+///
+/// Returns `None` when the NB fit is not feasible (μ ≤ 0, σ² ≤ μ, or
+/// computed probabilities outside (0, 1)).
+pub(crate) fn nb_llr(mu: f64, var: f64, observed: f64) -> Option<f64> {
+    if mu <= 0.0 || var <= mu {
+        return None;
+    }
+    let r = mu * mu / (var - mu);
+    let p = mu / var;
+    let p_o = r / (r + observed);
+    if !(0.0 < p && p < 1.0 && 0.0 < p_o && p_o < 1.0) {
+        return None;
+    }
+    let theta = ((1.0 - p_o) / (1.0 - p)).ln();
+    Some(observed * theta + r * (p_o / p).ln())
+}
+
+/// Complementary error function (max error < 1.5e-7 for x ≥ 0).
+fn erfc(x: f64) -> f64 {
+    if x < 0.0 {
+        return 2.0 - erfc(-x);
+    }
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let p = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    p * (-x * x).exp()
+}
+
+/// Build a coverage array and compute its mean and variance.
+///
+/// Spikes are distributed fractionally across adjacent bins to avoid aliasing
+/// for sub-bin intervals.  The mask (if any) zeroes non-accessible bins after
+/// the prefix sum.
+fn chrom_coverage_and_stats(
+    cdm: &ChromDepthMap,
+    mask: Option<&[bool]>,
+) -> (Vec<f32>, f64, f64) {
+    let n = cdm.n_bins;
+    let mut g = vec![0.0f32; n];
+
+    for &x in &cdm.pos_spikes {
+        let bin = (x / BIN_SIZE) as usize;
+        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        if bin < n {
+            g[bin] += 1.0 - frac;
+        }
+        if frac > 0.0 && bin + 1 < n {
+            g[bin + 1] += frac;
+        }
+    }
+    for &x in &cdm.neg_spikes {
+        let bin = (x / BIN_SIZE) as usize;
+        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
+        if bin < n {
+            g[bin] -= 1.0 - frac;
+        }
+        if frac > 0.0 && bin + 1 < n {
+            g[bin + 1] -= frac;
+        }
+    }
+    for i in 1..n {
+        g[i] += g[i - 1];
+    }
+
+    if let Some(mask) = mask {
+        for (i, &allowed) in mask.iter().enumerate().take(n) {
+            if !allowed {
+                g[i] = 0.0;
+            }
+        }
+    }
+
+    let nb = n as f64;
+    let sum: f64 = g.iter().map(|&x| x as f64).sum();
+    let mean = sum / nb;
+    let var: f64 = g
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / nb;
+
+    (g, mean, var)
+}
+
+/// Convert intervals to raw bp position vectors for fractional spike distribution.
 fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>) {
     let max_bp = (n_bins as u32) * BIN_SIZE;
     let mut pos = Vec::with_capacity(intervals.len());
@@ -530,106 +569,105 @@ fn build_spikes(intervals: &[(u32, u32)], n_bins: usize) -> (Vec<u32>, Vec<u32>)
     (pos, neg)
 }
 
-/// Build a real-valued coverage array of length `n = cdm.n()` via prefix sum
-/// of the impulse train, optionally mask it, then forward-FFT it with
-/// `realfft`, returning all n/2+1 complex coefficients plus the mean and
-/// variance of coverage over the `n_bins` real bins (after masking).
-///
-/// When `mask` is `Some(m)`, bins whose entry in `m` is `false` are zeroed
-/// after the prefix sum but before the FFT.  Bins beyond `m.len()` are already
-/// zero-padded by `make_input_vec`.
-///
-/// Cost: O(N) build + O(N) mask application + O(N log N) FFT.
-fn chrom_coverage_spectrum(cdm: &ChromDepthMap, mask: Option<&[bool]>) -> (Vec<Complex<f32>>, f64, f64) {
-    let n = cdm.n();
-
-    let fft = REAL_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
-    let mut indata = fft.make_input_vec(); // vec![0f32; n]
-
-    // Build fractionally-weighted impulse train (anti-aliased derivative of coverage).
-    // Each spike at raw position x is split between bins floor(x/BIN) and floor(x/BIN)+1
-    // with weights (1−frac) and frac, where frac = (x % BIN_SIZE) / BIN_SIZE.
-    // For sub-bin intervals this correctly assigns fractional coverage rather than
-    // cancelling to zero as the old integer-bin scheme did.
-    for &x in &cdm.pos_spikes {
-        let bin = (x / BIN_SIZE) as usize;
-        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
-        indata[bin.min(n - 1)] += 1.0 - frac;
-        if frac > 0.0 && bin + 1 < n {
-            indata[bin + 1] += frac;
-        }
-    }
-    for &x in &cdm.neg_spikes {
-        let bin = (x / BIN_SIZE) as usize;
-        let frac = (x % BIN_SIZE) as f32 / BIN_SIZE as f32;
-        indata[bin.min(n - 1)] -= 1.0 - frac;
-        if frac > 0.0 && bin + 1 < n {
-            indata[bin + 1] -= frac;
-        }
-    }
-    // Prefix sum: impulse train → coverage g[j].
-    for i in 1..n {
-        indata[i] += indata[i - 1];
-    }
-
-    // Apply positional filter: zero out non-whitelisted bins.
-    if let Some(mask) = mask {
-        for (i, &allowed) in mask.iter().enumerate() {
-            if !allowed {
-                indata[i] = 0.0;
-            }
-        }
-        // Bins beyond mask.len() are already 0.0 (zero-padded by make_input_vec).
-    }
-
-    // Compute mean and variance over the real (non-padded) bins.
-    let nb = cdm.n_bins as f64;
-    let sum: f64 = indata[..cdm.n_bins].iter().map(|&x| x as f64).sum();
-    let mean = sum / nb;
-    let var: f64 = indata[..cdm.n_bins]
-        .iter()
-        .map(|&x| { let d = x as f64 - mean; d * d })
-        .sum::<f64>()
-        / nb;
-
-    let mut spectrum = fft.make_output_vec(); // complex, length n/2+1
-    fft.process(&mut indata, &mut spectrum).unwrap();
-
-    (spectrum, mean, var)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_compute_pvalue_identical() {
-        let mut bed = BedMap::new();
-        // 10 Mb interval = 100_000 bins on chr22 (n=524288).
-        // Querying with the same interval as the DB: observed overlap = 100_000 bins.
-        // Under random shifts, only shift=0 achieves that maximum overlap, so the
-        // empirical p-value should be very small (≈ 1/N).
-        bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
+    // ── nb_llr unit tests ─────────────────────────────────────────────────────
 
-        let dm = DepthMap::build(&bed);
-        let q_dm = DepthMap::build(&bed);
-        let db_spectra = build_db_spectra(&dm);
-        let q_spectra = build_db_spectra(&q_dm);
-        // Use threshold=1.0 (full spectrum) to get enough IFFT samples for a
-        // tight empirical p-value — the default threshold is tuned for biology,
-        // not for this synthetic single-peak test.
-        let (observed, p_value, llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
-        assert!(observed > 50_000.0, "observed={observed}");
-        assert!(p_value < 0.1, "p_value={p_value}");
-        assert!(llr.map_or(true, |l| l >= 0.0), "llr={llr:?}");
+    #[test]
+    fn test_nb_llr_zero_at_null_mean() {
+        // When observed = μ, the tilted distribution equals the null → LLR = 0.
+        let llr = nb_llr(4000.0, 8000.0, 4000.0).unwrap();
+        assert!(llr.abs() < 1e-6, "LLR at null mean should be 0, got {llr}");
     }
 
     #[test]
+    fn test_nb_llr_positive_for_enrichment() {
+        let llr = nb_llr(4000.0, 8000.0, 20_000.0).unwrap();
+        assert!(llr > 0.0, "LLR above null mean should be positive, got {llr}");
+    }
+
+    #[test]
+    fn test_nb_llr_none_underdispersed() {
+        // var ≤ mu → NB not applicable.
+        assert!(nb_llr(2000.0, 1000.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn test_nb_llr_none_zero_mu() {
+        assert!(nb_llr(0.0, 1.0, 1.0).is_none());
+    }
+
+    // ── erfc sanity ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_erfc_known_values() {
+        assert!((erfc(0.0) - 1.0).abs() < 1e-6);
+        // erfc(1) ≈ 0.1573
+        assert!((erfc(1.0) - 0.157_299_2).abs() < 1e-5, "erfc(1)={}", erfc(1.0));
+        // erfc → 0 for large x
+        assert!(erfc(5.0) < 1e-10);
+    }
+
+    // ── compute_analytic_stats ────────────────────────────────────────────────
+
+    #[test]
+    fn test_compute_analytic_stats_no_shared_chrom() {
+        let mut q_bed = BedMap::new();
+        q_bed.insert("chr21".to_string(), vec![(10_000_000, 10_001_000)]);
+        let q_data = build_query_chrom_data(&q_bed, None);
+
+        let mut db_bed = BedMap::new();
+        db_bed.insert("chr22".to_string(), vec![(10_000_000, 10_001_000)]);
+        let db_dm = DepthMap::build(&db_bed);
+        let db_cov = build_chrom_cov_data(&db_dm);
+
+        assert!(compute_analytic_stats(&q_data, &db_cov, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_compute_analytic_stats_zero_observed() {
+        // Sweep returned 0 overlaps → p_value must be 1.0 regardless of moments.
+        let mut q_bed = BedMap::new();
+        q_bed.insert("chr22".to_string(), vec![(0, 1_000_000)]);
+        let q_data = build_query_chrom_data(&q_bed, None);
+
+        let mut db_bed = BedMap::new();
+        db_bed.insert("chr22".to_string(), vec![(49_000_000, 50_000_000)]);
+        let db_dm = DepthMap::build(&db_bed);
+        let db_cov = build_chrom_cov_data(&db_dm);
+
+        let (p_value, _llr) = compute_analytic_stats(&q_data, &db_cov, 0.0).unwrap();
+        assert_eq!(p_value, 1.0);
+    }
+
+    #[test]
+    fn test_compute_analytic_stats_enriched() {
+        // Many clustered intervals on both sides; high observed should give positive LLR.
+        let ivs: Vec<(u32, u32)> =
+            (0..500u32).map(|i| (i * 10_000, i * 10_000 + 5_000)).collect();
+
+        let mut db_bed = BedMap::new();
+        db_bed.insert("chr22".to_string(), ivs.clone());
+        let db_dm = DepthMap::build(&db_bed);
+        let db_cov = build_chrom_cov_data(&db_dm);
+
+        let mut q_bed = BedMap::new();
+        q_bed.insert("chr22".to_string(), ivs);
+        let q_data = build_query_chrom_data(&q_bed, None);
+
+        // observed = 500 overlapping intervals × 50 bins each (5000 bp / 100 bp/bin)
+        let (_p_value, llr) = compute_analytic_stats(&q_data, &db_cov, 25_000.0).unwrap();
+        assert!(llr.map_or(true, |l| l >= 0.0), "llr={llr:?}");
+    }
+
+    // ── FilterMask tests ──────────────────────────────────────────────────────
+
+    #[test]
     fn test_filter_mask_excludes_unmatched_chrom() {
-        // DB and query both on chr22; filter only covers chr21.
-        // With filter active, no chromosomes are shared → None.
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(10_000_000, 11_000_000)]);
         let dm = DepthMap::build(&bed);
@@ -638,150 +676,49 @@ mod tests {
         filter_bed.insert("chr21".to_string(), vec![(0, 46_709_983)]);
         let filter = FilterMask::build(&filter_bed, FilterMode::Whitelist);
 
-        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
+        let db_cov = build_chrom_cov_data_with_filter(&dm, Some(&filter));
+        let q_data = build_query_chrom_data(&bed, Some(&filter));
 
-        // chr22 excluded by filter → no spectra → p-value is None.
-        assert!(db_spectra.is_empty());
-        let result = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0);
-        assert!(result.is_none());
+        assert!(db_cov.is_empty());
+        assert!(compute_analytic_stats(&q_data, &db_cov, 0.0).is_none());
     }
 
     #[test]
     fn test_filter_mask_confines_signal() {
-        // Query and DB identical on chr22; filter covers the whole chromosome.
-        // Should still return a low p-value (signal is preserved).
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
         let dm = DepthMap::build(&bed);
 
-        // Full chr22 whitelist (all bins accessible).
         let mut filter_bed = BedMap::new();
         filter_bed.insert("chr22".to_string(), vec![(0, 50_818_468)]);
         let filter = FilterMask::build(&filter_bed, FilterMode::Whitelist);
 
-        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        let (observed, p_value, _llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
-
-        assert!(observed > 50_000.0, "observed={observed}");
-        assert!(p_value < 0.1, "p_value={p_value}");
+        let db_cov = build_chrom_cov_data_with_filter(&dm, Some(&filter));
+        let q_data = build_query_chrom_data(&bed, Some(&filter));
+        // Whitelist covering the full chromosome; should have shared data.
+        assert!(compute_analytic_stats(&q_data, &db_cov, 100_000.0).is_some());
     }
 
     #[test]
     fn test_blacklist_excludes_signal() {
-        // Query and DB both on chr22; blacklist covers the entire signal region.
-        // After blacklisting, the coverage vectors are all-zero → no cross-
-        // correlation power → observed overlap ~0 and p-value should be high.
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
         let dm = DepthMap::build(&bed);
 
-        // Blacklist covers exactly the signal region (plus some slack).
         let mut bl_bed = BedMap::new();
         bl_bed.insert("chr22".to_string(), vec![(0, 50_818_468)]);
         let filter = FilterMask::build(&bl_bed, FilterMode::Blacklist);
 
-        let db_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        let q_spectra = build_db_spectra_with_filter(&dm, Some(&filter));
-        // chr22 is present in the blacklist mask (all bins blocked), so it is
-        // not excluded from spectra — but all bins are zero, so observed ≈ 0.
-        let (observed, _p_value, _llr) = compute_pvalue_cached(&q_spectra, &db_spectra, 1.0).unwrap();
-        assert!(observed.abs() < 1.0, "observed should be ~0 after full blacklist, got {observed}");
+        // Full blacklist zeroes all DB bins → cov_mean = 0 → μ = 0 → NB fit fails.
+        let db_cov = build_chrom_cov_data_with_filter(&dm, Some(&filter));
+        let q_data = build_query_chrom_data(&bed, Some(&filter));
+        let (p_value, llr) = compute_analytic_stats(&q_data, &db_cov, 100_000.0).unwrap();
+        assert!(llr.is_none(), "NB fit should fail when all DB bins are zeroed");
+        assert_eq!(p_value, 1.0);
     }
 
-    #[test]
-    fn test_compute_pvalue_no_shared_chrom() {
-        let mut query = BedMap::new();
-        query.insert("chr21".to_string(), vec![(10_000_000, 10_001_000)]);
+    // ── Fractional spike distribution ─────────────────────────────────────────
 
-        let mut db_bed = BedMap::new();
-        db_bed.insert("chr22".to_string(), vec![(10_000_000, 10_001_000)]);
-        let dm = DepthMap::build(&db_bed);
-
-        assert!(compute_pvalue(&query, &dm).is_none());
-    }
-
-    #[test]
-    fn test_cached_matches_direct() {
-        let mut bed = BedMap::new();
-        bed.insert(
-            "chr22".to_string(),
-            vec![(10_000_000, 10_001_000), (20_000_000, 20_002_000)],
-        );
-        let dm = DepthMap::build(&bed);
-        let db_spectra = build_db_spectra(&dm);
-        let q_dm = DepthMap::build(&bed);
-        let q_spectra = build_db_spectra(&q_dm);
-
-        let (obs_cached, pv_cached, _) =
-            compute_pvalue_cached(&q_spectra, &db_spectra, DEFAULT_VARIANCE_THRESHOLD).unwrap();
-        let (obs_direct, pv_direct, _) = compute_pvalue(&bed, &dm).unwrap();
-
-        assert!((obs_cached - obs_direct).abs() < 1.0, "obs mismatch");
-        assert!((pv_cached - pv_direct).abs() < 0.05, "pv mismatch");
-    }
-
-    /// Build minimal ChromDbSpec stubs for testing analytic_nb_llr.
-    fn make_spec(chrom: &str, n_bins: usize, cov_mean: f64, cov_var: f64) -> ChromDbSpec {
-        ChromDbSpec {
-            chrom: chrom.to_string(),
-            n: n_bins.next_power_of_two(),
-            n_bins,
-            v: 0.0,
-            spec: vec![],
-            cov_mean,
-            cov_var,
-        }
-    }
-
-    #[test]
-    fn test_analytic_nb_llr_zero_at_null_mean() {
-        // When o = μ_Q + μ_R, the tilted distribution is the null → LLR ≈ 0.
-        // μ_Q = 2.0 * 1000 = 2000, σ²_Q = 4.0 * 1000 = 4000
-        // μ_R = 2.0 * 1000 = 2000, σ²_R = 4.0 * 1000 = 4000
-        // μ = 4000, σ² = 8000 → p = 0.5, r = 2000, observed = 4000
-        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
-        let r = vec![make_spec("chr1", 1000, 2.0, 4.0)];
-        let mu = 4000.0; // observed = null mean
-        let llr = analytic_nb_llr(&q, &r, mu).unwrap();
-        assert!(llr.abs() < 1e-6, "LLR at null mean should be 0, got {llr}");
-    }
-
-    #[test]
-    fn test_analytic_nb_llr_positive_for_enrichment() {
-        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
-        let r = vec![make_spec("chr1", 1000, 2.0, 4.0)];
-        let mu = 4000.0;
-        let llr_enriched = analytic_nb_llr(&q, &r, mu * 5.0).unwrap();
-        assert!(llr_enriched > 0.0, "LLR above null mean should be positive, got {llr_enriched}");
-    }
-
-    #[test]
-    fn test_analytic_nb_llr_none_underdispersed() {
-        // var ≤ mu → NB not applicable.
-        let q = vec![make_spec("chr1", 1000, 2.0, 1.0)]; // var=1000 < mu=2000
-        let r = vec![make_spec("chr1", 1000, 0.0, 0.0)];
-        assert!(analytic_nb_llr(&q, &r, 1.0).is_none());
-    }
-
-    #[test]
-    fn test_analytic_nb_llr_none_no_shared_chrom() {
-        let q = vec![make_spec("chr1", 1000, 2.0, 4.0)];
-        let r = vec![make_spec("chr2", 1000, 2.0, 4.0)];
-        assert!(analytic_nb_llr(&q, &r, 1.0).is_none());
-    }
-
-    /// Verify fractional spike distribution for a sub-bin interval.
-    ///
-    /// Interval [20, 80] fits entirely within bin 0 (100 bp bins).
-    /// Expected coverage in fractional bins: (80 − 20) / 100 = 0.60.
-    ///
-    /// Spike maths:
-    ///   start=20 → bin 0 += 0.80, bin 1 += 0.20
-    ///   end=80   → bin 0 -= 0.20, bin 1 -= 0.80
-    ///   net:       bin 0 = +0.60, bin 1 = −0.60
-    ///   prefix sum: g[0] = 0.60, g[1..] = 0.0
     #[test]
     fn test_sub_bin_fractional_coverage() {
         let mut bed = BedMap::new();
@@ -789,11 +726,8 @@ mod tests {
         let dm = DepthMap::build(&bed);
         let chrom = &dm.chroms[0];
 
-        // total_cov should equal (80 − 20) / 100 = 0.6 bins.
         let tc = chrom.total_cov();
         assert!((tc - 0.6).abs() < 1e-9, "total_cov={tc}");
-
-        // Verify by checking raw spike storage (raw bp positions).
         assert_eq!(chrom.pos_spikes, vec![20u32]);
         assert_eq!(chrom.neg_spikes, vec![80u32]);
     }

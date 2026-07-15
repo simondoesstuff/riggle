@@ -7,8 +7,8 @@ pub struct StatResult {
     pub db_name: String,
     /// Number of overlapping interval pairs from the sweep phase.
     pub overlap_count: u32,
-    /// Base-pair overlap at shift 0 (in 100 bp bins).  Present only when
-    /// `--stats` is enabled and the Fourier cache exists for the DB file.
+    /// Base-pair overlap in 100 bp bins (dot product of coverage arrays).
+    /// Present only when `--stats` is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_bins: Option<f64>,
     /// Right-tailed p-value under the rigid-body shift null model.

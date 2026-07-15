@@ -8,7 +8,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{DEFAULT_VARIANCE_THRESHOLD, DepthMap, FilterMask, FilterMode, build_db_spectra_with_filter, compute_pvalue_cached, parse_bed_as_map};
+use crate::fourier::{QueryChromData, DepthMap, FilterMask, FilterMode, build_chrom_cov_data_with_filter, build_query_chrom_data, compute_analytic_stats, mean_interval_bins, parse_bed_as_map};
 use crate::io::{
     BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, Meta, MetaError,
     is_bed_file, parse_bed_file,
@@ -48,15 +48,9 @@ pub struct QueryConfig {
     /// Maximum number of query files to parse and hold in memory at once.
     /// `None` (default) processes all query files in a single batch.
     pub batch_size: Option<usize>,
-    /// When `true`, compute FFT-based right-tailed p-values for every
-    /// (query, DB) pair with at least one interval overlap.  Requires that
-    /// the database was built with `add_to_database` (which caches Fourier
-    /// spectra under `{db}/fourier/`).
+    /// When `true`, compute analytic NB p-values and LLR for every
+    /// (query, DB) pair with at least one interval overlap.
     pub stats: bool,
-    /// Fraction of cross-correlation power to retain before the IFFT.
-    /// 1.0 = full spectrum (fast path, no scan); lower values act as a
-    /// smoothing regulariser.  See [`DEFAULT_VARIANCE_THRESHOLD`].
-    pub variance_threshold: f64,
     /// Optional positional filter: a BED file paired with a [`FilterMode`].
     ///
     /// - `Whitelist`: only 100 bp tiles covered by the BED contribute; chromosomes
@@ -77,7 +71,6 @@ impl QueryConfig {
             num_threads: None,
             batch_size: None,
             stats: false,
-            variance_threshold: DEFAULT_VARIANCE_THRESHOLD,
             filter: None,
         }
     }
@@ -90,19 +83,18 @@ pub struct QuerySource {
     pub count: usize,
 }
 
-/// A single Fourier p-value result for one (query, DB-source) pair.
+/// Analytic NB statistics for one (query, DB-source) pair.
 #[derive(Debug, Clone)]
 pub struct PValueResult {
     /// Row index in the overlap matrix (= Q_SID).
     pub query_id: usize,
     /// Database source identifier.
     pub db_sid: u32,
-    /// Base-pair overlap at shift 0, measured in 100 bp bins.
+    /// Base-pair overlap measured in 100 bp bins (dot product of coverage arrays).
     pub observed_bins: f64,
-    /// Right-tailed p-value under the rigid-body shift null model.
+    /// Right-tailed p-value under the NB null (Wilks approximation).
     pub p_value: f64,
-    /// Saddlepoint LLR under a NB null fitted to the shift samples.
-    /// None when the NB fit is not feasible (e.g. underdispersed null).
+    /// Saddlepoint LLR under the NB null.  None when the NB fit is not feasible.
     pub llr: Option<f64>,
 }
 
@@ -278,16 +270,15 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
-    // ── Phase 2: Fourier p-values ────────────────────────────────────────────
+    // ── Phase 2: Analytic NB p-values ───────────────────────────────────────
     let pvalues = if config.stats {
         let filter = config.filter.as_ref().and_then(|(p, mode)| {
             parse_bed_as_map(p).ok().map(|bed| FilterMask::build(&bed, *mode))
         });
-        let mut pvalues = compute_fourier_pvalues(
+        let mut pvalues = compute_analytic_pvalues(
             &final_counts,
             &query_file_paths,
             &config.db_path,
-            config.variance_threshold,
             filter.as_ref(),
         );
         // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
@@ -325,32 +316,23 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     })
 }
 
-/// For every non-zero (q_sid, d_sid) pair in `counts`, compute the FFT-based
-/// right-tailed p-value.
+/// For every non-zero (q_sid, d_sid) pair in `counts`, compute analytic NB stats.
 ///
-/// Three-phase strategy that eliminates all redundant forward FFTs:
+/// Phase A: Load all needed DB DepthMaps from the consolidated store.
 ///
-/// Phase A: Load all needed DB DepthMaps once in parallel to obtain V_db values.
+/// Phase B: Build query coverage data once per query file (O(N_bins) per
+/// chromosome, no FFT).  Each file's per-bin coverage array is cached for
+/// reuse across all DB partners.
 ///
-/// Phase B: For each query, determine the maximum V_db it will face, then build
-/// its coverage spectra once at that M_max.  All subsequent comparisons for that
-/// query reuse the cached spectra — forward FFT runs exactly once per (file,
-/// chromosome) rather than once per (file, chromosome, DB partner).
-///
-/// Phase C: For each DB file, build DB spectra once, then cross-correlate with
-/// every query spectrum that overlaps it.  The inner loop is purely O(M) complex
-/// multiplications — no FFT.
-///
-/// Pairs for which a depthmap is missing (DB built before this feature) are
-/// silently skipped.
-fn compute_fourier_pvalues(
+/// Phase C: For each DB file, build DB coverage data once, then compute the
+/// observed overlap (dot product with each query's cached coverage array) and
+/// the analytic NB LLR/p-value.
+fn compute_analytic_pvalues(
     counts: &SparseMatrix,
     query_file_paths: &[PathBuf],
     db_path: &Path,
-    variance_threshold: f64,
     filter: Option<&FilterMask>,
 ) -> Vec<PValueResult> {
-    // Collect non-zero (q_sid, d_sid) pairs, grouped by d_sid.
     let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
     for (q_sid, row) in counts.outer_iterator().enumerate() {
         for (d_sid, &cnt) in row.iter() {
@@ -365,8 +347,7 @@ fn compute_fourier_pvalues(
 
     let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
 
-    // Phase A: open the consolidated depth-map store once, then extract the
-    // needed DepthMaps in parallel.
+    // Phase A: open the consolidated depth-map store.
     let store_path = db_path.join("depthmap.rkyv");
     let store = match MappedDepthStore::open(&store_path) {
         Ok(s) => s,
@@ -377,18 +358,20 @@ fn compute_fourier_pvalues(
         .filter_map(|(&d_sid, _)| Some((d_sid, store.get(d_sid)?)))
         .collect();
 
-    // Phase B: build query spectra once per query file.
-    let query_spectra: HashMap<usize, _> = needed_q_sids
+    // Phase B: build query interval data and mean interval size once per query file.
+    let query_cov_data: HashMap<usize, (Vec<QueryChromData>, f64)> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
             let path = query_file_paths.get(q_sid)?;
             let bed = parse_bed_as_map(path).ok()?;
-            let q_dm = DepthMap::build(&bed);
-            Some((q_sid, build_db_spectra_with_filter(&q_dm, filter)))
+            let q_data = build_query_chrom_data(&bed, filter);
+            let mean_iv = mean_interval_bins(&q_data);
+            Some((q_sid, (q_data, mean_iv)))
         })
         .collect();
 
-    // Phase C: for each DB file, build DB spectra once then cross-correlate.
+    // Phase C: for each DB, build coverage data once then compute stats for
+    // every overlapping query.
     by_db
         .par_iter()
         .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
@@ -396,15 +379,15 @@ fn compute_fourier_pvalues(
                 Some(d) => d,
                 None => return Vec::new(),
             };
-
-            let db_spectra = build_db_spectra_with_filter(dm, filter);
-
+            let db_cov = build_chrom_cov_data_with_filter(dm, filter);
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
-                    let q_spec = query_spectra.get(&q_sid)?;
-                    let (observed_bins, p_value, llr) =
-                        compute_pvalue_cached(q_spec, &db_spectra, variance_threshold)?;
+                    let (q_data, mean_iv) = query_cov_data.get(&q_sid)?;
+                    let sweep_count = counts.get(q_sid, d_sid as usize).copied().unwrap_or(0);
+                    let observed_bins = sweep_count as f64 * mean_iv;
+                    let (p_value, llr) =
+                        compute_analytic_stats(q_data, &db_cov, observed_bins)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,
