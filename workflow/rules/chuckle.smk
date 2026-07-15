@@ -1,4 +1,4 @@
-# Chuckle (FFT-based interval intersection significance testing)
+# Chuckle (analytic NB interval intersection significance testing)
 #
 # WARNING: querying the full RME index requires ~250 GB RAM — allocate
 # --resources mem_mb=260000 and run at most one query job at a time.
@@ -27,7 +27,7 @@ rule chuckle_build:
 
 
 rule chuckle_index:
-    """Build chuckle Fourier-domain index from all processed RME beds.
+    """Build chuckle depth-map index from all processed RME beds.
 
     This is an expensive one-time build kept as a managed Snakemake artifact
     so query rules can depend on it without rebuilding unnecessarily.

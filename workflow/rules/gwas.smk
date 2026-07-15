@@ -8,6 +8,10 @@
 #
 # Regenerate all GWAS beds:
 #   snakemake gwas_all
+#
+# ROC-AUC benchmark (giggle + chuckle vs disease-tissue ground truth):
+#   snakemake data/gwas/roc_data.json
+#   snakemake data/plots/gwas_roc.png
 
 GWAS_DIR = "data/gwas"
 GWAS_RAW = f"{GWAS_DIR}/raw"
@@ -95,3 +99,58 @@ rule gwas_disease_tissue:
     shell:
         "uv run workflow/scripts/gwas_disease_tissue.py {input.doid} {input.hg19_dir} {output}"
 
+
+# ---------------------------------------------------------------------------
+# ROC-AUC benchmark
+#
+# Giggle results are available for all GWAS diseases; chuckle results are
+# picked up opportunistically from data/chuckle/ (expensive to generate —
+# see chuckle.smk).  The data artifact is rebuilt whenever giggle results
+# change; re-run manually after adding new chuckle results.
+# ---------------------------------------------------------------------------
+
+import json as _json
+from pathlib import Path as _Path
+
+# Traits with ground-truth tissue labels and existing giggle results
+_dt_path = f"{GWAS_DIR}/disease_tissue.json"
+if _Path(_dt_path).exists():
+    with open(_dt_path) as _f:
+        _DT = _json.load(_f)
+    GWAS_ROC_TRAITS = [
+        t for t in _DT
+        if _Path(f"data/giggle/{t}.tsv").exists()
+    ]
+else:
+    GWAS_ROC_TRAITS = []
+
+
+rule gwas_roc_data:
+    """Compute per-disease and combined ROC curves for giggle and chuckle."""
+    input:
+        disease_tissue=f"{GWAS_DIR}/disease_tissue.json",
+        giggle=expand("data/giggle/{trait}.tsv", trait=GWAS_ROC_TRAITS),
+    output:
+        f"{GWAS_DIR}/roc_data.json",
+    params:
+        giggle_dir="data/giggle",
+        chuckle_dir="data/chuckle",
+    shell:
+        "uv run workflow/scripts/gwas_roc.py"
+        " --disease-tissue {input.disease_tissue}"
+        " --giggle-dir {params.giggle_dir}"
+        " --chuckle-dir {params.chuckle_dir}"
+        " --output {output}"
+
+
+rule gwas_roc_plot:
+    """Plot ROC-AUC benchmark: combined curve + per-disease AUC bar chart."""
+    input:
+        f"{GWAS_DIR}/roc_data.json",
+    output:
+        "data/plots/gwas_roc.png",
+    shell:
+        "uv run workflow/scripts/gwas_roc_plot.py"
+        " --roc-data {input}"
+        " --output {output}"
+        " --no-show"
