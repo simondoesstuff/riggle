@@ -5,13 +5,13 @@
 # Run as:
 #   snakemake --resources mem_mb=260000 -j1 data/chuckle/<trait>.json
 #
-# The RME index (data/rme_chuckle) is managed by the chuckle_index rule below.
+# The RME index (data/roadmap_epigenomics/chuckle_index) is managed by the chuckle_index rule below.
 # Building it is a one-time cost; query jobs depend on it automatically.
 
 import os
 
 CHUCKLE_DIR = "data/chuckle"
-CHUCKLE_INDEX = "data/rme_chuckle"
+CHUCKLE_INDEX = f"{RME_DIR}/chuckle_index"
 CHUCKLE_BIN = "target/release/chuckle"
 
 
@@ -40,7 +40,7 @@ rule chuckle_index:
     params:
         beds_dir=RME_BEDS,
     shell:
-        "{input.bin} add -i {params.beds_dir} -d {output}"
+        "{input.bin} add -i {params.beds_dir} -d {output} --stats"
 
 
 rule chuckle_query:
