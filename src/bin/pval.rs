@@ -5,8 +5,10 @@
 use std::env;
 use std::path::Path;
 
-use chuckle::fourier::{DepthMap, build_chrom_cov_data, build_query_chrom_data,
-    compute_analytic_stats, coverage_dot_product, parse_bed_as_map};
+use chuckle::fourier::{
+    DEFAULT_MOMENTS_EPS, DepthMap, build_depth_moments, build_query_chrom_data,
+    compute_analytic_stats, coverage_dot_product, parse_bed_as_map,
+};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -32,11 +34,11 @@ fn main() {
     let b_dm = DepthMap::build(&b_bed);
 
     let a_data = build_query_chrom_data(&a_bed, None);
-    let b_cov = build_chrom_cov_data(&b_dm);
+    let b_moments = build_depth_moments(&b_dm, DEFAULT_MOMENTS_EPS);
 
     let observed = coverage_dot_product(&a_dm, &b_dm);
 
-    match compute_analytic_stats(&a_data, &b_cov, observed) {
+    match compute_analytic_stats(&a_data, &b_moments, observed) {
         None => eprintln!("No shared chromosomes."),
         Some((p_value, llr)) => {
             println!("---");

@@ -30,6 +30,12 @@ enum Commands {
         /// Maximum number of BED files to hold in memory at once (default: all)
         #[arg(long)]
         batch_size: Option<usize>,
+
+        /// Precompute FFT moment tables for analytic p-values at query time.
+        /// Adds O(N log N) per chromosome at index time; required for fast --stats
+        /// at query time (otherwise moments are recomputed on the fly).
+        #[arg(long)]
+        stats: bool,
     },
 
     /// Query a database with BED file(s)
@@ -79,7 +85,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Add { input, db, batch_size } => run_add(input, db, batch_size),
+        Commands::Add { input, db, batch_size, stats } => run_add(input, db, batch_size, stats),
         Commands::Query { db, query, output, stats, batch_size, whitelist, blacklist } => {
             run_query(db, query, output, stats, batch_size, whitelist, blacklist)
         }
@@ -96,9 +102,11 @@ fn run_add(
     input: PathBuf,
     db: PathBuf,
     batch_size: Option<usize>,
+    stats: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AddConfig::new(input, db);
     config.batch_size = batch_size;
+    config.compute_stats = stats;
     add_to_database(&config)?;
     Ok(())
 }

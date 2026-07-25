@@ -8,10 +8,14 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{QueryChromData, DepthMap, FilterMask, FilterMode, build_chrom_cov_data_with_filter, build_query_chrom_data, compute_analytic_stats, mean_interval_bins, parse_bed_as_map};
+use crate::fourier::{
+    ChromMoments, DEFAULT_MOMENTS_EPS, DepthMap, FilterMask, FilterMode, QueryChromData,
+    build_chrom_moments_with_filter, build_depth_moments, build_query_chrom_data,
+    compute_analytic_stats, mean_interval_bins, parse_bed_as_map,
+};
 use crate::io::{
-    BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, Meta, MetaError,
-    is_bed_file, parse_bed_file,
+    BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, MappedMomentStore,
+    Meta, MetaError, is_bed_file, parse_bed_file,
 };
 use crate::matrix::{DenseMatrix, SparseMatrix};
 use crate::sweep::query_sweep;
@@ -318,15 +322,13 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
 /// For every non-zero (q_sid, d_sid) pair in `counts`, compute analytic NB stats.
 ///
-/// Phase A: Load all needed DB DepthMaps from the consolidated store.
+/// Phase A: Load DB DepthMaps from `depthmap.rkyv` and, when available and no
+/// filter is active, pre-stored moments from `momentmap.rkyv`.
 ///
-/// Phase B: Build query coverage data once per query file (O(N_bins) per
-/// chromosome, no FFT).  Each file's per-bin coverage array is cached for
-/// reuse across all DB partners.
+/// Phase B: Build query interval data once per query file.
 ///
-/// Phase C: For each DB file, build DB coverage data once, then compute the
-/// observed overlap (dot product with each query's cached coverage array) and
-/// the analytic NB LLR/p-value.
+/// Phase C: For each DB file obtain moments (from store or computed on-the-fly
+/// via FFT), then score every overlapping query.
 fn compute_analytic_pvalues(
     counts: &SparseMatrix,
     query_file_paths: &[PathBuf],
@@ -347,18 +349,21 @@ fn compute_analytic_pvalues(
 
     let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
 
-    // Phase A: open the consolidated depth-map store.
+    // Phase A: open depth-map store (always needed) and moment store (optional).
     let store_path = db_path.join("depthmap.rkyv");
     let store = match MappedDepthStore::open(&store_path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
+    let moment_store_path = db_path.join("momentmap.rkyv");
+    let moment_store = MappedMomentStore::open(&moment_store_path).ok();
+
     let db_depthmaps: HashMap<u32, DepthMap> = by_db
         .par_iter()
         .filter_map(|(&d_sid, _)| Some((d_sid, store.get(d_sid)?)))
         .collect();
 
-    // Phase B: build query interval data and mean interval size once per query file.
+    // Phase B: build query interval data once per query file.
     let query_cov_data: HashMap<usize, (Vec<QueryChromData>, f64)> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
@@ -370,8 +375,7 @@ fn compute_analytic_pvalues(
         })
         .collect();
 
-    // Phase C: for each DB, build coverage data once then compute stats for
-    // every overlapping query.
+    // Phase C: obtain moments once per DB source, then score every query.
     by_db
         .par_iter()
         .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
@@ -379,7 +383,25 @@ fn compute_analytic_pvalues(
                 Some(d) => d,
                 None => return Vec::new(),
             };
-            let db_cov = build_chrom_cov_data_with_filter(dm, filter);
+
+            // Prefer pre-stored moments when no filter is active; otherwise compute
+            // on-the-fly (with filter applied) via FFT — once per DB source.
+            let db_moments: Vec<ChromMoments> = if let Some(ref ms) = moment_store {
+                if filter.is_none() {
+                    ms.get(d_sid).unwrap_or_else(|| {
+                        build_depth_moments(dm, DEFAULT_MOMENTS_EPS)
+                    })
+                } else {
+                    build_moments_with_filter(dm, filter.unwrap())
+                }
+            } else {
+                if filter.is_none() {
+                    build_depth_moments(dm, DEFAULT_MOMENTS_EPS)
+                } else {
+                    build_moments_with_filter(dm, filter.unwrap())
+                }
+            };
+
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
@@ -387,7 +409,7 @@ fn compute_analytic_pvalues(
                     let sweep_count = counts.get(q_sid, d_sid as usize).copied().unwrap_or(0);
                     let observed_bins = sweep_count as f64 * mean_iv;
                     let (p_value, llr) =
-                        compute_analytic_stats(q_data, &db_cov, observed_bins)?;
+                        compute_analytic_stats(q_data, &db_moments, observed_bins)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,
@@ -397,6 +419,20 @@ fn compute_analytic_pvalues(
                     })
                 })
                 .collect()
+        })
+        .collect()
+}
+
+/// Build per-chromosome moments from a DepthMap with a FilterMask applied.
+fn build_moments_with_filter(dm: &DepthMap, filter: &FilterMask) -> Vec<ChromMoments> {
+    dm.chroms
+        .iter()
+        .filter_map(|cdm| {
+            let mask = match filter.get(&cdm.chrom) {
+                Some(m) => m,
+                None => return None,
+            };
+            Some(build_chrom_moments_with_filter(cdm, mask, DEFAULT_MOMENTS_EPS))
         })
         .collect()
 }

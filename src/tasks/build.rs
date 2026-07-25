@@ -7,10 +7,10 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{DepthMap, intervals_to_bed_map};
+use crate::fourier::{DEFAULT_MOMENTS_EPS, DepthMap, build_depth_moments, intervals_to_bed_map};
 use crate::io::{
-    BedParseError, DepthStoreBuilder, LayerConfig, LayerError, Meta, MetaError, SidEntry,
-    build_jump_table, extend_jump_table, extend_layer, is_bed_file,
+    BedParseError, DepthStoreBuilder, LayerConfig, LayerError, Meta, MetaError,
+    MomentStoreBuilder, SidEntry, build_jump_table, extend_jump_table, extend_layer, is_bed_file,
     parse_bed_file, write_jump_table, write_layer,
 };
 
@@ -44,6 +44,10 @@ pub struct AddConfig {
     /// Maximum number of BED files to parse and hold in memory at once.
     /// `None` (default) processes all files in a single batch.
     pub batch_size: Option<usize>,
+    /// Whether to compute and store FFT moment tables for analytic p-values.
+    /// When false, `momentmap.rkyv` is not written and `--stats` at query time
+    /// will fall back to on-the-fly computation.
+    pub compute_stats: bool,
 }
 
 impl AddConfig {
@@ -53,6 +57,7 @@ impl AddConfig {
             db_path,
             layer_config: None,
             batch_size: None,
+            compute_stats: false,
         }
     }
 }
@@ -111,7 +116,7 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
 
     let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
     for batch in bed_files.chunks(batch_size) {
-        process_file_batch(batch, &mut meta, &config.db_path)?;
+        process_file_batch(batch, &mut meta, &config.db_path, config.compute_stats)?;
         meta.save(&config.db_path)?;
     }
 
@@ -123,6 +128,7 @@ fn process_file_batch(
     batch: &[PathBuf],
     meta: &mut Meta,
     db_path: &std::path::Path,
+    compute_stats: bool,
 ) -> Result<(), AddError> {
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
@@ -131,7 +137,7 @@ fn process_file_batch(
     let shards_dir = db_path.join("shards");
     fs::create_dir_all(&shards_dir)?;
 
-    // Parse all files in parallel, building depth maps in-memory.
+    // Parse all files in parallel, building depth maps and moments in-memory.
     // Each file is assigned a unique D_SID starting from `next_sid`.
     let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>, DepthMap), AddError>> =
         batch
@@ -151,9 +157,10 @@ fn process_file_batch(
             .collect();
 
     // Partition all intervals into (shard, layer_idx) buckets and collect
-    // depth maps for the consolidated store.
+    // depth maps and moment tables for the consolidated stores.
     let mut buckets: HashMap<(String, usize), Vec<Interval>> = HashMap::new();
     let mut new_sids: Vec<(u32, String)> = Vec::new();
+
     let store_path = db_path.join("depthmap.rkyv");
     let mut store = if store_path.exists() {
         DepthStoreBuilder::load(&store_path)?
@@ -161,9 +168,24 @@ fn process_file_batch(
         DepthStoreBuilder::new()
     };
 
+    let moment_path = db_path.join("momentmap.rkyv");
+    let mut moment_store = if compute_stats {
+        if moment_path.exists() {
+            MomentStoreBuilder::load(&moment_path)?
+        } else {
+            MomentStoreBuilder::new()
+        }
+    } else {
+        MomentStoreBuilder::new()
+    };
+
     for result in parse_results {
         let (sid, name, shard_map, dm) = result?;
         store.insert(sid, &dm);
+        if compute_stats {
+            let moments = build_depth_moments(&dm, DEFAULT_MOMENTS_EPS);
+            moment_store.insert(sid, &moments);
+        }
         new_sids.push((sid, name));
         for (shard, intervals) in shard_map {
             for iv in intervals {
@@ -223,8 +245,11 @@ fn process_file_batch(
         return Err(err);
     }
 
-    // Persist the consolidated depth-map store.
+    // Persist the consolidated depth-map and moment stores.
     store.save(&store_path)?;
+    if compute_stats {
+        moment_store.save(&moment_path)?;
+    }
 
     // Update meta: add new SID entries, shards, num_layers.
     let mut max_layer_used = meta.num_layers.saturating_sub(1);
