@@ -7,9 +7,9 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{DEFAULT_MOMENTS_EPS, DepthMap, build_depth_moments, intervals_to_bed_map};
+use crate::fourier::{DepthMap, build_depth_moments, intervals_to_bed_map};
 use crate::io::{
-    BedParseError, DepthStoreBuilder, LayerConfig, LayerError, Meta, MetaError,
+    BedParseError, LayerConfig, LayerError, Meta, MetaError,
     MomentStoreBuilder, SidEntry, build_jump_table, extend_jump_table, extend_layer, is_bed_file,
     parse_bed_file, write_jump_table, write_layer,
 };
@@ -46,7 +46,7 @@ pub struct AddConfig {
     pub batch_size: Option<usize>,
     /// Whether to compute and store FFT moment tables for analytic p-values.
     /// When false, `momentmap.rkyv` is not written and `--stats` at query time
-    /// will fall back to on-the-fly computation.
+    /// returns no p-values.
     pub compute_stats: bool,
 }
 
@@ -133,12 +133,10 @@ fn process_file_batch(
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
 
-    // Ensure the shards directory exists before the parallel section.
     let shards_dir = db_path.join("shards");
     fs::create_dir_all(&shards_dir)?;
 
-    // Parse all files in parallel, building depth maps and moments in-memory.
-    // Each file is assigned a unique D_SID starting from `next_sid`.
+    // Parse all files in parallel; build depth maps and moments in-memory.
     let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>, DepthMap), AddError>> =
         batch
             .par_iter()
@@ -156,17 +154,8 @@ fn process_file_batch(
             })
             .collect();
 
-    // Partition all intervals into (shard, layer_idx) buckets and collect
-    // depth maps and moment tables for the consolidated stores.
     let mut buckets: HashMap<(String, usize), Vec<Interval>> = HashMap::new();
     let mut new_sids: Vec<(u32, String)> = Vec::new();
-
-    let store_path = db_path.join("depthmap.rkyv");
-    let mut store = if store_path.exists() {
-        DepthStoreBuilder::load(&store_path)?
-    } else {
-        DepthStoreBuilder::new()
-    };
 
     let moment_path = db_path.join("momentmap.rkyv");
     let mut moment_store = if compute_stats {
@@ -181,9 +170,8 @@ fn process_file_batch(
 
     for result in parse_results {
         let (sid, name, shard_map, dm) = result?;
-        store.insert(sid, &dm);
         if compute_stats {
-            let moments = build_depth_moments(&dm, DEFAULT_MOMENTS_EPS);
+            let moments = build_depth_moments(&dm);
             moment_store.insert(sid, &moments);
         }
         new_sids.push((sid, name));
@@ -198,7 +186,7 @@ fn process_file_batch(
         }
     }
 
-    // Sort each bucket by start coordinate using voracious radix sort.
+    // Sort each bucket by start coordinate.
     let mut bucket_vec: Vec<((String, usize), Vec<Interval>)> = buckets.into_iter().collect();
     bucket_vec.par_iter_mut().for_each(|(_, ivs)| {
         ivs.voracious_sort();
@@ -230,10 +218,8 @@ fn process_file_batch(
             }
 
             let idx_result = if layer_exists {
-                // Merge into existing .idx (no-op if .idx is absent).
                 extend_jump_table(&idx_path, sorted_ivs, tile_sz)
             } else {
-                // New layer — create the .idx from scratch.
                 let table = build_jump_table(sorted_ivs, tile_sz);
                 write_jump_table(&idx_path, &table)
             };
@@ -245,13 +231,11 @@ fn process_file_batch(
         return Err(err);
     }
 
-    // Persist the consolidated depth-map and moment stores.
-    store.save(&store_path)?;
     if compute_stats {
         moment_store.save(&moment_path)?;
     }
 
-    // Update meta: add new SID entries, shards, num_layers.
+    // Update meta.
     let mut max_layer_used = meta.num_layers.saturating_sub(1);
 
     for (sid, name) in new_sids {
@@ -335,7 +319,6 @@ mod tests {
         let input = TempDir::new().unwrap();
         let db = TempDir::new().unwrap();
 
-        // Two files with interleaved coords — merged layer must be sorted
         write_bed(input.path(), "a.bed", "chr1\t300\t400\nchr1\t100\t200\n");
         write_bed(input.path(), "b.bed", "chr1\t150\t250\nchr1\t350\t450\n");
 
@@ -345,7 +328,6 @@ mod tests {
         ))
         .unwrap();
 
-        // All these intervals have size 100, which falls in layer 0 (size < 128)
         let layer_path = db.path().join("shards").join("chr1").join("layer_0.bin");
         assert!(layer_path.exists());
         let mapped = MappedLayer::open(&layer_path).unwrap();

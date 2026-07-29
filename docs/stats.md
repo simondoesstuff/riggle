@@ -17,43 +17,49 @@ independently over the DB with a uniform random position on each chromosome.
 The DB file is fixed with its full spatial structure.
 
 The test statistic is the **total base-pair overlap** between all query
-intervals and the DB file (A), measured in 100 bp bins and summed over all
+intervals and the DB file, measured in 100 bp bins and summed over all
 shared chromosomes.
 
 ---
 
 ## 2. Coverage Representation
 
-At index time, each source file is stored as a **sparse impulse train** — the
-derivative of its depth-of-coverage array.  Per chromosome, each interval
+At index time, each source file is stored as a **dense signed impulse train** —
+the derivative of its depth-of-coverage array.  Per chromosome, each interval
 `[s, e)` contributes:
 
 ```
-d[s] += (1 − frac_s),   d[s+1] += frac_s        (start spike, fractional)
-d[e] -= (1 − frac_e),   d[e+1] -= frac_e        (end spike, fractional)
+d[s/100]   += (1 − frac_s)      (fractional start spike, left bin)
+d[s/100+1] += frac_s             (fractional start spike, right bin)
+d[e/100]   -= (1 − frac_e)      (fractional end spike, left bin)
+d[e/100+1] -= frac_e             (fractional end spike, right bin)
 ```
 
-where `frac_x = (x mod 100) / 100` distributes each spike across the two
-adjacent 100 bp bins proportional to the sub-bin offset.
+where `frac_x = (x mod 100) / 100` distributes each spike proportionally
+across the two adjacent 100 bp bins.
 
-The coverage array `g[j]` is recovered by a single prefix sum:
+The coverage array `g[j]` is recovered by a SIMD-accelerated prefix sum:
 
 ```
 g[j] = Σ_{k ≤ j} d[k]
 ```
+
+The depth signal g[] is transient — only the moment tables (below) are
+persisted to `momentmap.rkyv`.
 
 ---
 
 ## 3. FFT Moment Computation
 
 For each DB chromosome of length N bins, the null distribution moments for
-any block size L are computed from three compacted arrays and one FFT:
+all block sizes L are computed from three compacted arrays and one FFT:
 
 ```
 d*[j]  = Σ_{k<j} g[k]              (prefix sum of coverage, size N+1)
 d**[j] = Σ_{k<j} d*[k]             (double prefix sum, size N+2)
 d2[j]  = Σ_{k<j} (d*[k])²         (prefix sum of squared d*, size N+2)
-R[L]   = IFFT(|FFT(d*)|²)[L]       (autocorrelation of d* via FFT)
+                                     computed with SIMD squaring (f64x4)
+R[L]   = IFFT(|FFT(d*)|²)[L]       (autocorrelation of d* via zero-padded FFT)
 ```
 
 The autocorrelation R is computed via zero-padded FFT (O(N log N)); all other
@@ -63,7 +69,7 @@ For any block size L:
 
 ```
 sum_f(L)  = d**[N+1] − d**[L] − d**[N−L+1]      (sum of window sums)
-sum_f2(L) = (d2[N+1] − d2[L]) + d2[N−L+1] − 2·R[L]  (sum of sq. window sums)
+sum_f2(L) = (d2[N+1] − d2[L]) + d2[N−L+1] − 2·R[L]
 n_w       = N − L + 1                              (number of windows)
 mean(L)   = sum_f(L)  / n_w
 var(L)    = sum_f2(L) / n_w  −  mean(L)²
@@ -74,22 +80,14 @@ uniformly at random; `var(L)` captures the true clustering structure of the DB.
 
 ---
 
-## 4. Compacted Moment Storage
+## 4. Dense Moment Storage
 
-All moments are computed once at index time and stored in `momentmap.rkyv`.
-Per chromosome, moments for a compacted set of representative block sizes are
-stored with a relative error bound ε (default 1%):
+All N-1 `(mean, var)` pairs (for L = 1, ..., N-1) are stored as f32 in
+`momentmap.rkyv`, indexed densely by L-1.  Lookup at query time is O(1) —
+a direct array access with no approximation.
 
-- **Dense region** L ∈ [1, ⌈1/ε⌉]: one `(mean, var)` pair per integer L.
-- **Sparse region** L > ⌈1/ε⌉: one pair per representative
-  L_m = ⌊dense_max · (1+ε)^m⌋ for m = 1, 2, …
-
-A query interval of length L maps to the nearest stored representative within
-relative error ε in block size.
-
-Storage per chromosome: O((1/ε) · log_{1+ε}(N/dense_max)) pairs ≈ 1,100
-pairs at ε = 0.01 for N = 2.5 M bins. Total: roughly 215 KB per DB file at
-single precision.
+Storage per chromosome: 2 × (N−1) × 4 bytes ≈ 20 MB for chr1 (N ≈ 2.49 M).
+Total for hg38: ≈ 250 MB per DB source.
 
 ---
 
@@ -101,8 +99,8 @@ For each query interval i of length l_i bins on chromosome c, look up the
 stored moments for block size l_i on that chromosome:
 
 ```
-μ_i  = mean(l_i)   (from M[l_i])
-σ²_i = var(l_i)    (from M[l_i])
+μ_i  = mean(l_i)   (from momentmap.rkyv)
+σ²_i = var(l_i)    (from momentmap.rkyv)
 ```
 
 Genome-wide null moments (independent intervals):
@@ -150,38 +148,29 @@ p = erfc(√LLR) / 2
 
 ---
 
-## 8. Positional Filter (Whitelist / Blacklist)
-
-An optional positional filter restricts analysis to accessible regions.
-When a filter is active, per-chromosome moments are computed on-the-fly at
-query time (via the same FFT approach) after zeroing non-accessible bins.
-This is done once per DB file (not per query file).
-
----
-
-## 9. Pipeline Summary
+## 8. Pipeline Summary
 
 ### Index time (per batch of BED files, parallel across files)
 
-1. Parse BED → build sparse impulse train (`depthmap.rkyv`).
-2. Build depth signal g → compute d*, d**, d2, R via FFT.
-3. Enumerate representative block sizes; store `(mean, var)` pairs in
-   `momentmap.rkyv`.
+1. Parse BED → assemble dense signed impulse train per chromosome.
+2. SIMD prefix sum (f32x8 two-pass scan) → depth signal g[].
+3. Build d*, d**, d2 (SIMD f64x4 for squaring), autocorrelation R via FFT.
+4. Compute mean(L) and var(L) for all L = 1..N-1.
+5. Store all (mean, var) pairs as f32 in `momentmap.rkyv`.
 
-Total index-time cost per chromosome: O(N log N) for the FFT.
+Total per chromosome: O(N log N) for the FFT; O(N) for prefix sums and storage.
 
 ### Query time (per (query, DB) pair)
 
 1. Sweep phase: count interval overlaps (unchanged).
 2. Stats phase:
-   - Load pre-stored moments from `momentmap.rkyv` (no-filter) or compute
-     moments on-the-fly with filter applied (O(N log N) per DB file).
-   - For each query interval: O(1) moment lookup.
+   - Load pre-stored moments from `momentmap.rkyv` (memmap'd, O(1) per lookup).
+   - For each query interval: O(1) moment lookup by direct array index.
    - Accumulate μ_null, σ²_null; fit NB; compute LLR and p-value.
 
 ---
 
-## 10. Output Fields
+## 9. Output Fields
 
 | Field           | Description                                                   |
 | --------------- | ------------------------------------------------------------- |

@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 
 use chuckle::io::Meta;
 use chuckle::stats::{StatResult, StatsOutput};
-use chuckle::fourier::FilterMode;
 use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
 
 #[derive(Parser)]
@@ -32,8 +31,7 @@ enum Commands {
         batch_size: Option<usize>,
 
         /// Precompute FFT moment tables for analytic p-values at query time.
-        /// Adds O(N log N) per chromosome at index time; required for fast --stats
-        /// at query time (otherwise moments are recomputed on the fly).
+        /// Adds O(N log N) per chromosome at index time; required for --stats at query time.
         #[arg(long)]
         stats: bool,
     },
@@ -53,24 +51,13 @@ enum Commands {
         output: PathBuf,
 
         /// Compute analytic NB p-values and LLR for all overlapping pairs.
+        /// Requires the database to have been built with --stats.
         #[arg(long)]
         stats: bool,
 
         /// Maximum number of query files to hold in memory at once (default: all)
         #[arg(long)]
         batch_size: Option<usize>,
-
-        /// Whitelist BED: only tiles covered by this file contribute to the p-value
-        /// calculation; chromosomes absent from the file are excluded entirely.
-        /// Mutually exclusive with --blacklist.  Only meaningful with --stats.
-        #[arg(long, conflicts_with = "blacklist")]
-        whitelist: Option<PathBuf>,
-
-        /// Blacklist BED: tiles covered by this file are excluded from the p-value
-        /// calculation; all other tiles remain accessible.
-        /// Mutually exclusive with --whitelist.  Only meaningful with --stats.
-        #[arg(long, conflicts_with = "whitelist")]
-        blacklist: Option<PathBuf>,
     },
 
     /// Print database summary (shards, sources, layers)
@@ -86,8 +73,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Add { input, db, batch_size, stats } => run_add(input, db, batch_size, stats),
-        Commands::Query { db, query, output, stats, batch_size, whitelist, blacklist } => {
-            run_query(db, query, output, stats, batch_size, whitelist, blacklist)
+        Commands::Query { db, query, output, stats, batch_size } => {
+            run_query(db, query, output, stats, batch_size)
         }
         Commands::Info { db } => run_info(db),
     };
@@ -117,24 +104,17 @@ fn run_query(
     output: PathBuf,
     stats: bool,
     batch_size: Option<usize>,
-    whitelist: Option<PathBuf>,
-    blacklist: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = QueryConfig::new(db, query);
     config.batch_size = batch_size;
     config.stats = stats;
-    config.filter = whitelist.map(|p| (p, FilterMode::Whitelist))
-        .or_else(|| blacklist.map(|p| (p, FilterMode::Blacklist)));
     let result = query_database(&config)?;
 
     let db_sources = &result.db_sources;
     let query_names = &result.query_names;
 
-    // When stats are enabled, pvalues covers every (q_sid, d_sid) pair
-    // (non-zero overlaps with computed p-values, plus zero-overlap pairs with
-    // p_value=1.0).  Drive the output from that complete list so no pair is
-    // silently absent.  Without stats, fall back to the sparse matrix which
-    // only records non-zero overlaps.
+    // When stats are enabled, pvalues covers every (q_sid, d_sid) pair.
+    // Without stats, fall back to the sparse matrix which only records non-zero overlaps.
     let mut stat_results: Vec<StatResult> = if stats {
         result
             .pvalues

@@ -9,7 +9,6 @@ use rayon::prelude::*;
 use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
-use crate::fourier::{FilterMask, FilterMode, parse_bed_as_map};
 use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
 use crate::matrix::{DenseMatrix, SparseMatrix};
 
@@ -45,13 +44,6 @@ pub struct QueryConfig {
     /// When `true`, compute analytic NB p-values and LLR for every
     /// (query, DB) pair with at least one interval overlap.
     pub stats: bool,
-    /// Optional positional filter: a BED file paired with a [`FilterMode`].
-    ///
-    /// - `Whitelist`: only 100 bp tiles covered by the BED contribute; chromosomes
-    ///   absent from the BED are excluded entirely.
-    /// - `Blacklist`: tiles covered by the BED are zeroed out; all other tiles
-    ///   remain accessible.
-    pub filter: Option<(std::path::PathBuf, FilterMode)>,
 }
 
 impl QueryConfig {
@@ -62,7 +54,6 @@ impl QueryConfig {
             num_threads: None,
             batch_size: None,
             stats: false,
-            filter: None,
         }
     }
 }
@@ -242,17 +233,13 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
     let pvalues = if config.stats {
-        let filter = config.filter.as_ref().and_then(|(p, mode)| {
-            parse_bed_as_map(p).ok().map(|bed| FilterMask::build(&bed, *mode))
-        });
         let mut pvalues = compute_analytic_pvalues(
             &final_counts,
             &query_file_paths,
             &config.db_path,
-            filter.as_ref(),
         );
-        // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
-        // under any null).  Emit them explicitly so callers get a complete result set.
+        // Zero-overlap pairs have a trivially known p-value of 1.0.
+        // Emit them explicitly so callers get a complete result set.
         for q_sid in 0..num_queries {
             let row = final_counts.outer_view(q_sid);
             let nonzero: HashSet<usize> = row
@@ -530,22 +517,22 @@ mod tests {
         let input = TempDir::new().unwrap();
         let db = TempDir::new().unwrap();
 
-        write_bed(input.path(), "a.bed", "chr1\t100\t200\n");
-        write_bed(input.path(), "b.bed", "chr1\t500\t600\n");
-        add_to_database(&AddConfig::new(
-            input.path().to_path_buf(),
-            db.path().to_path_buf(),
-        ))
-        .unwrap();
+        // Use chr22 (510K bins) to keep the FFT moment computation fast in tests.
+        write_bed(input.path(), "a.bed", "chr22\t100\t200\n");
+        write_bed(input.path(), "b.bed", "chr22\t5000000\t5000100\n");
+        let mut add_cfg = AddConfig::new(input.path().to_path_buf(), db.path().to_path_buf());
+        add_cfg.compute_stats = true;
+        add_to_database(&add_cfg).unwrap();
 
         let query_dir = TempDir::new().unwrap();
-        write_bed(query_dir.path(), "q.bed", "chr1\t100\t200\n");
+        write_bed(query_dir.path(), "q.bed", "chr22\t100\t200\n");
 
         let mut config =
             QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
         config.stats = true;
         let result = query_database(&config).unwrap();
 
+        // 2 DB sources × 1 query file = 2 pvalue entries.
         assert_eq!(result.pvalues.len(), 2);
 
         let zero_pair = result

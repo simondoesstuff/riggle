@@ -85,11 +85,9 @@ fn erfc(x: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::fourier::{
-        BedMap, ChromMoments, DEFAULT_MOMENTS_EPS, DepthMap, build_depth_moments,
-        build_query_chrom_data,
+        BedMap, ChromMoments, DepthMap, build_depth_moments, build_query_chrom_data,
     };
 
-    /// Build a lookup closure from a slice of ChromMoments (for tests / fallback path).
     fn make_lookup(moments: &[ChromMoments]) -> impl Fn(&str, f64) -> Option<(f64, f64)> + '_ {
         |chrom, l| moments.iter().find(|m| m.chrom == chrom)?.lookup(l)
     }
@@ -100,12 +98,12 @@ mod tests {
     fn test_compute_analytic_stats_no_shared_chrom() {
         let mut q_bed = BedMap::new();
         q_bed.insert("chr21".to_string(), vec![(10_000_000, 10_001_000)]);
-        let q_data = build_query_chrom_data(&q_bed, None);
+        let q_data = build_query_chrom_data(&q_bed);
 
         let mut db_bed = BedMap::new();
         db_bed.insert("chr22".to_string(), vec![(10_000_000, 10_001_000)]);
         let db_dm = DepthMap::build(&db_bed);
-        let db_moments = build_depth_moments(&db_dm, DEFAULT_MOMENTS_EPS);
+        let db_moments = build_depth_moments(&db_dm);
 
         assert!(compute_analytic_stats(&q_data, make_lookup(&db_moments), 0.0).is_none());
     }
@@ -114,12 +112,12 @@ mod tests {
     fn test_compute_analytic_stats_zero_observed() {
         let mut q_bed = BedMap::new();
         q_bed.insert("chr22".to_string(), vec![(0, 1_000_000)]);
-        let q_data = build_query_chrom_data(&q_bed, None);
+        let q_data = build_query_chrom_data(&q_bed);
 
         let mut db_bed = BedMap::new();
         db_bed.insert("chr22".to_string(), vec![(49_000_000, 50_000_000)]);
         let db_dm = DepthMap::build(&db_bed);
-        let db_moments = build_depth_moments(&db_dm, DEFAULT_MOMENTS_EPS);
+        let db_moments = build_depth_moments(&db_dm);
 
         let (p_value, _) =
             compute_analytic_stats(&q_data, make_lookup(&db_moments), 0.0).unwrap();
@@ -134,11 +132,11 @@ mod tests {
         let mut db_bed = BedMap::new();
         db_bed.insert("chr22".to_string(), ivs.clone());
         let db_dm = DepthMap::build(&db_bed);
-        let db_moments = build_depth_moments(&db_dm, DEFAULT_MOMENTS_EPS);
+        let db_moments = build_depth_moments(&db_dm);
 
         let mut q_bed = BedMap::new();
         q_bed.insert("chr22".to_string(), ivs);
-        let q_data = build_query_chrom_data(&q_bed, None);
+        let q_data = build_query_chrom_data(&q_bed);
 
         let (_p_value, llr) =
             compute_analytic_stats(&q_data, make_lookup(&db_moments), 25_000.0).unwrap();

@@ -1,8 +1,12 @@
 //! Single-file rkyv-backed store for per-source FFT moment tables.
 //!
-//! Parallel to `depthmap.rkyv`; written at index time, read at query time.
-//! `maps[sid]` holds the per-chromosome compacted (mean, var) tables for that
+//! `maps[sid]` holds the per-chromosome dense `(mean, var)` tables for that
 //! source.  SIDs are dense, so the vec index is the SID — O(1) lookup.
+//!
+//! # On-disk layout
+//! Per chromosome: a flat `Vec<f32>` of length `2*(n_bins-1)`, storing
+//! `[mean_1, var_1, mean_2, var_2, …]` for block sizes L = 1..n_bins-1.
+//! Query lookup for size L is a direct index at `(L-1)*2` — no approximation.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,57 +24,39 @@ use crate::fourier::ChromMoments;
 struct StoredChromMoments {
     chrom: String,
     n_bins: u32,
-    /// Stored as f32 to save space; converted to f64 on load.
-    eps: f32,
-    dense_max: u32,
-    /// Flattened (mean, var) pairs: [mean_0, var_0, mean_1, var_1, …]
+    /// Flattened (mean, var) pairs as f32: [mean_1, var_1, mean_2, var_2, …]
+    /// Entry for block size L is at index (L-1)*2 and (L-1)*2+1.
     moments: Vec<f32>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone)]
 struct MomentStore {
-    /// `maps[sid]` = per-chromosome moments for that source; empty = absent.
     maps: Vec<Vec<StoredChromMoments>>,
 }
 
 // ── Zerocopy handle for one SID ───────────────────────────────────────────────
 
-/// Zerocopy moment lookup for a single DB source.
-///
-/// Backed directly by the mmap'd `momentmap.rkyv` — no f32→f64 conversion or
-/// allocation beyond the one-time O(chroms) index built at access time.
 pub struct MappedSidMoments<'a> {
     entry: &'a [ArchivedStoredChromMoments],
-    /// chrom name → index into `entry`; built once, O(1) lookup.
     index: HashMap<&'a str, usize>,
 }
 
 impl<'a> MappedSidMoments<'a> {
     /// Return `(mean, var)` for a sliding window of `l_bins` bins on `chrom`.
     ///
-    /// Reads directly from the archived f32 slice — no allocation.
-    /// Returns `None` when `chrom` is absent, `l_bins` rounds to 0, or ≥ n_bins.
+    /// Direct O(1) index — no approximation.
+    /// Returns `None` when `chrom` is absent or `l_bins` rounds to 0 or ≥ n_bins.
     pub fn lookup(&self, chrom: &str, l_bins: f64) -> Option<(f64, f64)> {
         let &i = self.index.get(chrom)?;
         let acm = &self.entry[i];
         let n_bins = u32::from(acm.n_bins) as usize;
-        let dense_max = u32::from(acm.dense_max) as usize;
-        let eps = f32::from(acm.eps) as f64;
         let l = l_bins.round() as usize;
-        if l == 0 || l >= n_bins || acm.moments.is_empty() {
+        if l == 0 || l >= n_bins {
             return None;
         }
-        let n_pairs = acm.moments.len() / 2;
-        let idx = if l <= dense_max {
-            l - 1
-        } else {
-            let m = ((l as f64 / dense_max as f64).ln() / (1.0 + eps).ln())
-                .floor()
-                .max(1.0) as usize;
-            (dense_max + m - 1).min(n_pairs - 1)
-        };
-        let mean = f32::from(acm.moments[idx * 2]) as f64;
-        let var = f32::from(acm.moments[idx * 2 + 1]) as f64;
+        let base = (l - 1) * 2;
+        let mean = f32::from(acm.moments[base]) as f64;
+        let var = f32::from(acm.moments[base + 1]) as f64;
         Some((mean, var))
     }
 }
@@ -92,9 +78,6 @@ impl MappedMomentStore {
         unsafe { rkyv::access_unchecked::<ArchivedMomentStore>(&self.mmap[..]) }
     }
 
-    /// Return a zerocopy handle for `sid`, or `None` if not present.
-    ///
-    /// Builds a chrom→index map (O(chroms)) once; subsequent `lookup` calls are O(1).
     pub fn get_sid(&self, sid: u32) -> Option<MappedSidMoments<'_>> {
         let entry = self.archived().maps.get(sid as usize)?;
         if entry.is_empty() {
@@ -145,14 +128,12 @@ impl MomentStoreBuilder {
             .map(|m| {
                 let mut flat = Vec::with_capacity(m.moments.len() * 2);
                 for &(mean, var) in &m.moments {
-                    flat.push(mean as f32);
-                    flat.push(var as f32);
+                    flat.push(mean);
+                    flat.push(var);
                 }
                 StoredChromMoments {
                     chrom: m.chrom.clone(),
                     n_bins: m.n_bins as u32,
-                    eps: m.eps as f32,
-                    dense_max: m.dense_max as u32,
                     moments: flat,
                 }
             })
@@ -174,7 +155,7 @@ impl MomentStoreBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fourier::{BedMap, DepthMap, build_depth_moments, DEFAULT_MOMENTS_EPS};
+    use crate::fourier::{BedMap, DepthMap, build_depth_moments};
     use tempfile::TempDir;
 
     fn make_moments() -> Vec<ChromMoments> {
@@ -182,7 +163,7 @@ mod tests {
         bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
         bed.insert("chr1".to_string(), vec![(1_000_000, 2_000_000)]);
         let dm = DepthMap::build(&bed);
-        build_depth_moments(&dm, DEFAULT_MOMENTS_EPS)
+        build_depth_moments(&dm)
     }
 
     #[test]
@@ -201,17 +182,18 @@ mod tests {
         for sid in 0..2u32 {
             let sid_m = store.get_sid(sid).unwrap();
             for orig in &moments {
-                // Verify dense and sparse lookups round-trip within f32 precision.
                 for &l in &[50.0f64, 500.0] {
                     if let Some((exp_m, exp_v)) = orig.lookup(l) {
                         let (got_m, got_v) = sid_m.lookup(&orig.chrom, l).unwrap();
                         assert!(
                             (got_m - exp_m).abs() < exp_m.abs() * 1e-5 + 1e-10,
-                            "mean mismatch L={}: {} vs {}", l, got_m, exp_m
+                            "mean mismatch L={}: {} vs {}",
+                            l, got_m, exp_m
                         );
                         assert!(
                             (got_v - exp_v).abs() < exp_v.abs() * 1e-5 + 1e-10,
-                            "var mismatch L={}: {} vs {}", l, got_v, exp_v
+                            "var mismatch L={}: {} vs {}",
+                            l, got_v, exp_v
                         );
                     }
                 }

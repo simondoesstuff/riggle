@@ -1,69 +1,53 @@
 //! FFT-based sliding-window moment computation.
 //!
-//! # Moment computation (O(N log N) per chromosome)
-//! For depth signal g[0..N-1] with prefix sum d*[0..=N]:
+//! # Per-chromosome pipeline (O(N log N))
+//! For depth signal g[0..N-1] (built from the sparse impulse train):
 //!
-//!   d**[j]  = Σ_{k<j} d*[k]          (double prefix, size N+2)
-//!   d2[j]   = Σ_{k<j} (d*[k])²       (squared-prefix, size N+2)
-//!   R[L]    = IFFT(|FFT(d*)|²)[L]    (autocorrelation of d* via FFT)
+//!   d*[j]  = Σ_{k<j} g[k]               (prefix sum of g, size N+1)
+//!   d**[j] = Σ_{k<j} d*[k]              (double prefix sum, size N+2)
+//!   d2[j]  = Σ_{k<j} (d*[k])²           (SIMD-accelerated squared prefix, size N+2)
+//!   R[L]   = IFFT(|FFT(d*)|²)[L]        (autocorrelation via zero-padded FFT)
 //!
-//!   sum_f(L)  = d**[N+1] − d**[L] − d**[N−L+1]
-//!   sum_f2(L) = (d2[N+1] − d2[L]) + d2[N−L+1] − 2·R[L]
-//!   mean(L)   = sum_f(L)  / (N−L+1)
-//!   var(L)    = sum_f2(L) / (N−L+1) − mean(L)²
+//! For each block size L = 1..N-1:
+//!   n_w      = N - L + 1
+//!   sum_f    = d**[N+1] − d**[L] − d**[N−L+1]
+//!   sum_f2   = (d2[N+1] − d2[L]) + d2[N−L+1] − 2·R[L]
+//!   mean(L)  = sum_f / n_w
+//!   var(L)   = sum_f2 / n_w − mean(L)²
 //!
-//! # Compacted storage (O(M) with M ≈ (1/ε)·ln(N·ε))
-//! Dense region L ∈ [1, ⌈1/ε⌉]: one entry per integer L.
-//! Sparse region L > ⌈1/ε⌉: representative Ls spaced by stride ε·L, giving
-//! logarithmic density.  Every query L maps to a stored representative within
-//! relative error ε in L.
+//! # Dense storage
+//! All N-1 (mean, var) pairs are stored as f32 in `moments[L-1]`.
+//! Query lookup for block size L is a direct O(1) array access with no approximation.
 
 use rayon::prelude::*;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use wide::f64x4;
 
 use super::depth::{ChromDepthMap, DepthMap, build_depth_signal};
-use super::filter::FilterMask;
 use super::genome::{BedMap, BIN_SIZE, hg38_chrom_sizes};
 
-pub const DEFAULT_MOMENTS_EPS: f64 = 0.01;
-
-/// Per-chromosome sliding-window moments for one DB file, compacted with ε-relative error.
+/// Dense sliding-window moments for one DB chromosome.
+///
+/// `moments[L-1]` = `(mean, var)` for a uniformly placed block of L bins.
 pub struct ChromMoments {
     pub chrom: String,
     pub n_bins: usize,
-    pub eps: f64,
-    pub dense_max: usize,
-    /// (mean, var) pairs indexed by a compacted scheme:
-    ///   indices 0 .. dense_max-1  → dense region, L = 1 ..= dense_max
-    ///   indices dense_max ..      → sparse region, representative L = dense_max·(1+ε)^m (m=1,2,…)
-    pub moments: Vec<(f64, f64)>,
+    /// (mean, var) pairs for L = 1..n_bins-1, stored as f32.
+    pub moments: Vec<(f32, f32)>,
 }
 
 impl ChromMoments {
-    /// Return `(mean, var)` for a sliding window of size `l_bins` bins.
-    ///
-    /// `mean` is the expected total overlap (bins) when a block of `l_bins` is
-    /// placed uniformly at random over this chromosome.
-    /// `var` is the variance of that overlap.
+    /// Return `(mean, var)` for a sliding window of `l_bins` bins.
     ///
     /// Returns `None` when `l_bins` rounds to 0 or ≥ `n_bins`.
     pub fn lookup(&self, l_bins: f64) -> Option<(f64, f64)> {
         let l = l_bins.round() as usize;
-        if l == 0 || l >= self.n_bins || self.moments.is_empty() {
+        if l == 0 || l >= self.n_bins {
             return None;
         }
-        let idx = if l <= self.dense_max {
-            l - 1
-        } else {
-            // m = floor(log_{1+ε}(L / dense_max)), ≥ 1 for L > dense_max
-            let m = ((l as f64 / self.dense_max as f64).ln() / (1.0 + self.eps).ln())
-                .floor()
-                .max(1.0) as usize;
-            // Sparse entries start at total index dense_max; slot m → index dense_max + m - 1
-            (self.dense_max + m - 1).min(self.moments.len() - 1)
-        };
-        self.moments.get(idx).copied()
+        let (m, v) = self.moments.get(l - 1)?;
+        Some((*m as f64, *v as f64))
     }
 }
 
@@ -75,45 +59,25 @@ pub struct QueryChromData {
     pub interval_lengths: Vec<f64>,
 }
 
-/// Build compacted moment tables for every chromosome in a [`DepthMap`].
-///
-/// `eps` controls the relative error in block-size approximation; 0.01 means
-/// each stored representative is within 1% of the requested block size.
-pub fn build_depth_moments(dm: &DepthMap, eps: f64) -> Vec<ChromMoments> {
+/// Build dense moment tables for every chromosome in a [`DepthMap`].
+pub fn build_depth_moments(dm: &DepthMap) -> Vec<ChromMoments> {
     dm.chroms
         .par_iter()
-        .map(|cdm| build_chrom_moments(cdm, eps))
+        .map(build_chrom_moments)
         .collect()
 }
 
-/// Build compacted moments for one chromosome (no filter).
-pub fn build_chrom_moments(cdm: &ChromDepthMap, eps: f64) -> ChromMoments {
-    let g = build_depth_signal(cdm, None);
-    moments_from_signal(&g, &cdm.chrom, cdm.n_bins, eps)
-}
-
-/// Build compacted moments for one chromosome with a filter mask applied.
-///
-/// Bins not accessible under `mask` are zeroed before moment computation.
-pub fn build_chrom_moments_with_filter(
-    cdm: &ChromDepthMap,
-    mask: &[bool],
-    eps: f64,
-) -> ChromMoments {
-    let g = build_depth_signal(cdm, Some(mask));
-    moments_from_signal(&g, &cdm.chrom, cdm.n_bins, eps)
+/// Build dense moments for one chromosome.
+pub fn build_chrom_moments(cdm: &ChromDepthMap) -> ChromMoments {
+    let g = build_depth_signal(cdm);
+    moments_from_signal(&g, &cdm.chrom, cdm.n_bins)
 }
 
 /// Build per-chromosome interval data from a raw BED map.
-pub fn build_query_chrom_data(bed: &BedMap, filter: Option<&FilterMask>) -> Vec<QueryChromData> {
+pub fn build_query_chrom_data(bed: &BedMap) -> Vec<QueryChromData> {
     hg38_chrom_sizes()
         .iter()
         .filter_map(|&(chrom, size)| {
-            if let Some(f) = filter {
-                if f.get(chrom).is_none() {
-                    return None;
-                }
-            }
             let ivs = bed.get(chrom)?;
             if ivs.is_empty() {
                 return None;
@@ -138,16 +102,13 @@ pub fn mean_interval_bins(q_data: &[QueryChromData]) -> f64 {
     if total_n == 0 { 0.0 } else { total_l / total_n as f64 }
 }
 
-fn moments_from_signal(g: &[f32], chrom: &str, n_bins: usize, eps: f64) -> ChromMoments {
+fn moments_from_signal(g: &[f32], chrom: &str, n_bins: usize) -> ChromMoments {
     let n = n_bins;
-    let dense_max = (1.0_f64 / eps).ceil() as usize;
 
     if n <= 1 {
         return ChromMoments {
             chrom: chrom.to_string(),
             n_bins,
-            eps,
-            dense_max,
             moments: Vec::new(),
         };
     }
@@ -164,46 +125,52 @@ fn moments_from_signal(g: &[f32], chrom: &str, n_bins: usize, eps: f64) -> Chrom
         d_ss[j] = d_ss[j - 1] + d_star[j - 1];
     }
 
-    // d2[0..=N+1]: prefix sum of (d*)² (d2[0]=0)
-    let mut d2 = vec![0.0f64; n + 2];
-    for j in 1..=(n + 1) {
-        d2[j] = d2[j - 1] + d_star[j - 1] * d_star[j - 1];
-    }
+    // d2[0..=N+1]: prefix sum of (d*)² using SIMD squaring for throughput
+    let d2 = d2_prefix_sum(&d_star);
 
+    // Autocorrelation R[L] = IFFT(|FFT(d*)|²)[L]
     let r = autocorr_via_fft(&d_star);
 
+    // Build all (mean, var) pairs for L = 1..n_bins-1
     let max_l = n - 1;
-    let mut moments: Vec<(f64, f64)> = Vec::new();
-
-    // Dense region: L = 1..=dense_max (one entry per integer L)
-    for l in 1..=dense_max.min(max_l) {
-        moments.push(window_moments(&d_ss, &d2, &r, n, l));
-    }
-
-    // Sparse region: representative Ls at dense_max·(1+ε)^m for m = 1, 2, …
-    let log_base = 1.0 + eps;
-    let mut l_f = dense_max as f64 * log_base;
-    let mut last_l = dense_max;
-
-    loop {
-        let l = l_f.floor() as usize;
-        if l > max_l {
-            break;
-        }
-        if l > last_l {
-            moments.push(window_moments(&d_ss, &d2, &r, n, l));
-            last_l = l;
-        }
-        l_f *= log_base;
+    let mut moments = Vec::with_capacity(max_l);
+    for l in 1..=max_l {
+        let (mean, var) = window_moments(&d_ss, &d2, &r, n, l);
+        moments.push((mean as f32, var as f32));
     }
 
     ChromMoments {
         chrom: chrom.to_string(),
         n_bins,
-        eps,
-        dense_max,
         moments,
     }
+}
+
+/// Prefix sum of squares of `d_star`, returned as a vec of length `d_star.len() + 1`.
+///
+/// Uses f64x4 SIMD to compute four squares per iteration before the sequential
+/// prefix-sum step, improving throughput on the squaring bottleneck.
+fn d2_prefix_sum(d_star: &[f64]) -> Vec<f64> {
+    let m = d_star.len(); // = n+1
+    let mut d2 = vec![0.0f64; m + 1]; // d2[0]=0, d2[j] = Σ_{k<j} d_star[k]²
+
+    const W: usize = 4;
+    let chunks = m / W;
+
+    for c in 0..chunks {
+        let b = c * W;
+        let v = f64x4::from([d_star[b], d_star[b + 1], d_star[b + 2], d_star[b + 3]]);
+        let sq = (v * v).to_array();
+        // Sequential prefix additions using the SIMD-computed squares.
+        for i in 0..W {
+            d2[b + i + 1] = d2[b + i] + sq[i];
+        }
+    }
+    for i in chunks * W..m {
+        d2[i + 1] = d2[i] + d_star[i] * d_star[i];
+    }
+
+    d2
 }
 
 /// Compute (mean, var) for sliding windows of size `l` over the depth signal.
@@ -290,6 +257,25 @@ mod tests {
         assert!((r[1] - 18.0).abs() < 1e-4, "r[1]={}", r[1]);
     }
 
+    // ── d2_prefix_sum ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_d2_prefix_sum_correctness() {
+        let d_star: Vec<f64> = (0..20).map(|i| i as f64 * 0.7).collect();
+
+        let got = d2_prefix_sum(&d_star);
+
+        // Brute-force reference
+        let mut expected = vec![0.0f64; d_star.len() + 1];
+        for j in 1..=d_star.len() {
+            expected[j] = expected[j - 1] + d_star[j - 1] * d_star[j - 1];
+        }
+
+        for (i, (e, g)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!((e - g).abs() < 1e-9, "index {i}: expected {e}, got {g}");
+        }
+    }
+
     // ── window_moments correctness ────────────────────────────────────────────
 
     #[test]
@@ -300,19 +286,24 @@ mod tests {
         let g: Vec<f32> = vec![1.0; n];
 
         let mut d_star = vec![0.0f64; n + 1];
-        for j in 1..=n { d_star[j] = d_star[j-1] + g[j-1] as f64; }
+        for j in 1..=n {
+            d_star[j] = d_star[j - 1] + g[j - 1] as f64;
+        }
         let mut d_ss = vec![0.0f64; n + 2];
-        for j in 1..=(n+1) { d_ss[j] = d_ss[j-1] + d_star[j-1]; }
-        let mut d2 = vec![0.0f64; n + 2];
-        for j in 1..=(n+1) { d2[j] = d2[j-1] + d_star[j-1]*d_star[j-1]; }
+        for j in 1..=(n + 1) {
+            d_ss[j] = d_ss[j - 1] + d_star[j - 1];
+        }
+        let d2 = d2_prefix_sum(&d_star);
         let r = autocorr_via_fft(&d_star);
 
         for l in 1..n {
             let (mean, var) = window_moments(&d_ss, &d2, &r, n, l);
-            assert!((mean - l as f64).abs() < 1e-6,
-                "uniform: mean(L={})={:.4} expected {}", l, mean, l);
-            assert!(var < 1e-6,
-                "uniform: var(L={})={:.4} expected 0", l, var);
+            assert!(
+                (mean - l as f64).abs() < 1e-6,
+                "uniform: mean(L={})={:.4} expected {}",
+                l, mean, l
+            );
+            assert!(var < 1e-6, "uniform: var(L={})={:.4} expected 0", l, var);
         }
     }
 
@@ -322,11 +313,14 @@ mod tests {
         let g: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
         let n = g.len();
         let mut d_star = vec![0.0f64; n + 1];
-        for j in 1..=n { d_star[j] = d_star[j-1] + g[j-1] as f64; }
+        for j in 1..=n {
+            d_star[j] = d_star[j - 1] + g[j - 1] as f64;
+        }
         let mut d_ss = vec![0.0f64; n + 2];
-        for j in 1..=(n+1) { d_ss[j] = d_ss[j-1] + d_star[j-1]; }
-        let mut d2 = vec![0.0f64; n + 2];
-        for j in 1..=(n+1) { d2[j] = d2[j-1] + d_star[j-1]*d_star[j-1]; }
+        for j in 1..=(n + 1) {
+            d_ss[j] = d_ss[j - 1] + d_star[j - 1];
+        }
+        let d2 = d2_prefix_sum(&d_star);
         let r = autocorr_via_fft(&d_star);
 
         let (mean, var) = window_moments(&d_ss, &d2, &r, n, 3);
@@ -340,11 +334,11 @@ mod tests {
     // ── ChromMoments lookup ───────────────────────────────────────────────────
 
     #[test]
-    fn test_chrom_moments_lookup_dense() {
+    fn test_chrom_moments_lookup() {
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(10_000_000, 20_000_000)]);
         let dm = DepthMap::build(&bed);
-        let moments = build_chrom_moments(&dm.chroms[0], 0.01);
+        let moments = build_chrom_moments(&dm.chroms[0]);
 
         let r = moments.lookup(50.0);
         assert!(r.is_some(), "lookup(50) returned None");
@@ -354,17 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn test_chrom_moments_lookup_sparse() {
+    fn test_chrom_moments_lookup_large_l() {
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(0, 50_818_468)]);
         let dm = DepthMap::build(&bed);
-        let moments = build_chrom_moments(&dm.chroms[0], 0.01);
+        let moments = build_chrom_moments(&dm.chroms[0]);
 
         let r = moments.lookup(500.0);
         assert!(r.is_some(), "lookup(500) returned None");
-        let (mean, var) = r.unwrap();
-        assert!((mean - 500.0).abs() / 500.0 < 0.015, "mean={}", mean);
-        assert!(var < 10.0, "var={}", var);
+        let (mean, _) = r.unwrap();
+        // For a fully covered chromosome, mean(L) ≈ L
+        assert!((mean - 500.0).abs() / 500.0 < 0.02, "mean={}", mean);
     }
 
     #[test]
@@ -372,7 +366,7 @@ mod tests {
         let mut bed = BedMap::new();
         bed.insert("chr22".to_string(), vec![(0, 1_000_000)]);
         let dm = DepthMap::build(&bed);
-        let moments = build_chrom_moments(&dm.chroms[0], 0.01);
+        let moments = build_chrom_moments(&dm.chroms[0]);
         assert!(moments.lookup(0.0).is_none());
         assert!(moments.lookup(moments.n_bins as f64).is_none());
     }

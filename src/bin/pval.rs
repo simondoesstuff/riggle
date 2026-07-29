@@ -6,7 +6,7 @@ use std::env;
 use std::path::Path;
 
 use chuckle::fourier::{
-    DEFAULT_MOMENTS_EPS, DepthMap, build_depth_moments, build_query_chrom_data,
+    DepthMap, build_depth_moments, build_query_chrom_data,
     compute_analytic_stats, coverage_dot_product, parse_bed_as_map,
 };
 
@@ -33,8 +33,8 @@ fn main() {
     let a_dm = DepthMap::build(&a_bed);
     let b_dm = DepthMap::build(&b_bed);
 
-    let a_data = build_query_chrom_data(&a_bed, None);
-    let b_moments = build_depth_moments(&b_dm, DEFAULT_MOMENTS_EPS);
+    let a_data = build_query_chrom_data(&a_bed);
+    let b_moments = build_depth_moments(&b_dm);
 
     let observed = coverage_dot_product(&a_dm, &b_dm);
 
