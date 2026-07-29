@@ -38,7 +38,8 @@ fn main() {
 
     let observed = coverage_dot_product(&a_dm, &b_dm);
 
-    match compute_analytic_stats(&a_data, &b_moments, observed) {
+    let lookup = |chrom: &str, l: f64| b_moments.iter().find(|m| m.chrom == chrom)?.lookup(l);
+    match compute_analytic_stats(&a_data, lookup, observed) {
         None => eprintln!("No shared chromosomes."),
         Some((p_value, llr)) => {
             println!("---");

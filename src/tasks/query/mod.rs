@@ -1,31 +1,21 @@
-use std::cell::RefCell;
+mod files;
+mod pvalues;
+mod sweep;
+
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use rayon::prelude::*;
 use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
-use crate::core::Interval;
-use crate::fourier::{
-    ChromMoments, DEFAULT_MOMENTS_EPS, DepthMap, FilterMask, FilterMode, QueryChromData,
-    build_chrom_moments_with_filter, build_depth_moments, build_query_chrom_data,
-    compute_analytic_stats, mean_interval_bins, parse_bed_as_map,
-};
-use crate::io::{
-    BedParseError, LayerError, MappedDepthStore, MappedJumpTable, MappedLayer, MappedMomentStore,
-    Meta, MetaError, is_bed_file, parse_bed_file,
-};
+use crate::fourier::{FilterMask, FilterMode, parse_bed_as_map};
+use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
 use crate::matrix::{DenseMatrix, SparseMatrix};
-use crate::sweep::query_sweep;
 
-// ---------------------------------------------------------------------------
-// Thread-local scratch buffer — reused across sweep calls on the same thread.
-// ---------------------------------------------------------------------------
-thread_local! {
-    static THREAD_LOCAL_BUFFER: RefCell<Option<DenseMatrix>> = const { RefCell::new(None) };
-}
+use files::{enumerate_query_files, parse_file_batch};
+use pvalues::compute_analytic_pvalues;
+use sweep::{build_csr_from_sorted_entries, run_sweep_block};
 
 /// Errors from query execution
 #[derive(Debug, Error)]
@@ -61,9 +51,6 @@ pub struct QueryConfig {
     ///   absent from the BED are excluded entirely.
     /// - `Blacklist`: tiles covered by the BED are zeroed out; all other tiles
     ///   remain accessible.
-    ///
-    /// Exactly one of whitelist / blacklist may be set (they are mutually exclusive).
-    /// Has no effect unless `stats` is `true`.
     pub filter: Option<(std::path::PathBuf, FilterMode)>,
 }
 
@@ -121,22 +108,6 @@ pub struct QueryResult {
 ///
 /// Accepts a single BED file or a directory of BED files.  Each file becomes
 /// one row (Q_SID) in the result matrix.
-///
-/// When `config.batch_size` is set, query files are processed in sequential
-/// batches, bounding peak memory to roughly `batch_size` files at once.  The
-/// per-batch dense accumulator is `batch_size × num_sources` instead of
-/// `num_queries × num_sources`.
-///
-/// ### Pipeline
-///
-/// 1. Load `meta.json`; enumerate query files.
-/// 2. For each batch of `batch_size` query files:
-///    a. Parse the batch; assign local Q_SIDs 0..batch_len.
-///    b. For each shard × layer: sweep, reduce, add to a batch-local accumulator.
-///    c. Drain non-zero entries from the accumulator, shifting rows by the
-///       global batch offset, into `all_entries`.
-/// 3. Build the final CSR matrix from `all_entries` (already (row,col)-sorted).
-/// 4. If `config.stats`: compute Fourier p-values for all non-zero pairs.
 pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let meta_path = config.db_path.join("meta.json");
     if !meta_path.exists() {
@@ -164,7 +135,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         });
     }
 
-    // Determine thread count for block sizing.
     let num_threads = config
         .num_threads
         .unwrap_or_else(rayon::current_num_threads)
@@ -175,7 +145,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let db_shard_set: std::collections::HashSet<&str> =
         meta.shards.iter().map(|s| s.as_str()).collect();
 
-    // Accumulated (global_row, col, val) triples — sorted by (row, col).
     let mut all_entries: Vec<(usize, usize, u32)> = Vec::new();
     let mut query_names: Vec<String> = Vec::new();
     let mut query_sources: Vec<QuerySource> = Vec::new();
@@ -189,7 +158,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             continue;
         }
 
-        // Per-batch dense accumulator: batch_len × num_sources.
         let mut accumulator = DenseMatrix::new(batch_len, num_sources);
 
         for (shard, mut shard_queries) in parsed.shard_intervals {
@@ -230,7 +198,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 let db_intervals = layer.intervals();
 
                 let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
-                let blocks: Vec<&[Interval]> = shard_queries.chunks(block_size).collect();
+                let blocks: Vec<&[_]> = shard_queries.chunks(block_size).collect();
 
                 let layer_result = blocks
                     .par_iter()
@@ -255,7 +223,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             }
         }
 
-        // Drain non-zero entries into all_entries with global row indices.
         for local_row in 0..batch_len {
             let row_slice = accumulator.row(local_row);
             for (col, &val) in row_slice.iter().enumerate() {
@@ -274,7 +241,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
-    // ── Phase 2: Analytic NB p-values ───────────────────────────────────────
     let pvalues = if config.stats {
         let filter = config.filter.as_ref().and_then(|(p, mode)| {
             parse_bed_as_map(p).ok().map(|bed| FilterMask::build(&bed, *mode))
@@ -286,11 +252,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             filter.as_ref(),
         );
         // Zero-overlap pairs have a trivially known p-value of 1.0 (P(X≥0)=1
-        // under any null).  Emit them explicitly so callers get a complete
-        // result set without having to infer absences.
+        // under any null).  Emit them explicitly so callers get a complete result set.
         for q_sid in 0..num_queries {
             let row = final_counts.outer_view(q_sid);
-            // Collect d_sids that already have a computed p-value entry.
             let nonzero: HashSet<usize> = row
                 .map(|rv| rv.iter().map(|(d, _)| d).collect())
                 .unwrap_or_default();
@@ -320,256 +284,14 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     })
 }
 
-/// For every non-zero (q_sid, d_sid) pair in `counts`, compute analytic NB stats.
-///
-/// Phase A: Load DB DepthMaps from `depthmap.rkyv` and, when available and no
-/// filter is active, pre-stored moments from `momentmap.rkyv`.
-///
-/// Phase B: Build query interval data once per query file.
-///
-/// Phase C: For each DB file obtain moments (from store or computed on-the-fly
-/// via FFT), then score every overlapping query.
-fn compute_analytic_pvalues(
-    counts: &SparseMatrix,
-    query_file_paths: &[PathBuf],
-    db_path: &Path,
-    filter: Option<&FilterMask>,
-) -> Vec<PValueResult> {
-    let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (q_sid, row) in counts.outer_iterator().enumerate() {
-        for (d_sid, &cnt) in row.iter() {
-            if cnt > 0 {
-                by_db.entry(d_sid as u32).or_default().push(q_sid);
-            }
-        }
-    }
-    if by_db.is_empty() {
-        return Vec::new();
-    }
-
-    let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
-
-    // Phase A: open depth-map store (always needed) and moment store (optional).
-    let store_path = db_path.join("depthmap.rkyv");
-    let store = match MappedDepthStore::open(&store_path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let moment_store_path = db_path.join("momentmap.rkyv");
-    let moment_store = MappedMomentStore::open(&moment_store_path).ok();
-
-    let db_depthmaps: HashMap<u32, DepthMap> = by_db
-        .par_iter()
-        .filter_map(|(&d_sid, _)| Some((d_sid, store.get(d_sid)?)))
-        .collect();
-
-    // Phase B: build query interval data once per query file.
-    let query_cov_data: HashMap<usize, (Vec<QueryChromData>, f64)> = needed_q_sids
-        .par_iter()
-        .filter_map(|&q_sid| {
-            let path = query_file_paths.get(q_sid)?;
-            let bed = parse_bed_as_map(path).ok()?;
-            let q_data = build_query_chrom_data(&bed, filter);
-            let mean_iv = mean_interval_bins(&q_data);
-            Some((q_sid, (q_data, mean_iv)))
-        })
-        .collect();
-
-    // Phase C: obtain moments once per DB source, then score every query.
-    by_db
-        .par_iter()
-        .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
-            let dm = match db_depthmaps.get(&d_sid) {
-                Some(d) => d,
-                None => return Vec::new(),
-            };
-
-            // Prefer pre-stored moments when no filter is active; otherwise compute
-            // on-the-fly (with filter applied) via FFT — once per DB source.
-            let db_moments: Vec<ChromMoments> = if let Some(ref ms) = moment_store {
-                if filter.is_none() {
-                    ms.get(d_sid).unwrap_or_else(|| {
-                        build_depth_moments(dm, DEFAULT_MOMENTS_EPS)
-                    })
-                } else {
-                    build_moments_with_filter(dm, filter.unwrap())
-                }
-            } else {
-                if filter.is_none() {
-                    build_depth_moments(dm, DEFAULT_MOMENTS_EPS)
-                } else {
-                    build_moments_with_filter(dm, filter.unwrap())
-                }
-            };
-
-            q_sids
-                .iter()
-                .filter_map(|&q_sid| {
-                    let (q_data, mean_iv) = query_cov_data.get(&q_sid)?;
-                    let sweep_count = counts.get(q_sid, d_sid as usize).copied().unwrap_or(0);
-                    let observed_bins = sweep_count as f64 * mean_iv;
-                    let (p_value, llr) =
-                        compute_analytic_stats(q_data, &db_moments, observed_bins)?;
-                    Some(PValueResult {
-                        query_id: q_sid,
-                        db_sid: d_sid,
-                        observed_bins,
-                        p_value,
-                        llr,
-                    })
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Build per-chromosome moments from a DepthMap with a FilterMask applied.
-fn build_moments_with_filter(dm: &DepthMap, filter: &FilterMask) -> Vec<ChromMoments> {
-    dm.chroms
-        .iter()
-        .filter_map(|cdm| {
-            let mask = match filter.get(&cdm.chrom) {
-                Some(m) => m,
-                None => return None,
-            };
-            Some(build_chrom_moments_with_filter(cdm, mask, DEFAULT_MOMENTS_EPS))
-        })
-        .collect()
-}
-
-/// Run a single sweep block using the thread-local scratch buffer.
-fn run_sweep_block(
-    db_intervals: &[Interval],
-    layer_max_size: u32,
-    jump_table: &MappedJumpTable,
-    query_block: &[Interval],
-    num_queries: usize,
-    num_sources: usize,
-) -> DenseMatrix {
-    THREAD_LOCAL_BUFFER.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        let scratch = borrow.get_or_insert_with(|| DenseMatrix::new(num_queries, num_sources));
-
-        if scratch.num_rows() != num_queries || scratch.num_cols() != num_sources {
-            scratch.resize_and_zero(num_queries, num_sources);
-        }
-
-        query_sweep(
-            db_intervals,
-            layer_max_size,
-            jump_table,
-            query_block,
-            scratch,
-        );
-
-        let result = scratch.clone();
-        scratch.resize_and_zero(num_queries, num_sources);
-        result
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-struct ParsedQueries {
-    shard_intervals: HashMap<String, Vec<Interval>>,
-    query_sources: Vec<QuerySource>,
-    query_names: Vec<String>,
-    /// Paths of non-empty files in this batch (same order as query_names).
-    file_paths: Vec<PathBuf>,
-    /// Number of non-empty files in this batch (= number of Q_SID rows used).
-    total_count: usize,
-}
-
-/// Return all BED file paths under `path` (or `path` itself if it is a file).
-fn enumerate_query_files(path: &Path) -> Result<Vec<PathBuf>, QueryError> {
-    if path.is_dir() {
-        let mut files: Vec<PathBuf> = fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| is_bed_file(p))
-            .collect();
-        files.sort(); // deterministic ordering
-        Ok(files)
-    } else {
-        Ok(vec![path.to_path_buf()])
-    }
-}
-
-/// Parse a slice of BED files, assigning local Q_SIDs 0..N (one per non-empty file).
-fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
-    let mut shard_intervals: HashMap<String, Vec<Interval>> = HashMap::new();
-    let mut query_sources = Vec::new();
-    let mut query_names = Vec::new();
-    let mut file_paths = Vec::new();
-    let mut file_sid = 0u32;
-
-    for bed_path in files {
-        let file_shards = parse_bed_file(bed_path, file_sid)?;
-        let file_count: usize = file_shards.values().map(|v| v.len()).sum();
-
-        if file_count == 0 {
-            continue;
-        }
-
-        let name = bed_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("query_{}", file_sid));
-
-        query_names.push(name.clone());
-        query_sources.push(QuerySource {
-            name,
-            count: file_count,
-        });
-        file_paths.push(bed_path.clone());
-
-        for (shard, intervals) in file_shards {
-            shard_intervals.entry(shard).or_default().extend(intervals);
-        }
-
-        file_sid += 1;
-    }
-
-    Ok(ParsedQueries {
-        shard_intervals,
-        query_sources,
-        query_names,
-        file_paths,
-        total_count: file_sid as usize,
-    })
-}
-
-/// Build a CSR sparse matrix from entries that are already sorted by (row, col).
-fn build_csr_from_sorted_entries(
-    entries: &[(usize, usize, u32)],
-    num_rows: usize,
-    num_cols: usize,
-) -> SparseMatrix {
-    let mut indptr = vec![0usize; num_rows + 1];
-    let mut indices = Vec::with_capacity(entries.len());
-    let mut data = Vec::with_capacity(entries.len());
-
-    for &(row, col, val) in entries {
-        indices.push(col);
-        data.push(val);
-        indptr[row + 1] += 1;
-    }
-    // Convert per-row counts to prefix sums.
-    for i in 0..num_rows {
-        indptr[i + 1] += indptr[i];
-    }
-
-    sprs::CsMat::new((num_rows, num_cols), indptr, indices, data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::matrix::condense_to_sparse_no_mask;
     use crate::tasks::build::{AddConfig, add_to_database};
+    use std::fs;
     use std::io::Write;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn write_bed(dir: &Path, name: &str, content: &str) {
@@ -638,12 +360,11 @@ mod tests {
         .unwrap();
 
         let query_dir = TempDir::new().unwrap();
-        write_bed(query_dir.path(), "q.bed", "chr2\t100\t200\n"); // chr2 not in db
+        write_bed(query_dir.path(), "q.bed", "chr2\t100\t200\n");
         let config = QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
         let result = query_database(&config).unwrap();
 
         assert_eq!(result.counts.rows(), 1);
-        // No overlaps since shard is absent
         assert_eq!(result.counts.nnz(), 0);
     }
 
@@ -693,7 +414,6 @@ mod tests {
         let input = TempDir::new().unwrap();
         let db = TempDir::new().unwrap();
 
-        // 3 DB source files
         write_bed(input.path(), "a.bed", "chr1\t100\t200\nchr1\t300\t400\n");
         write_bed(input.path(), "b.bed", "chr1\t150\t250\n");
         write_bed(input.path(), "c.bed", "chr1\t350\t500\n");
@@ -703,7 +423,6 @@ mod tests {
         ))
         .unwrap();
 
-        // 4 query files
         let query_dir = TempDir::new().unwrap();
         write_bed(query_dir.path(), "q1.bed", "chr1\t100\t200\n");
         write_bed(query_dir.path(), "q2.bed", "chr1\t200\t350\n");
@@ -715,7 +434,6 @@ mod tests {
             query_database(&config).unwrap()
         };
 
-        // batch_size=1 forces one file per batch
         let batched = {
             let mut config =
                 QueryConfig::new(db.path().to_path_buf(), query_dir.path().to_path_buf());
@@ -803,18 +521,15 @@ mod tests {
             });
 
         let sparse = condense_to_sparse_no_mask(&folded, 2, 3);
-        assert_eq!(sparse.get(0, 0), Some(&15)); // 1+2+3+4+5
+        assert_eq!(sparse.get(0, 0), Some(&15));
         assert_eq!(sparse.get(1, 0), None);
     }
 
-    /// Zero-overlap (query, DB) pairs must appear in pvalues with p_value=1.0
-    /// when stats=true, so callers always receive a complete result set.
     #[test]
     fn test_stats_zero_overlap_pairs_have_pvalue_one() {
         let input = TempDir::new().unwrap();
         let db = TempDir::new().unwrap();
 
-        // Two DB sources on non-overlapping regions.
         write_bed(input.path(), "a.bed", "chr1\t100\t200\n");
         write_bed(input.path(), "b.bed", "chr1\t500\t600\n");
         add_to_database(&AddConfig::new(
@@ -823,7 +538,6 @@ mod tests {
         ))
         .unwrap();
 
-        // Query only overlaps "a", not "b".
         let query_dir = TempDir::new().unwrap();
         write_bed(query_dir.path(), "q.bed", "chr1\t100\t200\n");
 
@@ -832,10 +546,8 @@ mod tests {
         config.stats = true;
         let result = query_database(&config).unwrap();
 
-        // Must have exactly num_queries × num_sources = 1 × 2 = 2 p-value entries.
         assert_eq!(result.pvalues.len(), 2);
 
-        // The zero-overlap pair must carry p_value=1.0.
         let zero_pair = result
             .pvalues
             .iter()

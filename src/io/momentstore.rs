@@ -4,6 +4,7 @@
 //! `maps[sid]` holds the per-chromosome compacted (mean, var) tables for that
 //! source.  SIDs are dense, so the vec index is the SID — O(1) lookup.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -32,6 +33,48 @@ struct MomentStore {
     maps: Vec<Vec<StoredChromMoments>>,
 }
 
+// ── Zerocopy handle for one SID ───────────────────────────────────────────────
+
+/// Zerocopy moment lookup for a single DB source.
+///
+/// Backed directly by the mmap'd `momentmap.rkyv` — no f32→f64 conversion or
+/// allocation beyond the one-time O(chroms) index built at access time.
+pub struct MappedSidMoments<'a> {
+    entry: &'a [ArchivedStoredChromMoments],
+    /// chrom name → index into `entry`; built once, O(1) lookup.
+    index: HashMap<&'a str, usize>,
+}
+
+impl<'a> MappedSidMoments<'a> {
+    /// Return `(mean, var)` for a sliding window of `l_bins` bins on `chrom`.
+    ///
+    /// Reads directly from the archived f32 slice — no allocation.
+    /// Returns `None` when `chrom` is absent, `l_bins` rounds to 0, or ≥ n_bins.
+    pub fn lookup(&self, chrom: &str, l_bins: f64) -> Option<(f64, f64)> {
+        let &i = self.index.get(chrom)?;
+        let acm = &self.entry[i];
+        let n_bins = u32::from(acm.n_bins) as usize;
+        let dense_max = u32::from(acm.dense_max) as usize;
+        let eps = f32::from(acm.eps) as f64;
+        let l = l_bins.round() as usize;
+        if l == 0 || l >= n_bins || acm.moments.is_empty() {
+            return None;
+        }
+        let n_pairs = acm.moments.len() / 2;
+        let idx = if l <= dense_max {
+            l - 1
+        } else {
+            let m = ((l as f64 / dense_max as f64).ln() / (1.0 + eps).ln())
+                .floor()
+                .max(1.0) as usize;
+            (dense_max + m - 1).min(n_pairs - 1)
+        };
+        let mean = f32::from(acm.moments[idx * 2]) as f64;
+        let var = f32::from(acm.moments[idx * 2 + 1]) as f64;
+        Some((mean, var))
+    }
+}
+
 // ── Read-only memmap handle ───────────────────────────────────────────────────
 
 pub struct MappedMomentStore {
@@ -49,33 +92,20 @@ impl MappedMomentStore {
         unsafe { rkyv::access_unchecked::<ArchivedMomentStore>(&self.mmap[..]) }
     }
 
-    /// Return the moment tables for `sid`, or `None` if not present.
-    pub fn get(&self, sid: u32) -> Option<Vec<ChromMoments>> {
+    /// Return a zerocopy handle for `sid`, or `None` if not present.
+    ///
+    /// Builds a chrom→index map (O(chroms)) once; subsequent `lookup` calls are O(1).
+    pub fn get_sid(&self, sid: u32) -> Option<MappedSidMoments<'_>> {
         let entry = self.archived().maps.get(sid as usize)?;
         if entry.is_empty() {
             return None;
         }
-        let chroms = entry
+        let index: HashMap<&str, usize> = entry
             .iter()
-            .map(|c| {
-                let n_bins = u32::from(c.n_bins) as usize;
-                let eps = f32::from(c.eps) as f64;
-                let dense_max = u32::from(c.dense_max) as usize;
-                let moments: Vec<(f64, f64)> = c
-                    .moments
-                    .chunks_exact(2)
-                    .map(|pair| (f32::from(pair[0]) as f64, f32::from(pair[1]) as f64))
-                    .collect();
-                ChromMoments {
-                    chrom: c.chrom.as_str().to_string(),
-                    n_bins,
-                    eps,
-                    dense_max,
-                    moments,
-                }
-            })
+            .enumerate()
+            .map(|(i, c)| (c.chrom.as_str(), i))
             .collect();
-        Some(chroms)
+        Some(MappedSidMoments { entry: &entry[..], index })
     }
 }
 
@@ -169,23 +199,26 @@ mod tests {
         let store = MappedMomentStore::open(&path).unwrap();
 
         for sid in 0..2u32 {
-            let got = store.get(sid).unwrap();
-            assert_eq!(got.len(), moments.len());
-            for (a, b) in moments.iter().zip(got.iter()) {
-                assert_eq!(a.chrom, b.chrom);
-                assert_eq!(a.n_bins, b.n_bins);
-                assert_eq!(a.moments.len(), b.moments.len());
-                // Check round-trip precision (f32 store, f64 in-memory)
-                for (&(am, av), &(bm, bv)) in a.moments.iter().zip(b.moments.iter()) {
-                    assert!((am - bm).abs() < am.abs() * 1e-5 + 1e-10,
-                        "mean mismatch: {} vs {}", am, bm);
-                    assert!((av - bv).abs() < av.abs() * 1e-5 + 1e-10,
-                        "var mismatch: {} vs {}", av, bv);
+            let sid_m = store.get_sid(sid).unwrap();
+            for orig in &moments {
+                // Verify dense and sparse lookups round-trip within f32 precision.
+                for &l in &[50.0f64, 500.0] {
+                    if let Some((exp_m, exp_v)) = orig.lookup(l) {
+                        let (got_m, got_v) = sid_m.lookup(&orig.chrom, l).unwrap();
+                        assert!(
+                            (got_m - exp_m).abs() < exp_m.abs() * 1e-5 + 1e-10,
+                            "mean mismatch L={}: {} vs {}", l, got_m, exp_m
+                        );
+                        assert!(
+                            (got_v - exp_v).abs() < exp_v.abs() * 1e-5 + 1e-10,
+                            "var mismatch L={}: {} vs {}", l, got_v, exp_v
+                        );
+                    }
                 }
             }
         }
 
-        assert!(store.get(2).is_none());
+        assert!(store.get_sid(2).is_none());
     }
 
     #[test]
@@ -204,8 +237,23 @@ mod tests {
         b2.save(&path).unwrap();
 
         let store = MappedMomentStore::open(&path).unwrap();
-        assert!(store.get(0).is_some());
-        assert!(store.get(1).is_some());
-        assert!(store.get(2).is_none());
+        assert!(store.get_sid(0).is_some());
+        assert!(store.get_sid(1).is_some());
+        assert!(store.get_sid(2).is_none());
+    }
+
+    #[test]
+    fn test_lookup_absent_chrom_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("momentmap.rkyv");
+
+        let moments = make_moments();
+        let mut builder = MomentStoreBuilder::new();
+        builder.insert(0, &moments);
+        builder.save(&path).unwrap();
+
+        let store = MappedMomentStore::open(&path).unwrap();
+        let sid_m = store.get_sid(0).unwrap();
+        assert!(sid_m.lookup("chrXYZ", 100.0).is_none());
     }
 }
