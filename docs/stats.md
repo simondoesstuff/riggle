@@ -80,14 +80,35 @@ uniformly at random; `var(L)` captures the true clustering structure of the DB.
 
 ---
 
-## 4. Dense Moment Storage
+## 4. Compact Moment Storage
 
-All N-1 `(mean, var)` pairs (for L = 1, ..., N-1) are stored as f32 in
-`momentmap.rkyv`, indexed densely by L-1.  Lookup at query time is O(1) —
-a direct array access with no approximation.
+Only a subset of block sizes L are stored, tolerating at most 1% relative
+error in L (eps = 0.01, T = floor(1/eps) = 100):
 
-Storage per chromosome: 2 × (N−1) × 4 bytes ≈ 20 MB for chr1 (N ≈ 2.49 M).
-Total for hg38: ≈ 250 MB per DB source.
+```
+L = 1..T        : stored exactly (every block size, no approximation)
+L > T           : only the first L in each log_{1+eps}-spaced slot is stored
+                  slot k covers L in [T·(1+eps)^k, T·(1+eps)^{k+1})
+```
+
+**Lookup formula** — given a query block size L, the 0-indexed position in the
+compact store is:
+
+```
+compact_index(L) = L − 1                                 if L ≤ T
+compact_index(L) = T + floor(log_{1.01}(L/T)) − 1       if L > T
+```
+
+O(1) lookup via a single `ln` and integer cast; no stored L values needed.
+
+**Storage per chromosome**: approximately T + ceil(log_{1.01}(N/T)) ≈ 1100
+entries for chr1 (N ≈ 2.49 M), versus 2.49 M for the dense scheme.
+Storage ≈ 2 × 1100 × 4 bytes ≈ 9 KB per chromosome, ≈ 220 KB total for hg38
+per DB source (vs 250 MB dense).
+
+The maximum approximation error is eps × L in block size, which translates to
+a negligible shift in the returned `(mean, var)` for smoothly varying moment
+functions.
 
 ---
 
@@ -155,10 +176,11 @@ p = erfc(√LLR) / 2
 1. Parse BED → assemble dense signed impulse train per chromosome.
 2. SIMD prefix sum (f32x8 two-pass scan) → depth signal g[].
 3. Build d*, d**, d2 (SIMD f64x4 for squaring), autocorrelation R via FFT.
-4. Compute mean(L) and var(L) for all L = 1..N-1.
-5. Store all (mean, var) pairs as f32 in `momentmap.rkyv`.
+4. Compute mean(L) and var(L) for ~T + log_{1.01}(N/T) ≈ 1100 sampled L values.
+5. Store compact (mean, var) pairs as f32 in `momentmap.rkyv`.
 
-Total per chromosome: O(N log N) for the FFT; O(N) for prefix sums and storage.
+Total per chromosome: O(N log N) for the FFT; O(N) for prefix sums; O(log N)
+for moment sampling and storage.
 
 ### Query time (per (query, DB) pair)
 

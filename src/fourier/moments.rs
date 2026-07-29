@@ -15,9 +15,13 @@
 //!   mean(L)  = sum_f / n_w
 //!   var(L)   = sum_f2 / n_w − mean(L)²
 //!
-//! # Dense storage
-//! All N-1 (mean, var) pairs are stored as f32 in `moments[L-1]`.
-//! Query lookup for block size L is a direct O(1) array access with no approximation.
+//! # Compact storage
+//! Only a subset of L values are stored, tolerating a 1% relative error in L:
+//!   - L = 1..T_THRESHOLD (T=100): every block size stored, no approximation.
+//!   - L > T: only the first L in each log_{1+eps}-spaced slot is stored.
+//!     The number of stored entries is T + ⌊log_{1.01}(N/T)⌋ ≈ 1100 for chr1.
+//!
+//! Use `compact_index(l)` to map a block size to its 0-indexed position in the store.
 
 use rayon::prelude::*;
 use rustfft::num_complex::Complex;
@@ -27,26 +31,51 @@ use wide::f64x4;
 use super::depth::{ChromDepthMap, DepthMap, build_depth_signal};
 use super::genome::{BedMap, BIN_SIZE, hg38_chrom_sizes};
 
-/// Dense sliding-window moments for one DB chromosome.
+/// Relative error tolerance for block-size approximation (1%).
+pub const EPS: f64 = 0.01;
+/// Block sizes L <= T_THRESHOLD are stored exactly (dense); above this,
+/// only geometrically spaced samples are kept.
+pub const T_THRESHOLD: usize = 100; // floor(1.0 / EPS)
+
+/// Map block size L to its 0-indexed position in the compact moment store.
 ///
-/// `moments[L-1]` = `(mean, var)` for a uniformly placed block of L bins.
+/// For L <= T_THRESHOLD: index = L - 1 (exact, no approximation).
+/// For L > T_THRESHOLD: index = T + floor(log_{1+EPS}(L/T)) - 1.
+///
+/// Two queries L and L' that share an index differ by at most EPS in relative terms.
+pub fn compact_index(l: usize) -> usize {
+    debug_assert!(l >= 1, "compact_index: l must be >= 1");
+    if l <= T_THRESHOLD {
+        l - 1
+    } else {
+        let k = ((l as f64 / T_THRESHOLD as f64).ln() / (1.0_f64 + EPS).ln()) as usize;
+        T_THRESHOLD + k - 1
+    }
+}
+
+/// Compact sliding-window moments for one DB chromosome.
+///
+/// Stores one `(mean, var)` pair per log-slot: dense for L ≤ T_THRESHOLD,
+/// then geometrically spaced above. Use `compact_index(l)` to look up.
 pub struct ChromMoments {
     pub chrom: String,
     pub n_bins: usize,
-    /// (mean, var) pairs for L = 1..n_bins-1, stored as f32.
+    /// Compact (mean, var) pairs as f32; position given by `compact_index(L)`.
     pub moments: Vec<(f32, f32)>,
 }
 
 impl ChromMoments {
     /// Return `(mean, var)` for a sliding window of `l_bins` bins.
     ///
-    /// Returns `None` when `l_bins` rounds to 0 or ≥ `n_bins`.
+    /// Lookup is O(1). The returned moments may have been computed at the
+    /// nearest sampled L (within EPS relative error). Returns `None` when
+    /// `l_bins` rounds to 0 or ≥ `n_bins`.
     pub fn lookup(&self, l_bins: f64) -> Option<(f64, f64)> {
         let l = l_bins.round() as usize;
         if l == 0 || l >= self.n_bins {
             return None;
         }
-        let (m, v) = self.moments.get(l - 1)?;
+        let (m, v) = self.moments.get(compact_index(l))?;
         Some((*m as f64, *v as f64))
     }
 }
@@ -131,12 +160,38 @@ fn moments_from_signal(g: &[f32], chrom: &str, n_bins: usize) -> ChromMoments {
     // Autocorrelation R[L] = IFFT(|FFT(d*)|²)[L]
     let r = autocorr_via_fft(&d_star);
 
-    // Build all (mean, var) pairs for L = 1..n_bins-1
     let max_l = n - 1;
-    let mut moments = Vec::with_capacity(max_l);
-    for l in 1..=max_l {
+
+    // Estimate compact store size: T linear + log-spaced geometric entries.
+    let geom_est = if n > T_THRESHOLD {
+        ((max_l as f64 / T_THRESHOLD as f64).ln() / (1.0_f64 + EPS).ln()).ceil() as usize + 1
+    } else {
+        0
+    };
+    let mut moments = Vec::with_capacity(T_THRESHOLD.min(max_l) + geom_est);
+
+    // Phase 1: dense linear — every L = 1..=T (no approximation).
+    for l in 1..=T_THRESHOLD.min(max_l) {
         let (mean, var) = window_moments(&d_ss, &d2, &r, n, l);
         moments.push((mean as f32, var as f32));
+    }
+
+    // Phase 2: geometric spacing for L > T.
+    // Canonical L for each log-slot: first integer >= T * (1+EPS)^j.
+    // Relative error in L is at most EPS for any query in that slot.
+    let mut l_f = T_THRESHOLD as f64;
+    let mut prev_l = T_THRESHOLD;
+    loop {
+        l_f *= 1.0 + EPS;
+        let l = l_f.ceil() as usize;
+        if l > max_l {
+            break;
+        }
+        if l > prev_l {
+            let (mean, var) = window_moments(&d_ss, &d2, &r, n, l);
+            moments.push((mean as f32, var as f32));
+            prev_l = l;
+        }
     }
 
     ChromMoments {

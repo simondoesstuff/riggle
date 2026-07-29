@@ -16,7 +16,7 @@ use std::path::Path;
 use memmap2::Mmap;
 use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::fourier::ChromMoments;
+use crate::fourier::{ChromMoments, compact_index};
 
 // ── Archived types ────────────────────────────────────────────────────────────
 
@@ -54,7 +54,10 @@ impl<'a> MappedSidMoments<'a> {
         if l == 0 || l >= n_bins {
             return None;
         }
-        let base = (l - 1) * 2;
+        let base = compact_index(l) * 2;
+        if base + 1 >= acm.moments.len() {
+            return None;
+        }
         let mean = f32::from(acm.moments[base]) as f64;
         let var = f32::from(acm.moments[base + 1]) as f64;
         Some((mean, var))
