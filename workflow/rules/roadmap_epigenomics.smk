@@ -119,7 +119,7 @@ checkpoint rme_split:
     input:
         f"{RME_BEDS}/raw",
     output:
-        directory(f"{RME_BEDS}/split"),
+        temp(directory(f"{RME_BEDS}/split")),
     script:
         "../scripts/rme_split.py"
 
