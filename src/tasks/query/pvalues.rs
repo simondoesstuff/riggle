@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::fourier::{QueryChromData, build_query_chrom_data, compute_analytic_stats,
-    mean_interval_bins, parse_bed_as_map};
+    parse_bed_as_map};
 use crate::io::MappedMomentStore;
 use crate::matrix::SparseMatrix;
 
@@ -16,10 +16,14 @@ use super::PValueResult;
 /// Phase B: Build query interval data once per query file.
 /// Phase C: For each DB source, look up pre-stored moments (O(1) per interval),
 ///          accumulate μ_null / σ²_null, fit NB, score, return p-value and LLR.
+///
+/// `overlap` supplies the exact base-pair overlap in 100 bp bins for each
+/// (q_sid, d_sid) pair, computed during the sweep phase.
 pub(super) fn compute_analytic_pvalues(
     counts: &SparseMatrix,
     query_file_paths: &[PathBuf],
     db_path: &Path,
+    overlap: &HashMap<(usize, usize), f32>,
 ) -> Vec<PValueResult> {
     let mut by_db: HashMap<u32, Vec<usize>> = HashMap::new();
     for (q_sid, row) in counts.outer_iterator().enumerate() {
@@ -43,14 +47,13 @@ pub(super) fn compute_analytic_pvalues(
     let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
 
     // Phase B: build query interval data once per query file.
-    let query_cov_data: HashMap<usize, (Vec<QueryChromData>, f64)> = needed_q_sids
+    let query_cov_data: HashMap<usize, Vec<QueryChromData>> = needed_q_sids
         .par_iter()
         .filter_map(|&q_sid| {
             let path = query_file_paths.get(q_sid)?;
             let bed = parse_bed_as_map(path).ok()?;
             let q_data = build_query_chrom_data(&bed);
-            let mean_iv = mean_interval_bins(&q_data);
-            Some((q_sid, (q_data, mean_iv)))
+            Some((q_sid, q_data))
         })
         .collect();
 
@@ -66,9 +69,10 @@ pub(super) fn compute_analytic_pvalues(
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
-                    let (q_data, mean_iv) = query_cov_data.get(&q_sid)?;
-                    let sweep_count = counts.get(q_sid, d_sid as usize).copied().unwrap_or(0);
-                    let observed_bins = sweep_count as f64 * mean_iv;
+                    let q_data = query_cov_data.get(&q_sid)?;
+                    // Exact overlap in bins from the sweep phase.
+                    let observed_bins =
+                        overlap.get(&(q_sid, d_sid as usize)).copied().unwrap_or(0.0) as f64;
 
                     let lookup = |chrom: &str, l: f64| sid_moments.lookup(chrom, l);
                     let (p_value, llr) =

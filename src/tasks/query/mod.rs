@@ -10,7 +10,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
-use crate::matrix::{DenseMatrix, SparseMatrix};
+use crate::matrix::{DenseMatrix, OverlapMatrix, SparseMatrix};
 
 use files::{enumerate_query_files, parse_file_batch};
 use pvalues::compute_analytic_pvalues;
@@ -141,6 +141,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let mut query_sources: Vec<QuerySource> = Vec::new();
     let mut query_file_paths: Vec<PathBuf> = Vec::new();
     let mut global_q_offset = 0usize;
+    // Exact overlap in bins for each (q_sid, d_sid) pair; populated for every hit.
+    let mut overlap_map: HashMap<(usize, usize), f32> = HashMap::new();
 
     for batch_files in all_files.chunks(batch_size) {
         let parsed = parse_file_batch(batch_files)?;
@@ -149,7 +151,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             continue;
         }
 
-        let mut accumulator = DenseMatrix::new(batch_len, num_sources);
+        let mut count_accumulator = DenseMatrix::new(batch_len, num_sources);
+        let mut overlap_accumulator = OverlapMatrix::new(batch_len, num_sources);
 
         for (shard, mut shard_queries) in parsed.shard_intervals {
             if !db_shard_set.contains(shard.as_str()) {
@@ -204,21 +207,27 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                         )
                     })
                     .reduce_with(|mut a, b| {
-                        a.add_dense(&b);
+                        a.0.add_dense(&b.0);
+                        a.1.add_dense(&b.1);
                         a
                     });
 
-                if let Some(layer_dense) = layer_result {
-                    accumulator.add_dense(&layer_dense);
+                if let Some((layer_counts, layer_overlap)) = layer_result {
+                    count_accumulator.add_dense(&layer_counts);
+                    overlap_accumulator.add_dense(&layer_overlap);
                 }
             }
         }
 
+        // Extract non-zero entries; collect exact overlap alongside count.
         for local_row in 0..batch_len {
-            let row_slice = accumulator.row(local_row);
+            let row_slice = count_accumulator.row(local_row);
+            let global_row = global_q_offset + local_row;
             for (col, &val) in row_slice.iter().enumerate() {
                 if val > 0 {
-                    all_entries.push((global_q_offset + local_row, col, val));
+                    all_entries.push((global_row, col, val));
+                    let ov = overlap_accumulator.get(local_row, col);
+                    *overlap_map.entry((global_row, col)).or_default() += ov;
                 }
             }
         }
@@ -237,6 +246,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             &final_counts,
             &query_file_paths,
             &config.db_path,
+            &overlap_map,
         );
         // Zero-overlap pairs have a trivially known p-value of 1.0.
         // Emit them explicitly so callers get a complete result set.

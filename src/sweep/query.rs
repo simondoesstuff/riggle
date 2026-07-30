@@ -1,6 +1,7 @@
 use crate::core::Interval;
+use crate::fourier::BIN_SIZE;
 use crate::io::MappedJumpTable;
-use crate::matrix::DenseMatrix;
+use crate::matrix::{DenseMatrix, OverlapMatrix};
 
 /// Per-query scan over a flat sorted layer, with O(1) cold-start via jump table.
 ///
@@ -17,13 +18,16 @@ use crate::matrix::DenseMatrix;
 ///   conservative lower-bound index; a short forward scan completes positioning.
 /// - `query_block`: sorted `&[Interval]` where `sid` is the row index in
 ///   `results` (Q_SID).
-/// - `results`: `[Q_sids][D_sids]` dense accumulator, mutated in place.
+/// - `results`: `[Q_sids][D_sids]` dense count accumulator, mutated in place.
+/// - `overlap`: parallel f32 accumulator; each hit adds the exact overlap in
+///   100 bp bins — `(min(q.end, d.end) − max(q.start, d.start)) / BIN_SIZE`.
 pub fn query_sweep(
     db_layer: &[Interval],
     layer_max_size: u32,
     jump_table: &MappedJumpTable,
     query_block: &[Interval],
     results: &mut DenseMatrix,
+    overlap: &mut OverlapMatrix,
 ) {
     if query_block.is_empty() || db_layer.is_empty() {
         return;
@@ -37,12 +41,17 @@ pub fn query_sweep(
         let lo = q.start.saturating_sub(layer_max_size);
         let approx = jump_table.lookup(lo).min(db_layer.len());
         let start_idx = approx + db_layer[approx..].partition_point(|d| d.start < lo);
+        let q_sid = q.sid as usize;
         for d in &db_layer[start_idx..] {
             if d.start >= q.end {
                 break;
             }
             if d.end > q.start {
-                results.add(q.sid as usize, d.sid as usize, 1);
+                let d_sid = d.sid as usize;
+                results.add(q_sid, d_sid, 1);
+                let overlap_bins =
+                    (q.end.min(d.end) - q.start.max(d.start)) as f32 / BIN_SIZE as f32;
+                overlap.add(q_sid, d_sid, overlap_bins);
             }
         }
     }
@@ -67,82 +76,85 @@ mod tests {
         (f, jt)
     }
 
+    fn sweep(
+        db: &[Interval],
+        layer_max_size: u32,
+        query: &[Interval],
+        nrows: usize,
+        ncols: usize,
+    ) -> (DenseMatrix, OverlapMatrix) {
+        let (_f, jt) = make_jt(db, layer_max_size);
+        let mut results = DenseMatrix::new(nrows, ncols);
+        let mut overlap = OverlapMatrix::new(nrows, ncols);
+        query_sweep(db, layer_max_size, &jt, query, &mut results, &mut overlap);
+        (results, overlap)
+    }
+
     #[test]
     fn test_basic_overlap() {
-        let db = vec![iv(50, 150, 0)];
-        let query = vec![iv(40, 160, 0)];
-        let mut results = DenseMatrix::new(1, 1);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        // Q=[40,160) overlaps D=[50,150) by 100 bp = 1 bin
+        let (results, overlap) = sweep(&[iv(50, 150, 0)], 200, &[iv(40, 160, 0)], 1, 1);
         assert_eq!(results.get(0, 0), 1);
+        assert!((overlap.get(0, 0) - 1.0).abs() < 1e-5, "expected 1.0 bin, got {}", overlap.get(0, 0));
     }
 
     #[test]
     fn test_no_overlap() {
-        let db = vec![iv(50, 100, 0)];
-        let query = vec![iv(200, 300, 0)];
-        let mut results = DenseMatrix::new(1, 1);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&[iv(50, 100, 0)], 200, &[iv(200, 300, 0)], 1, 1);
         assert_eq!(results.get(0, 0), 0);
+        assert_eq!(overlap.get(0, 0), 0.0);
     }
 
     #[test]
     fn test_multiple_queries_and_db() {
-        // D0=[25,75), D1=[75,125)
+        // D0=[25,75), D1=[75,125); Q0=[0,50), Q1=[50,100)
         let db = vec![iv(25, 75, 0), iv(75, 125, 1)];
-        // Q0=[0,50), Q1=[50,100)
         let query = vec![iv(0, 50, 0), iv(50, 100, 1)];
-        let mut results = DenseMatrix::new(2, 2);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&db, 200, &query, 2, 2);
 
         assert_eq!(results.get(0, 0), 1);
         assert_eq!(results.get(0, 1), 0);
         assert_eq!(results.get(1, 0), 1);
         assert_eq!(results.get(1, 1), 1);
+        // Q0∩D0 = [25,50) = 25 bp = 0.25 bins
+        assert!((overlap.get(0, 0) - 0.25).abs() < 1e-5, "Q0∩D0={}", overlap.get(0, 0));
+        // Q1∩D0 = [50,75) = 25 bp = 0.25 bins
+        assert!((overlap.get(1, 0) - 0.25).abs() < 1e-5, "Q1∩D0={}", overlap.get(1, 0));
+        // Q1∩D1 = [75,100) = 25 bp = 0.25 bins
+        assert!((overlap.get(1, 1) - 0.25).abs() < 1e-5, "Q1∩D1={}", overlap.get(1, 1));
     }
 
     #[test]
     fn test_dead_zone_skipped_via_jump_table() {
-        // DB has intervals at 0-50 and 10000-10050; query only at 10000-10100.
         let db = vec![iv(0, 50, 0), iv(10_000, 10_050, 1)];
         let query = vec![iv(10_000, 10_100, 0)];
-        let mut results = DenseMatrix::new(1, 2);
-        let (_f, jt) = make_jt(&db, 100);
-        query_sweep(&db, 100, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&db, 100, &query, 1, 2);
 
         assert_eq!(results.get(0, 0), 0); // D0 far away, no overlap
         assert_eq!(results.get(0, 1), 1); // D1 overlaps
+        assert_eq!(overlap.get(0, 0), 0.0);
+        // Q∩D1 = [10000,10050) = 50 bp = 0.5 bins
+        assert!((overlap.get(0, 1) - 0.5).abs() < 1e-5, "Q∩D1={}", overlap.get(0, 1));
     }
 
     #[test]
     fn test_touching_intervals_not_overlapping() {
-        let db = vec![iv(0, 50, 0)];
-        let query = vec![iv(50, 100, 0)];
-        let mut results = DenseMatrix::new(1, 1);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&[iv(0, 50, 0)], 200, &[iv(50, 100, 0)], 1, 1);
         assert_eq!(results.get(0, 0), 0);
+        assert_eq!(overlap.get(0, 0), 0.0);
     }
 
     #[test]
     fn test_empty_db() {
-        let db: Vec<Interval> = vec![];
-        let query = vec![iv(0, 100, 0)];
-        let mut results = DenseMatrix::new(1, 1);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&[], 200, &[iv(0, 100, 0)], 1, 1);
         assert_eq!(results.get(0, 0), 0);
+        assert_eq!(overlap.get(0, 0), 0.0);
     }
 
     #[test]
     fn test_empty_query() {
-        let db = vec![iv(0, 100, 0)];
-        let query: Vec<Interval> = vec![];
-        let mut results = DenseMatrix::new(1, 1);
-        let (_f, jt) = make_jt(&db, 200);
-        query_sweep(&db, 200, &jt, &query, &mut results);
+        let (results, overlap) = sweep(&[iv(0, 100, 0)], 200, &[], 1, 1);
         assert_eq!(results.get(0, 0), 0);
+        assert_eq!(overlap.get(0, 0), 0.0);
     }
 }

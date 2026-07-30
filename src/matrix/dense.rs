@@ -175,6 +175,69 @@ impl BitwiseMask {
     }
 }
 
+/// Row-major f32 matrix for accumulating exact bin-overlap totals.
+///
+/// Mirrors `DenseMatrix` layout (row i = query i, column j = database source j),
+/// but stores the sum of base-pair overlaps in 100 bp bins rather than a hit count.
+#[derive(Debug, Clone)]
+pub struct OverlapMatrix {
+    data: Vec<f32>,
+    num_rows: usize,
+    num_cols: usize,
+}
+
+impl OverlapMatrix {
+    pub fn new(num_rows: usize, num_cols: usize) -> Self {
+        Self {
+            data: vec![0.0; num_rows * num_cols],
+            num_rows,
+            num_cols,
+        }
+    }
+
+    #[inline]
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    #[inline]
+    pub fn num_cols(&self) -> usize {
+        self.num_cols
+    }
+
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> f32 {
+        debug_assert!(row < self.num_rows && col < self.num_cols);
+        self.data[row * self.num_cols + col]
+    }
+
+    #[inline]
+    pub fn add(&mut self, row: usize, col: usize, delta: f32) {
+        debug_assert!(row < self.num_rows && col < self.num_cols);
+        self.data[row * self.num_cols + col] += delta;
+    }
+
+    /// Element-wise f32 addition; auto-vectorizes to SIMD on supported targets.
+    pub fn add_dense(&mut self, other: &OverlapMatrix) {
+        debug_assert_eq!(self.num_rows, other.num_rows);
+        debug_assert_eq!(self.num_cols, other.num_cols);
+        let n = self.num_rows * self.num_cols;
+        for (a, b) in self.data[..n].iter_mut().zip(other.data[..n].iter()) {
+            *a += b;
+        }
+    }
+
+    pub fn resize_and_zero(&mut self, num_rows: usize, num_cols: usize) {
+        let new_size = num_rows * num_cols;
+        if new_size > self.data.len() {
+            self.data.resize(new_size, 0.0);
+        }
+        self.data[..new_size].fill(0.0);
+        self.num_rows = num_rows;
+        self.num_cols = num_cols;
+    }
+}
+
 /// Allocate a paired dense matrix and bitmask for accumulation
 pub fn allocate_dense_accumulator(
     num_queries: usize,
