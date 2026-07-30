@@ -79,7 +79,7 @@ impl ChromMoments {
     /// nearest sampled L (within EPS relative error). Returns `None` when
     /// `l_bins` rounds to 0 or ≥ `n_bins`.
     pub fn lookup(&self, l_bins: f64) -> Option<(f64, f64)> {
-        let l = l_bins.round() as usize;
+        let l = l_bins.ceil() as usize;
         if l == 0 || l >= self.n_bins {
             return None;
         }

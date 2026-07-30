@@ -3,10 +3,10 @@
 ### Overview
 
 After the sweep phase produces an overlap count matrix, `--stats` mode computes
-per-pair significance using an analytic negative-binomial (NB) null model. No
-random trials are run at query time. The full pipeline — FFT moment computation,
-NB parameter fitting, LLR, and p-value — runs in $O(N \log N)$ at index time and
-$O(1)$ per query interval at query time.
+per-pair significance using an analytic null model — negative-binomial (NB) when the
+null is overdispersed, Poisson on count units when it is not. No random trials are run
+at query time. The full pipeline runs in $O(N \log N)$ at index time and $O(1)$ per
+query interval at query time.
 
 ---
 
@@ -113,44 +113,72 @@ a negligible shift in the returned $(\mu, \sigma^2)$ for smoothly varying moment
 
 ---
 
-## 5. NB Null Distribution
+## 5. Null Distribution and Dispatch
 
 ### 5.1 Moment Accumulation
 
-For each query interval $i$ of length $l_i$ bins on chromosome $c$, look up the
-stored moments for block size $l_i$:
+For each query interval $i$ of length $l_i$ bins, let $l_\text{int} = \lceil l_i \rceil$ and
+$s_i = l_i / l_\text{int}$ (scale factor; $s_i = 1$ for full-bin intervals, $s_i < 1$ for sub-bin).
+Look up stored moments at $l_\text{int}$:
 
-$$\mu_i = \mu(l_i), \qquad \sigma^2_i = \sigma^2(l_i)$$
+$$
+\mu_i = \mu(l_\text{int}) \cdot s_i, \qquad
+\sigma^2_i = \sigma^2(l_\text{int}) \cdot s_i^2, \qquad
+\mu^\text{raw}_i = \mu(l_\text{int}) / l_\text{int}
+$$
 
-Genome-wide null moments (independent intervals):
+$\mu^\text{raw}_i$ approximates the per-interval overlap probability (coverage fraction);
+it is scale-free and equals $\mu(1)$ for $l_i \le 1$.
 
-$$\mu_\text{null} = \sum_i \mu_i, \qquad \sigma^2_\text{null} = \sum_i \sigma^2_i$$
+Genome-wide sums:
 
-### 5.2 NB Parameter Fitting (Method of Moments)
+$$
+\mu = \sum_i \mu_i, \qquad
+\sigma^2 = \sum_i \sigma^2_i, \qquad
+\mu^\text{raw} = \sum_i \mu^\text{raw}_i
+$$
+
+### 5.2 Dispatch on Dispersion
+
+**Overdispersed** ($\sigma^2 > \mu$): NB null on the bin-overlap statistic $O$.
+This holds for $L \ge 2$ in the RME index (95–100% of pairs).
+
+**Underdispersed** ($\sigma^2 \le \mu$): Poisson null on count units.
+The effective scale $s = \mu / \mu^\text{raw}$ (≈ mean interval length) maps $O$ to
+count units, recovering the full-power count-based LLR:
+
+$$
+\hat{O} = O / s, \qquad \mu^\text{count} = \mu^\text{raw}
+$$
+
+This is exact for uniform-length queries (e.g. all 1 bp SNPs, where $s = 0.01$).
+
+### 5.3 NB Parameter Fitting (Method of Moments)
 
 A negative binomial $\operatorname{NB}(r, p)$ has mean $r(1-p)/p$ and variance $r(1-p)/p^2$.
-Solving from $\mu_\text{null}$ and $\sigma^2_\text{null}$:
+Solving from $\mu$ and $\sigma^2$:
 
 $$
-p = \frac{\mu_\text{null}}{\sigma^2_\text{null}}, \qquad
-r = \frac{\mu_\text{null}^2}{\sigma^2_\text{null} - \mu_\text{null}}
+p = \frac{\mu}{\sigma^2}, \qquad r = \frac{\mu^2}{\sigma^2 - \mu}
 $$
-
-Requires $\sigma^2_\text{null} > \mu_\text{null} > 0$ (overdispersion).
 
 ---
 
-## 6. Log-Likelihood Ratio (Saddlepoint / Exponential Tilt)
+## 6. Log-Likelihood Ratios
 
-To score observation $O$ against $\operatorname{NB}(r, p)$:
+**NB saddlepoint** (overdispersed), observation $O$ against $\operatorname{NB}(r, p)$:
 
 $$
 p_O = \frac{r}{r + O}, \qquad
 \theta = \ln\frac{1 - p_O}{1 - p}, \qquad
-\text{LLR} = O\,\theta + r\ln\frac{p_O}{p}
+\text{LLR}_\text{NB} = O\,\theta + r\ln\frac{p_O}{p}
 $$
 
-$\text{LLR} = 0$ when $O = \mu_\text{null}$; $\text{LLR} > 0$ for enrichment.
+**Poisson saddlepoint** (underdispersed), observation $\hat{O}$ against $\operatorname{Poisson}(\mu^\text{count})$:
+
+$$\text{LLR}_\text{Poisson} = \hat{O}\ln(\hat{O}/\mu^\text{count}) - (\hat{O} - \mu^\text{count})$$
+
+Both LLRs equal 0 at the null mean and are positive for enrichment.
 
 ---
 
@@ -181,7 +209,7 @@ for moment sampling and storage.
 2. Stats phase:
    - Load pre-stored moments from `momentmap.rkyv` (memmap'd, $O(1)$ per lookup).
    - For each query interval: $O(1)$ moment lookup by direct array index.
-   - Accumulate $\mu_\text{null}$, $\sigma^2_\text{null}$; fit NB; compute LLR and p-value.
+   - Accumulate $\mu$, $\sigma^2$, $\mu^\text{raw}$; dispatch on dispersion (§5.2); compute LLR and p-value.
 
 ---
 
@@ -191,5 +219,5 @@ for moment sampling and storage.
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `overlap_count` | Number of overlapping interval pairs from the sweep.                                                                                                                                                 |
 | `observed_bins` | Exact base-pair overlap in 100 bp bins: $\sum \bigl(\min(q_e, d_e) - \max(q_s, d_s)\bigr) / 100$ summed over all overlapping (query, DB) pairs. Computed during the sweep phase alongside the count. |
-| `p_value`       | Right-tailed analytic p-value under the NB null.                                                                                                                                                     |
-| `llr`           | Saddlepoint LLR; `null` when NB fit fails.                                                                                                                                                           |
+| `p_value`       | Right-tailed analytic p-value: NB saddlepoint when overdispersed, Poisson saddlepoint on count units when underdispersed.                                                                            |
+| `llr`           | Saddlepoint LLR (NB or Poisson); `null` only when no query intervals share a chromosome with the DB.                                                                                                 |
