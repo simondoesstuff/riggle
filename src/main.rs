@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use chuckle::io::Meta;
-use chuckle::stats::{StatResult, StatsOutput};
-use chuckle::tasks::{AddConfig, QueryConfig, add_to_database, query_database};
+use chuckle::stats::{IntervalsOutput, StatResult, StatsOutput};
+use chuckle::tasks::{AddConfig, QueryConfig, QueryMode, add_to_database, query_database};
 
 #[derive(Parser)]
 #[command(name = "chuckle")]
@@ -52,8 +52,12 @@ enum Commands {
 
         /// Compute analytic NB p-values and LLR for all overlapping pairs.
         /// Requires the database to have been built with --stats.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "intervals")]
         stats: bool,
+
+        /// Return the exact set of overlapping interval pairs with intersection lengths.
+        #[arg(long, conflicts_with = "stats")]
+        intervals: bool,
 
         /// Maximum number of query files to hold in memory at once (default: all)
         #[arg(long)]
@@ -73,8 +77,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Add { input, db, batch_size, stats } => run_add(input, db, batch_size, stats),
-        Commands::Query { db, query, output, stats, batch_size } => {
-            run_query(db, query, output, stats, batch_size)
+        Commands::Query { db, query, output, stats, intervals, batch_size } => {
+            run_query(db, query, output, stats, intervals, batch_size)
         }
         Commands::Info { db } => run_info(db),
     };
@@ -103,12 +107,27 @@ fn run_query(
     query: PathBuf,
     output: PathBuf,
     stats: bool,
+    intervals: bool,
     batch_size: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = QueryConfig::new(db, query);
     config.batch_size = batch_size;
-    config.stats = stats;
+    config.mode = if stats {
+        QueryMode::Stats
+    } else if intervals {
+        QueryMode::Intervals
+    } else {
+        QueryMode::Counts
+    };
     let result = query_database(&config)?;
+
+    if intervals {
+        let n_hits = result.interval_hits.len();
+        let json = IntervalsOutput { hits: result.interval_hits }.to_json()?;
+        std::fs::write(&output, json)?;
+        println!("Query complete: {} interval hits → {}", n_hits, output.display());
+        return Ok(());
+    }
 
     let db_sources = &result.db_sources;
     let query_names = &result.query_names;

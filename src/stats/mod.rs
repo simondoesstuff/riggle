@@ -1,5 +1,31 @@
 use serde::{Deserialize, Serialize};
 
+/// One overlapping (query interval, DB interval) pair from `--intervals` mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntervalHit {
+    pub query_name: String,
+    pub db_name: String,
+    pub chrom: String,
+    pub query_start: u32,
+    pub query_end: u32,
+    pub db_start: u32,
+    pub db_end: u32,
+    /// Exact intersection length in base pairs.
+    pub intersection_bp: u32,
+}
+
+/// Full output for an `--intervals` query run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntervalsOutput {
+    pub hits: Vec<IntervalHit>,
+}
+
+impl IntervalsOutput {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
 /// Statistical result for one (query, database source) pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatResult {

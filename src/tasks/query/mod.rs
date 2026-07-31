@@ -1,4 +1,5 @@
 mod files;
+mod intervals;
 mod pvalues;
 mod sweep;
 
@@ -11,8 +12,10 @@ use voracious_radix_sort::RadixSort;
 
 use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
 use crate::matrix::{DenseMatrix, OverlapMatrix, SparseMatrix};
+use crate::stats::IntervalHit;
 
 use files::{enumerate_query_files, parse_file_batch};
+use intervals::collect_interval_pairs;
 use pvalues::compute_analytic_pvalues;
 use sweep::{build_csr_from_sorted_entries, run_sweep_block};
 
@@ -31,6 +34,20 @@ pub enum QueryError {
     DatabaseNotFound(PathBuf),
 }
 
+/// Output mode for a query operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueryMode {
+    /// Return file-level overlap counts only (default).
+    #[default]
+    Counts,
+    /// Compute analytic NB/Poisson p-values and LLR for every (query, DB) pair.
+    /// Requires the database to have been built with `--stats`.
+    Stats,
+    /// Return the exact set of overlapping interval pairs with intersection lengths.
+    /// Mutually exclusive with `Stats`.
+    Intervals,
+}
+
 /// Configuration for a query operation
 #[derive(Debug, Clone)]
 pub struct QueryConfig {
@@ -41,9 +58,7 @@ pub struct QueryConfig {
     /// Maximum number of query files to parse and hold in memory at once.
     /// `None` (default) processes all query files in a single batch.
     pub batch_size: Option<usize>,
-    /// When `true`, compute analytic NB p-values and LLR for every
-    /// (query, DB) pair with at least one interval overlap.
-    pub stats: bool,
+    pub mode: QueryMode,
 }
 
 impl QueryConfig {
@@ -53,7 +68,7 @@ impl QueryConfig {
             query_path,
             num_threads: None,
             batch_size: None,
-            stats: false,
+            mode: QueryMode::default(),
         }
     }
 }
@@ -83,7 +98,8 @@ pub struct PValueResult {
 /// Output of a query operation
 #[derive(Debug)]
 pub struct QueryResult {
-    /// Sparse intersection count matrix: rows = Q_SIDs, cols = D_SIDs
+    /// Sparse intersection count matrix: rows = Q_SIDs, cols = D_SIDs.
+    /// Empty when `mode == QueryMode::Intervals`.
     pub counts: SparseMatrix,
     /// Query file names (indexed by Q_SID)
     pub query_names: Vec<String>,
@@ -91,8 +107,10 @@ pub struct QueryResult {
     pub query_sources: Vec<QuerySource>,
     /// Database source names (D_SID → name)
     pub db_sources: HashMap<u32, String>,
-    /// Fourier p-values; populated only when `QueryConfig::stats == true`.
+    /// Analytic p-values; populated only when `mode == QueryMode::Stats`.
     pub pvalues: Vec<PValueResult>,
+    /// Individual interval pairs; populated only when `mode == QueryMode::Intervals`.
+    pub interval_hits: Vec<IntervalHit>,
 }
 
 /// Execute a query against the database.
@@ -113,6 +131,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         .map(|(k, v)| (*k, v.name.clone()))
         .collect();
 
+    // Intervals mode is a wholly separate sweep path: no count matrix is built.
+    if config.mode == QueryMode::Intervals {
+        let hits = collect_interval_pairs(config, &meta, &db_sources)?;
+        let empty_counts = sprs::CsMat::empty(sprs::CompressedStorage::CSR, num_sources);
+        return Ok(QueryResult {
+            counts: empty_counts,
+            query_names: Vec::new(),
+            query_sources: Vec::new(),
+            db_sources,
+            pvalues: Vec::new(),
+            interval_hits: hits,
+        });
+    }
+
     let all_files = enumerate_query_files(&config.query_path)?;
 
     if all_files.is_empty() {
@@ -123,6 +155,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             query_sources: Vec::new(),
             db_sources,
             pvalues: Vec::new(),
+            interval_hits: Vec::new(),
         });
     }
 
@@ -241,7 +274,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
-    let pvalues = if config.stats {
+    let pvalues = if config.mode == QueryMode::Stats {
         let mut pvalues = compute_analytic_pvalues(
             &final_counts,
             &query_file_paths,
@@ -278,6 +311,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         query_sources,
         db_sources,
         pvalues,
+        interval_hits: Vec::new(),
     })
 }
 
@@ -539,7 +573,7 @@ mod tests {
 
         let mut config =
             QueryConfig::new(db.path().to_path_buf(), query_dir.path().join("q.bed"));
-        config.stats = true;
+        config.mode = QueryMode::Stats;
         let result = query_database(&config).unwrap();
 
         // 2 DB sources × 1 query file = 2 pvalue entries.

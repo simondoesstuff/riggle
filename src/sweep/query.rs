@@ -3,6 +3,37 @@ use crate::fourier::BIN_SIZE;
 use crate::io::MappedJumpTable;
 use crate::matrix::{DenseMatrix, OverlapMatrix};
 
+/// Collect every overlapping (query, DB) interval pair and its intersection length.
+///
+/// Same jump-table positioning as [`query_sweep`]; returns owned pairs rather than
+/// accumulating into matrices.  Used by `--intervals` mode.
+pub fn query_sweep_pairs(
+    db_layer: &[Interval],
+    layer_max_size: u32,
+    jump_table: &MappedJumpTable,
+    query_block: &[Interval],
+) -> Vec<(Interval, Interval, u32)> {
+    let mut pairs = Vec::new();
+    if query_block.is_empty() || db_layer.is_empty() {
+        return pairs;
+    }
+    for q in query_block {
+        let lo = q.start.saturating_sub(layer_max_size);
+        let approx = jump_table.lookup(lo).min(db_layer.len());
+        let start_idx = approx + db_layer[approx..].partition_point(|d| d.start < lo);
+        for d in &db_layer[start_idx..] {
+            if d.start >= q.end {
+                break;
+            }
+            if d.end > q.start {
+                let intersection_bp = q.end.min(d.end) - q.start.max(d.start);
+                pairs.push((*q, *d, intersection_bp));
+            }
+        }
+    }
+    pairs
+}
+
 /// Per-query scan over a flat sorted layer, with O(1) cold-start via jump table.
 ///
 /// For each query interval, uses the jump table to land near the first database

@@ -1,2 +1,2 @@
 mod query;
-pub use query::query_sweep;
+pub use query::{query_sweep, query_sweep_pairs};
