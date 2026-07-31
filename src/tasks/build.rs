@@ -158,21 +158,21 @@ fn process_file_batch(
     let mut new_sids: Vec<(u32, String)> = Vec::new();
 
     let moment_path = db_path.join("momentmap.rkyv");
-    let mut moment_store = if compute_stats {
-        if moment_path.exists() {
+    let mut moment_store: Option<MomentStoreBuilder> = if compute_stats {
+        Some(if moment_path.exists() {
             MomentStoreBuilder::load(&moment_path)?
         } else {
             MomentStoreBuilder::new()
-        }
+        })
     } else {
-        MomentStoreBuilder::new()
+        None
     };
 
     for result in parse_results {
         let (sid, name, shard_map, dm) = result?;
-        if compute_stats {
+        if let Some(ref mut store) = moment_store {
             let moments = build_depth_moments(&dm);
-            moment_store.insert(sid, &moments);
+            store.insert(sid, &moments);
         }
         new_sids.push((sid, name));
         for (shard, intervals) in shard_map {
@@ -231,8 +231,8 @@ fn process_file_batch(
         return Err(err);
     }
 
-    if compute_stats {
-        moment_store.save(&moment_path)?;
+    if let Some(ref store) = moment_store {
+        store.save(&moment_path)?;
     }
 
     // Update meta.

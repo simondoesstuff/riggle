@@ -133,11 +133,7 @@ pub fn parse_bed_file(
 
         if let Some(result) = parse_bed_line(line_num, &line, sid) {
             let parsed = result?;
-            if let Some(intervals) = shards.get_mut(parsed.shard) {
-                intervals.push(parsed.interval);
-            } else {
-                shards.insert(parsed.shard.to_string(), vec![parsed.interval]);
-            }
+            shards.entry(parsed.shard.to_string()).or_default().push(parsed.interval);
         }
     }
 
@@ -156,11 +152,7 @@ pub fn parse_bed_string(
 
         if let Some(result) = parse_bed_line(line_num, line, sid) {
             let parsed = result?;
-            if let Some(intervals) = shards.get_mut(parsed.shard) {
-                intervals.push(parsed.interval);
-            } else {
-                shards.insert(parsed.shard.to_string(), vec![parsed.interval]);
-            }
+            shards.entry(parsed.shard.to_string()).or_default().push(parsed.interval);
         }
     }
 

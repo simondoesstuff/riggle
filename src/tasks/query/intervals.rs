@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use rayon::prelude::*;
+use voracious_radix_sort::RadixSort;
 
 use crate::io::{MappedJumpTable, MappedLayer, Meta};
 use crate::stats::IntervalHit;
@@ -25,8 +28,7 @@ pub(super) fn collect_interval_pairs(
         .unwrap_or_else(rayon::current_num_threads)
         .max(1);
     let batch_size = config.batch_size.unwrap_or(all_files.len()).max(1);
-    let db_shard_set: std::collections::HashSet<&str> =
-        meta.shards.iter().map(|s| s.as_str()).collect();
+    let db_shard_set: HashSet<&str> = meta.shards.iter().map(|s| s.as_str()).collect();
 
     let mut all_hits: Vec<IntervalHit> = Vec::new();
 
@@ -40,7 +42,7 @@ pub(super) fn collect_interval_pairs(
             if !db_shard_set.contains(shard.as_str()) || shard_queries.is_empty() {
                 continue;
             }
-            voracious_radix_sort::RadixSort::voracious_sort(&mut shard_queries);
+            shard_queries.voracious_sort();
 
             for layer_idx in 0..meta.num_layers {
                 let layer_path = config

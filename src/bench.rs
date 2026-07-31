@@ -34,7 +34,7 @@ impl Default for BedGenConfig {
     fn default() -> Self {
         Self {
             num_intervals: 10_000,
-            genome_size: 250_000_000, // 100Mb
+            genome_size: 250_000_000,
             min_len: 100,
             max_len: 10_000,
             seed: 42,

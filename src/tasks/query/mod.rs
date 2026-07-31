@@ -166,8 +166,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
 
     let batch_size = config.batch_size.unwrap_or(all_files.len()).max(1);
 
-    let db_shard_set: std::collections::HashSet<&str> =
-        meta.shards.iter().map(|s| s.as_str()).collect();
+    let db_shard_set: HashSet<&str> = meta.shards.iter().map(|s| s.as_str()).collect();
 
     let mut all_entries: Vec<(usize, usize, u32)> = Vec::new();
     let mut query_names: Vec<String> = Vec::new();
