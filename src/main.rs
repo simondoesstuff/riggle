@@ -34,6 +34,11 @@ enum Commands {
         /// Adds O(N log N) per chromosome at index time; required for --stats at query time.
         #[arg(long)]
         stats: bool,
+
+        /// Only compute FFT moments for these chromosomes (default: all).
+        /// Example: --chroms chr1 chr2 chr3
+        #[arg(long, num_args(1..))]
+        chroms: Vec<String>,
     },
 
     /// Query a database with BED file(s)
@@ -76,7 +81,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Add { input, db, batch_size, stats } => run_add(input, db, batch_size, stats),
+        Commands::Add { input, db, batch_size, stats, chroms } => run_add(input, db, batch_size, stats, chroms),
         Commands::Query { db, query, output, stats, intervals, batch_size } => {
             run_query(db, query, output, stats, intervals, batch_size)
         }
@@ -94,10 +99,14 @@ fn run_add(
     db: PathBuf,
     batch_size: Option<usize>,
     stats: bool,
+    chroms: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AddConfig::new(input, db);
     config.batch_size = batch_size;
     config.compute_stats = stats;
+    if !chroms.is_empty() {
+        config.chrom_whitelist = Some(chroms.into_iter().collect());
+    }
     add_to_database(&config)?;
     Ok(())
 }

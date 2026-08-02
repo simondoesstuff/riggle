@@ -136,10 +136,8 @@ impl MomentStoreBuilder {
             .collect();
     }
 
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        let store = MomentStore {
-            maps: self.maps.clone(),
-        };
+    pub fn save(self, path: &Path) -> io::Result<()> {
+        let store = MomentStore { maps: self.maps };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&store)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         fs::write(path, bytes.as_slice())

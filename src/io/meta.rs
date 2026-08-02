@@ -34,8 +34,19 @@ impl LayerConfig {
         if size < self.min_size {
             return 0;
         }
-        // Find K such that min_size * gf^(K-1) <= size < min_size * gf^K
-        // i.e. K = ceil(log_{gf}(size / min_size)) but with integer arithmetic
+        // O(1) fast path when both are powers of two (the common case).
+        // Layer K holds sizes in [min * gf^(K-1), min * gf^K), so
+        //   K = floor((log2(size) - log2(min)) / log2(gf)) + 1.
+        if self.min_size.is_power_of_two()
+            && self.growth_factor.is_power_of_two()
+            && self.growth_factor >= 2
+        {
+            let log2_size = u32::BITS - 1 - size.leading_zeros();
+            let log2_min  = u32::BITS - 1 - self.min_size.leading_zeros();
+            let log2_gf   = self.growth_factor.trailing_zeros();
+            return (log2_size.saturating_sub(log2_min) / log2_gf + 1) as usize;
+        }
+        // General case for non-power-of-two configs.
         let mut threshold = self.min_size as u64;
         let gf = self.growth_factor as u64;
         let mut layer = 0usize;

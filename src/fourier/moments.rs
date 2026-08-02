@@ -31,10 +31,13 @@ use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 use wide::f64x4;
 
-// One real-FFT planner per rayon worker thread.  Plans for a given size are
-// computed once and reused across all chromosomes and files on that thread.
+// Per-thread caches: FFT plans (computed once per size) and large scratch
+// buffers (grown once to the max chromosome FFT size, then reused without
+// reallocation).  Avoids repeated 64 MB malloc/free per chromosome call.
 thread_local! {
     static R2C_PLANNER: RefCell<RealFftPlanner<f64>> = RefCell::new(RealFftPlanner::new());
+    static SCRATCH_REAL: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_SPEC: RefCell<Vec<Complex<f64>>> = const { RefCell::new(Vec::new()) };
 }
 
 use super::depth::{ChromDepthMap, DepthMap, build_depth_signal};
@@ -381,39 +384,45 @@ fn autocorr_via_fft(signal: &[f64]) -> Vec<f64> {
         return Vec::new();
     }
     let fft_len = (2 * n).next_power_of_two();
+    let spec_len = fft_len / 2 + 1;
 
-    // Fetch (or compute) plans from the thread-local planner cache.
     let (r2c, c2r) = R2C_PLANNER.with(|p| {
         let mut p = p.borrow_mut();
         (p.plan_fft_forward(fft_len), p.plan_fft_inverse(fft_len))
     });
 
-    // Real buffer: signal zero-padded to fft_len.
-    let mut real_buf: Vec<f64> = Vec::with_capacity(fft_len);
-    real_buf.extend_from_slice(signal);
-    real_buf.resize(fft_len, 0.0);
+    // Borrow thread-local scratch buffers; grow them on first large call, then
+    // reuse without reallocation for all subsequent chromosomes on this thread.
+    SCRATCH_REAL.with(|rb| {
+        SCRATCH_SPEC.with(|sb| {
+            let mut real_buf = rb.borrow_mut();
+            let mut spectrum = sb.borrow_mut();
 
-    // Complex spectrum: only fft_len/2 + 1 elements needed (half of complex FFT).
-    let mut spectrum = vec![Complex::new(0.0, 0.0); fft_len / 2 + 1];
+            if real_buf.len() < fft_len {
+                real_buf.resize(fft_len, 0.0);
+            }
+            real_buf[..n].copy_from_slice(signal);
+            real_buf[n..fft_len].fill(0.0);
 
-    r2c.process(&mut real_buf, &mut spectrum).expect("r2c FFT failed");
+            if spectrum.len() < spec_len {
+                spectrum.resize(spec_len, Complex::new(0.0, 0.0));
+            }
 
-    // Power spectrum in-place: |X[k]|² (real, so imaginary set to 0).
-    for c in &mut spectrum {
-        let p = c.norm_sqr();
-        *c = Complex::new(p, 0.0);
-    }
+            r2c.process(&mut real_buf[..fft_len], &mut spectrum[..spec_len])
+                .expect("r2c FFT failed");
 
-    // Inverse real FFT: writes back into real_buf (fft_len f64).
-    c2r.process(&mut spectrum, &mut real_buf).expect("c2r IFFT failed");
+            for c in &mut spectrum[..spec_len] {
+                let p = c.norm_sqr();
+                *c = Complex::new(p, 0.0);
+            }
 
-    // realfft IFFT is unnormalized; divide by fft_len.
-    let scale = 1.0 / fft_len as f64;
-    real_buf.truncate(n);
-    for x in &mut real_buf {
-        *x *= scale;
-    }
-    real_buf
+            c2r.process(&mut spectrum[..spec_len], &mut real_buf[..fft_len])
+                .expect("c2r IFFT failed");
+
+            let scale = 1.0 / fft_len as f64;
+            real_buf[..n].iter().map(|&x| x * scale).collect()
+        })
+    })
 }
 
 #[cfg(test)]

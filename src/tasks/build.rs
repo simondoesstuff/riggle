@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,7 +7,7 @@ use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
 use crate::core::Interval;
-use crate::fourier::{DepthMap, build_depth_moments, intervals_to_bed_map};
+use crate::fourier::{ChromMoments, DepthMap, build_chrom_moments, intervals_to_bed_map};
 use crate::io::{
     BedParseError, LayerConfig, LayerError, Meta, MetaError,
     MomentStoreBuilder, SidEntry, build_jump_table, extend_jump_table, extend_layer, is_bed_file,
@@ -48,6 +48,9 @@ pub struct AddConfig {
     /// When false, `momentmap.rkyv` is not written and `--stats` at query time
     /// returns no p-values.
     pub compute_stats: bool,
+    /// If set, only compute FFT moments for chromosomes in this set.
+    /// `None` (default) computes moments for all chromosomes present in the file.
+    pub chrom_whitelist: Option<HashSet<String>>,
 }
 
 impl AddConfig {
@@ -58,6 +61,7 @@ impl AddConfig {
             layer_config: None,
             batch_size: None,
             compute_stats: false,
+            chrom_whitelist: None,
         }
     }
 }
@@ -116,7 +120,7 @@ pub fn add_to_database(config: &AddConfig) -> Result<(), AddError> {
 
     let batch_size = config.batch_size.unwrap_or(bed_files.len()).max(1);
     for batch in bed_files.chunks(batch_size) {
-        process_file_batch(batch, &mut meta, &config.db_path, config.compute_stats)?;
+        process_file_batch(batch, &mut meta, &config.db_path, config.compute_stats, config.chrom_whitelist.as_ref())?;
         meta.save(&config.db_path)?;
     }
 
@@ -129,6 +133,7 @@ fn process_file_batch(
     meta: &mut Meta,
     db_path: &std::path::Path,
     compute_stats: bool,
+    chrom_whitelist: Option<&HashSet<String>>,
 ) -> Result<(), AddError> {
     let layer_config = meta.layer_config.clone();
     let next_sid = meta.next_sid();
@@ -136,8 +141,11 @@ fn process_file_batch(
     let shards_dir = db_path.join("shards");
     fs::create_dir_all(&shards_dir)?;
 
-    // Parse all files in parallel; build depth maps and moments in-memory.
-    let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>, DepthMap), AddError>> =
+    // Parse all files in parallel; compute FFT moments in the same pass so the
+    // outer par_iter (over files) provides all parallelism.  Each file iterates
+    // its chromosomes sequentially, avoiding the nested par_iter that serialized
+    // 1906 files and left worker threads idle between files.
+    let parse_results: Vec<Result<(u32, String, HashMap<String, Vec<Interval>>, Vec<ChromMoments>), AddError>> =
         batch
             .par_iter()
             .enumerate()
@@ -149,8 +157,19 @@ fn process_file_batch(
                     .unwrap_or_else(|| format!("file_{}", sid));
                 let shards = parse_bed_file(path, sid)?;
                 let bed_map = intervals_to_bed_map(&shards);
-                let dm = DepthMap::build(&bed_map);
-                Ok((sid, name, shards, dm))
+                let moments: Vec<ChromMoments> = if compute_stats {
+                    let dm = DepthMap::build(&bed_map);
+                    dm.chroms
+                        .iter()
+                        .filter(|c| {
+                            chrom_whitelist.map_or(true, |wl| wl.contains(&c.chrom))
+                        })
+                        .map(build_chrom_moments)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Ok((sid, name, shards, moments))
             })
             .collect();
 
@@ -169,9 +188,8 @@ fn process_file_batch(
     };
 
     for result in parse_results {
-        let (sid, name, shard_map, dm) = result?;
+        let (sid, name, shard_map, moments) = result?;
         if let Some(ref mut store) = moment_store {
-            let moments = build_depth_moments(&dm);
             store.insert(sid, &moments);
         }
         new_sids.push((sid, name));
@@ -231,7 +249,7 @@ fn process_file_batch(
         return Err(err);
     }
 
-    if let Some(ref store) = moment_store {
+    if let Some(store) = moment_store {
         store.save(&moment_path)?;
     }
 
