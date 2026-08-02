@@ -49,15 +49,15 @@ rule scatter_bed_pvals:
         " -o {output} --no-show"
 
 
-rule scatter_regioners:
-    """2×3 scatter: chuckle vs each regioners method (-log10 and raw p-value rows)."""
+rule scatter_regioners_chuckle:
+    """3×3 scatter: chuckle vs each regioners method (rank, -log10, raw p-value rows)."""
     input:
         chuckle=f"{CHUCKLE_DIR}/{{trait}}.json",
         shuffle=f"{REGIONERS_DIR}/shuffle/{{trait}}.tsv",
         circle=f"{REGIONERS_DIR}/circle/{{trait}}.tsv",
         novl=f"{REGIONERS_DIR}/novl/{{trait}}.tsv",
     output:
-        "data/plots/scatter_regioners_{trait}.png",
+        "data/plots/scatter_regioners_chuckle_{trait}.png",
     shell:
         "uv run workflow/scripts/regioners_scatter.py"
         " --trait {wildcards.trait}"
@@ -66,19 +66,36 @@ rule scatter_regioners:
         " -o {output} --no-show"
 
 
-rule scatter_regioners_all:
-    """2×3 scatter across all GWAS traits combined: chuckle vs each regioners method."""
+rule scatter_regioners_chuckle_all:
+    """3×3 scatter across all GWAS traits combined: chuckle vs each regioners method."""
     input:
         chuckle=expand(f"{CHUCKLE_DIR}/{{trait}}.json", trait=_REGIONERS_TRAITS),
         shuffle=expand(f"{REGIONERS_DIR}/shuffle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
         circle=expand(f"{REGIONERS_DIR}/circle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
         novl=expand(f"{REGIONERS_DIR}/novl/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
     output:
-        "data/plots/scatter_regioners_all.png",
+        "data/plots/scatter_regioners_chuckle_all.png",
     shell:
         "uv run workflow/scripts/regioners_scatter.py"
         " --all-traits"
         " --chuckle {CHUCKLE_DIR}"
+        " --regioners {REGIONERS_DIR}"
+        " -o {output} --no-show"
+
+
+rule scatter_regioners_giggle_all:
+    """3×3 scatter across all GWAS traits combined: giggle vs each regioners method."""
+    input:
+        giggle=expand("data/giggle/{trait}.tsv", trait=_REGIONERS_TRAITS),
+        shuffle=expand(f"{REGIONERS_DIR}/shuffle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+        circle=expand(f"{REGIONERS_DIR}/circle/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+        novl=expand(f"{REGIONERS_DIR}/novl/{{trait}}.tsv", trait=_REGIONERS_TRAITS),
+    output:
+        "data/plots/scatter_regioners_giggle_all.png",
+    shell:
+        "uv run workflow/scripts/regioners_scatter.py"
+        " --all-traits"
+        " --giggle data/giggle"
         " --regioners {REGIONERS_DIR}"
         " -o {output} --no-show"
 

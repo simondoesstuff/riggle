@@ -49,7 +49,6 @@ rule chuckle_query:
         query="data/queries/{trait}.bed",
         bin=CHUCKLE_BIN,
         index=CHUCKLE_INDEX,
-        whitelist=ancient(f"{RME_DIR}/whitelist.bed"),
     output:
         f"{CHUCKLE_DIR}/{{trait}}.json",
     resources:
@@ -60,4 +59,3 @@ rule chuckle_query:
         " --query {input.query}"
         " --output {output}"
         " --stats"
-        " --whitelist {input.whitelist}"

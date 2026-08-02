@@ -5,12 +5,19 @@ Each point = one RME (cell × state) bed.  Produces one panel per tool pair
 (chuckle/giggle, chuckle/BITS, giggle/BITS).
 
 Usage:
-    uv run scripts/tool_scatter.py \\
+    uv run workflow/scripts/tool_scatter.py \\
         --per-bed Rheumatoid_arthritis \\
         --chuckle data/chuckle \\
         --giggle data/giggle \\
         --bits data/bits/1000 \\
-        --output imgs/scatter_bed_pvals_ra_1000.png
+        -o data/plots/scatter_bed_pvals_Rheumatoid_arthritis_1000.png --no-show
+
+    uv run workflow/scripts/tool_scatter.py \\
+        --per-bed Rheumatoid_arthritis \\
+        --chuckle data/chuckle \\
+        --giggle data/giggle \\
+        --mc data/montecarlo \\
+        -o data/plots/scatter_mc_Rheumatoid_arthritis.png --no-show
 """
 
 from __future__ import annotations
