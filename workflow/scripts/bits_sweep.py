@@ -13,21 +13,18 @@ import argparse
 import gzip
 import os
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-
-def _strip_name(filename: str) -> str:
-    for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-        if filename.endswith(ext):
-            return filename[: -len(ext)]
-    return filename
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import strip_bed_name
 
 
 def _run_one(args_tuple: tuple[str, str, str, int]) -> tuple[str, tuple | None]:
     query, bed_gz, universe, trials = args_tuple
-    name = _strip_name(Path(bed_gz).name)
+    name = strip_bed_name(Path(bed_gz).name)
 
     with tempfile.NamedTemporaryFile(suffix=".bed", delete=False) as tmp:
         tmp_path = tmp.name

@@ -123,9 +123,7 @@ rule scatter_mc:
         " -o {output} --no-show"
 
 
-# INFO: ------------------------
-# 			  RME Heatmaps
-# ------------------------------
+# RME Heatmaps
 
 
 RME_HEAT_STATES = [

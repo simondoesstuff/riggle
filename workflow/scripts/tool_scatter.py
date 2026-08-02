@@ -24,13 +24,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 
-_TINY = float(np.finfo(np.float64).tiny)
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import FLOAT_TINY, read_chuckle_records, read_tsv, strip_bed_name
 
 _TOOL_COLORS = {
     "bits": "#e07b54",
@@ -41,44 +43,16 @@ _TOOL_COLORS = {
 
 
 # ──────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────
-
-
-def _strip_name(filename: str) -> str:
-    for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-        if filename.endswith(ext):
-            return filename[: -len(ext)]
-    return filename
-
-
-def _read_tsv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
-    """Return (header, rows) from a TSV, stripping leading '#' from any line."""
-    with open(path) as f:
-        lines = [l.rstrip("\n\t") for l in f if l.strip()]
-    if not lines:
-        return [], []
-    header = lines[0].lstrip("#").split("\t")
-    n = len(header)
-    rows = []
-    for line in lines[1:]:
-        parts = line.lstrip("#").split("\t")
-        if len(parts) >= n:
-            rows.append(dict(zip(header, parts[:n])))
-    return header, rows
-
-
-# ──────────────────────────────────────────────────────────────
 # Per-bed loaders — return dict[bed_name → -log10(p)]
 # ──────────────────────────────────────────────────────────────
 
 
 def load_bits_per_bed(tsv_path: str) -> dict[str, float]:
-    _, rows = _read_tsv(Path(tsv_path))
+    _, rows = read_tsv(Path(tsv_path))
     result: dict[str, float] = {}
     for r in rows:
         try:
-            p = max(float(r["p_value"]), _TINY)
+            p = max(float(r["p_value"]), FLOAT_TINY)
             result[r["name"]] = -math.log10(p)
         except (KeyError, ValueError):
             pass
@@ -86,12 +60,12 @@ def load_bits_per_bed(tsv_path: str) -> dict[str, float]:
 
 
 def load_giggle_per_bed(tsv_path: str, col: str = "fishers_right_tail") -> dict[str, float]:
-    _, rows = _read_tsv(Path(tsv_path))
+    _, rows = read_tsv(Path(tsv_path))
     result: dict[str, float] = {}
     for r in rows:
         try:
-            name = _strip_name(Path(r["file"]).name)
-            p = max(float(r[col]), _TINY)
+            name = strip_bed_name(Path(r["file"]).name)
+            p = max(float(r[col]), FLOAT_TINY)
             result[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass
@@ -101,7 +75,7 @@ def load_giggle_per_bed(tsv_path: str, col: str = "fishers_right_tail") -> dict[
 def load_mc_per_bed(tsv_path: str, trials: int) -> dict[str, float]:
     """Load MC p-values for a specific trial milestone from a multi-milestone TSV."""
     # Floor at 1/trials: empirical p can't be smaller than one exceedance out of N.
-    # Using _TINY here produces -log10(p) ≈ 308 for p=0 hits, blowing up the axis.
+    # FLOAT_TINY would produce -log10(p) ≈ 308 for p=0 hits, blowing up the axis.
     p_floor = 1.0 / trials
     result: dict[str, float] = {}
     in_section = False
@@ -116,7 +90,7 @@ def load_mc_per_bed(tsv_path: str, trials: int) -> dict[str, float]:
                 continue
             cols = line.split("\t")
             if len(cols) >= 3:
-                name = _strip_name(Path(cols[0]).name)
+                name = strip_bed_name(Path(cols[0]).name)
                 try:
                     p = max(float(cols[2]), p_floor)
                     result[name] = -math.log10(p)
@@ -126,16 +100,11 @@ def load_mc_per_bed(tsv_path: str, trials: int) -> dict[str, float]:
 
 
 def load_chuckle_per_bed(json_path: str) -> dict[str, float]:
-    import json as _json
-
-    with open(json_path) as f:
-        data = _json.load(f)
-    results = data.get("results", data) if isinstance(data, dict) else data
     out: dict[str, float] = {}
-    for r in results:
+    for r in read_chuckle_records(json_path):
         try:
-            name = _strip_name(Path(r["db_name"]).name)
-            p = max(float(r["p_value"]), _TINY)
+            name = strip_bed_name(Path(r["db_name"]).name)
+            p = max(float(r["p_value"]), FLOAT_TINY)
             out[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass

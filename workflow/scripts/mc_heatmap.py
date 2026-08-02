@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import stats
 
-_TINY = float(np.finfo(np.float64).tiny)
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import FLOAT_TINY, read_chuckle_records, strip_bed_name
 
 # Chuckle p-value thresholds: beds with chuckle p < threshold are included.
 # Ordered most-permissive to most-stringent.
@@ -38,23 +40,12 @@ MIN_N = 5  # minimum beds needed to report a correlation
 # ──────────────────────────────────────────────────────────────
 
 
-def _strip_name(filename: str) -> str:
-    for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-        if filename.endswith(ext):
-            return filename[: -len(ext)]
-    return filename
-
-
 def load_chuckle(json_path: str) -> dict[str, float]:
-    import json
-    with open(json_path) as f:
-        data = json.load(f)
-    results = data.get("results", data) if isinstance(data, dict) else data
     out: dict[str, float] = {}
-    for r in results:
+    for r in read_chuckle_records(json_path):
         try:
-            name = _strip_name(Path(r["db_name"]).name)
-            p = max(float(r["p_value"]), _TINY)
+            name = strip_bed_name(Path(r["db_name"]).name)
+            p = max(float(r["p_value"]), FLOAT_TINY)
             out[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass
@@ -83,9 +74,9 @@ def load_mc_all_milestones(tsv_path: str) -> dict[int, dict[str, float]]:
                 continue
             cols = line.split("\t")
             if len(cols) >= 3:
-                name = _strip_name(Path(cols[0]).name)
+                name = strip_bed_name(Path(cols[0]).name)
                 try:
-                    p = max(float(cols[2]), _TINY)
+                    p = max(float(cols[2]), FLOAT_TINY)
                     current_data[name] = -math.log10(p)
                 except ValueError:
                     pass
@@ -121,7 +112,7 @@ def compute_grid(
         mc = mc_milestones[trials]
         common = sorted(set(chuckle) & set(mc))
         for j, threshold in enumerate(thresholds):
-            log_thresh = -math.log10(max(threshold, _TINY))
+            log_thresh = -math.log10(max(threshold, FLOAT_TINY))
             subset = [n for n in common if chuckle[n] >= log_thresh]
             n = len(subset)
             n_grid[i, j] = n

@@ -26,6 +26,9 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import parse_bed_filename, read_chuckle_records, read_tsv
+
 # ---------------------------------------------------------------------------
 # Bed-file → tissue classification
 # ---------------------------------------------------------------------------
@@ -69,28 +72,6 @@ _CELL_TISSUE_RULES: list[tuple[list[str], list[str]]] = [
       "FORESKIN", "NHDF"], ["skin", "connective_tissue"]),
 ]
 
-_CHROMATIN_STATES = [
-    "Active_TSS", "Flanking_Active_TSS", "Strong_transcription", "Weak_transcription",
-    "Enhancers", "Genic_enhancers", "ZNF_genes_and_repeats", "Heterochromatin",
-    "Bivalent_Poised_TSS", "Flanking_Bivalent_TSS_Enh", "Bivalent_Enhancer",
-    "Repressed_PolyComb", "Weak_Repressed_PolyComb", "Transcr_at_gene_5_and_3",
-    "Quiescent_Low",
-]
-
-
-def _parse_bed_name(bed_name: str) -> tuple[str, str] | None:
-    """Return (cell_type_prefix, chromatin_state) or None if unrecognised."""
-    stem = Path(bed_name).name
-    for ext in (".bed.gz", ".bed"):
-        if stem.endswith(ext):
-            stem = stem[: -len(ext)]
-    for state in sorted(_CHROMATIN_STATES, key=len, reverse=True):
-        if stem.endswith(state):
-            prefix = stem[: -(len(state))].rstrip("_")
-            return prefix, state
-    return None
-
-
 def _prefix_to_tissues(prefix: str) -> list[str]:
     upper = prefix.upper()
     tissues: set[str] = set()
@@ -101,7 +82,7 @@ def _prefix_to_tissues(prefix: str) -> list[str]:
 
 
 def bed_to_tissues(bed_name: str) -> list[str]:
-    parsed = _parse_bed_name(bed_name)
+    parsed = parse_bed_filename(bed_name)
     return _prefix_to_tissues(parsed[0]) if parsed else []
 
 
@@ -112,38 +93,23 @@ def bed_to_tissues(bed_name: str) -> list[str]:
 
 def load_giggle(path: Path) -> dict[str, float]:
     """Parse giggle TSV → {bed_filename: combo_score}."""
+    header, rows = read_tsv(path)
+    for col in ("file", "combo_score"):
+        if col not in header:
+            raise ValueError(f"Missing column '{col}' in {path}")
     scores: dict[str, float] = {}
-    with open(path) as f:
-        header = f.readline().lstrip("#").rstrip("\n").split("\t")
+    for r in rows:
         try:
-            file_idx = header.index("file")
-            score_idx = header.index("combo_score")
-        except ValueError as e:
-            raise ValueError(f"Missing column in {path}: {e}") from e
-        for line in f:
-            if not line.strip():
-                continue
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) <= max(file_idx, score_idx):
-                continue
-            filename = Path(parts[file_idx]).name
-            try:
-                scores[filename] = float(parts[score_idx])
-            except ValueError:
-                continue
+            scores[Path(r["file"]).name] = float(r["combo_score"])
+        except (KeyError, ValueError):
+            continue
     return scores
 
 
 def load_chuckle(path: Path) -> dict[str, float]:
     """Parse chuckle JSON → {bed_filename: llr}."""
-    with open(path) as f:
-        data = json.load(f)
-    records: list[dict] = (
-        data if isinstance(data, list)
-        else next(v for v in data.values() if isinstance(v, list))
-    )
     scores: dict[str, float] = {}
-    for r in records:
+    for r in read_chuckle_records(path):
         if r.get("llr") is None:
             continue
         scores[Path(r["db_name"]).name] = float(r["llr"])
@@ -168,7 +134,7 @@ def aggregate_to_cell_types(scores: dict[str, float]) -> dict[str, float]:
     # Parse all bed names into (prefix, state, score)
     triples: list[tuple[str, str, float]] = []
     for bed, score in scores.items():
-        parsed = _parse_bed_name(bed)
+        parsed = parse_bed_filename(bed)
         if parsed is not None:
             triples.append((*parsed, score))
 

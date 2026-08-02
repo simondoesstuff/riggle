@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import sys
@@ -18,29 +17,17 @@ from matplotlib.colors import Colormap, Normalize
 from matplotlib.figure import Figure
 from numpy.typing import NDArray
 
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import CHROMATIN_STATES, parse_bed_filename, read_chuckle_records, read_tsv, strip_bed_name
+
 type Pathish = os.PathLike[str] | str
 
 # ==========================================
 # Genomics Domain Specifics
 # ==========================================
 
-chromatin_states = [
-    "Active_TSS",
-    "Flanking_Active_TSS",
-    "Strong_transcription",
-    "Weak_transcription",
-    "Enhancers",
-    "Genic_enhancers",
-    "ZNF_genes_and_repeats",
-    "Heterochromatin",
-    "Bivalent_Poised_TSS",
-    "Flanking_Bivalent_TSS_Enh",
-    "Bivalent_Enhancer",
-    "Repressed_PolyComb",
-    "Weak_Repressed_PolyComb",
-    "Transcr_at_gene_5_and_3",
-    "Quiescent_Low",
-]
+# Alias to preserve the public name used in the CLI choices and function signatures.
+chromatin_states = CHROMATIN_STATES
 
 cell_categories = [
     "iPSC",
@@ -126,16 +113,10 @@ def classify_cell_type(cell_type: str) -> str:
 
 
 def classify_bed_file(bed: Pathish) -> tuple[str, str]:
-    filename = os.path.basename(str(bed))
-    if filename.endswith(".bed.gz"):
-        filename = filename[:-7]
-    elif filename.endswith(".bed"):
-        filename = filename[:-4]
-    for state in sorted(chromatin_states, key=len, reverse=True):
-        if filename.endswith(state):
-            prefix = filename[: -(len(state))].rstrip("_")
-            return prefix, state
-    raise ValueError(f'Unknown format, expecting "cellType_chrmState", got: {filename}')
+    result = parse_bed_filename(os.path.basename(str(bed)))
+    if result is None:
+        raise ValueError(f'Unknown format, expecting "cellType_chrmState", got: {bed}')
+    return result
 
 
 def parse_giggle_tsv(
@@ -143,30 +124,21 @@ def parse_giggle_tsv(
 ) -> tuple[list[str], list[float]]:
     """Parse a giggle search TSV.  P-value columns are -log10 transformed."""
     p_value_cols = {"fishers_two_tail", "fishers_left_tail", "fishers_right_tail"}
+    header, rows = read_tsv(score_path)
+    if col not in header or "file" not in header:
+        raise ValueError(f"Column '{col}' not found in giggle header: {header}")
     pairs: list[tuple[str, float]] = []
-    with open(score_path) as f:
-        header = f.readline().lstrip("#").rstrip("\n\t").split("\t")
+    for r in rows:
         try:
-            col_idx = header.index(col)
-            file_idx = header.index("file")
-        except ValueError:
-            raise ValueError(f"Column '{col}' not found in giggle header: {header}")
-        for line in f:
-            if not line.strip():
-                continue
-            parts = line.rstrip("\n\t").split("\t")
-            if len(parts) <= max(col_idx, file_idx):
-                continue
-            name = Path(parts[file_idx]).name.split(".")[0]
-            try:
-                val = float(parts[col_idx])
-                if col in p_value_cols:
-                    if val <= 0:
-                        continue
-                    val = -math.log10(val)
-                pairs.append((name, val))
-            except ValueError:
-                continue
+            name = strip_bed_name(Path(r["file"]).name)
+            val = float(r[col])
+            if col in p_value_cols:
+                if val <= 0:
+                    continue
+                val = -math.log10(val)
+            pairs.append((name, val))
+        except (KeyError, ValueError):
+            continue
     pairs.sort(key=lambda x: -x[1])
     if not pairs:
         return [], []
@@ -201,18 +173,7 @@ def parse_score_file(
 def parse_json_file(
     json_path: Pathish, score_field: str = "p_value"
 ) -> tuple[list[str], list[float]]:
-    with open(json_path) as f:
-        data = json.load(f)
-
-    # Accept a bare list or find the first list value in an object
-    records: list[dict] = (
-        data
-        if isinstance(data, list)
-        else next(v for v in data.values() if isinstance(v, list))
-    )
-
-    # Filter out records where score_field is None (e.g. llr not computed)
-    records = [r for r in records if r.get(score_field) is not None]
+    records = [r for r in read_chuckle_records(json_path) if r.get(score_field) is not None]
     if not records:
         return [], []
 
@@ -225,14 +186,8 @@ def parse_json_file(
     ]
     name_field = max(path_fields, key=lambda k: len({r[k] for r in records}))
 
-    def _strip_extensions(filename: str) -> str:
-        for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-            if filename.endswith(ext):
-                return filename[: -len(ext)]
-        return filename.split(".")[0]
-
     pairs = [
-        (_strip_extensions(Path(r[name_field]).name), float(r[score_field]))
+        (strip_bed_name(Path(r[name_field]).name), float(r[score_field]))
         for r in records
     ]
 

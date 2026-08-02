@@ -13,21 +13,18 @@ import gzip
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-
-def _strip_name(filename: str) -> str:
-    for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-        if filename.endswith(ext):
-            return filename[: -len(ext)]
-    return filename
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import strip_bed_name
 
 
 def _run_one(args_tuple: tuple) -> tuple[str, dict | None]:
     query, bed_gz, genome, method, trials, bin_path = args_tuple
-    name = _strip_name(Path(bed_gz).name)
+    name = strip_bed_name(Path(bed_gz).name)
 
     with tempfile.NamedTemporaryFile(suffix=".bed", delete=False) as tmp_b:
         tmp_b_path = tmp_b.name

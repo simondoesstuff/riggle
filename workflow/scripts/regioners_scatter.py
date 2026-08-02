@@ -25,7 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -33,7 +33,9 @@ import numpy as np
 from matplotlib.axes import Axes
 from scipy.stats import rankdata
 
-_TINY = float(np.finfo(np.float64).tiny)
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import FLOAT_TINY, read_chuckle_records, read_tsv, strip_bed_name
+
 _METHOD_COLORS = {
     "shuffle": "#e07b54",
     "circle": "#54a0e0",
@@ -42,24 +44,14 @@ _METHOD_COLORS = {
 _METHODS = ["shuffle", "circle", "novl"]
 
 
-def _strip_name(filename: str) -> str:
-    for ext in (".clean.bed.gz", ".bed.gz", ".clean.bed", ".bed"):
-        if filename.endswith(ext):
-            return filename[: -len(ext)]
-    return filename
-
-
 def load_chuckle(json_path: Path) -> tuple[dict[str, float], dict[str, float]]:
     """Return ({bed_name: p_value}, {bed_name: llr})."""
-    with open(json_path) as f:
-        data = json.load(f)
-    results = data.get("results", data) if isinstance(data, dict) else data
     p_out: dict[str, float] = {}
     llr_out: dict[str, float] = {}
-    for r in results:
+    for r in read_chuckle_records(json_path):
         try:
-            name = _strip_name(Path(r["db_name"]).name)
-            p_out[name] = max(float(r["p_value"]), _TINY)
+            name = strip_bed_name(Path(r["db_name"]).name)
+            p_out[name] = max(float(r["p_value"]), FLOAT_TINY)
             llr_out[name] = float(r["llr"])
         except (KeyError, ValueError):
             pass
@@ -68,52 +60,38 @@ def load_chuckle(json_path: Path) -> tuple[dict[str, float], dict[str, float]]:
 
 def load_giggle(tsv_path: Path) -> tuple[dict[str, float], dict[str, float]]:
     """Return ({bed_name: fishers_right_tail}, {bed_name: combo_score})."""
+    _, rows = read_tsv(tsv_path)
     p_out: dict[str, float] = {}
     score_out: dict[str, float] = {}
-    with open(tsv_path) as f:
-        header = f.readline().lstrip("#").rstrip().split("\t")
-        rt_idx = header.index("fishers_right_tail")
-        cs_idx = header.index("combo_score")
-        file_idx = header.index("file")
-        for line in f:
-            cols = line.rstrip().split("\t")
-            if len(cols) <= max(rt_idx, cs_idx, file_idx):
-                continue
-            try:
-                name = _strip_name(Path(cols[file_idx]).name)
-                p_out[name] = max(float(cols[rt_idx]), _TINY)
-                score_out[name] = float(cols[cs_idx])
-            except (ValueError, IndexError):
-                pass
+    for r in rows:
+        try:
+            name = strip_bed_name(Path(r["file"]).name)
+            p_out[name] = max(float(r["fishers_right_tail"]), FLOAT_TINY)
+            score_out[name] = float(r["combo_score"])
+        except (KeyError, ValueError):
+            pass
     return p_out, score_out
 
 
 def load_regioners(tsv_path: Path) -> dict[str, float]:
     """Return {bed_name: enrichment_p_value}, converting alt='l' to enrichment direction."""
+    _, rows = read_tsv(tsv_path)
     out: dict[str, float] = {}
-    with open(tsv_path) as f:
-        header = f.readline().lstrip("#").rstrip().split("\t")
-        p_idx = header.index("p_val")
-        alt_idx = header.index("alt")
-        name_idx = header.index("name")
-        for line in f:
-            cols = line.rstrip().split("\t")
-            if len(cols) <= max(p_idx, alt_idx, name_idx):
-                continue
-            try:
-                raw_p = float(cols[p_idx])
-                alt = cols[alt_idx]
-                # Convert to enrichment p-value: "g" is already enrichment;
-                # "l" tests depletion so enrichment p ≈ 1 - p.
-                if alt == "g":
-                    p = raw_p
-                elif alt == "l":
-                    p = 1.0 - raw_p
-                else:
-                    p = raw_p  # "t" or unknown — use as-is
-                out[cols[name_idx]] = max(p, _TINY)
-            except (ValueError, IndexError):
-                pass
+    for r in rows:
+        try:
+            raw_p = float(r["p_val"])
+            alt = r["alt"]
+            # Convert to enrichment p-value: "g" is already enrichment;
+            # "l" tests depletion so enrichment p ≈ 1 - p.
+            if alt == "g":
+                p = raw_p
+            elif alt == "l":
+                p = 1.0 - raw_p
+            else:
+                p = raw_p  # "t" or unknown — use as-is
+            out[r["name"]] = max(p, FLOAT_TINY)
+        except (KeyError, ValueError):
+            pass
     return out
 
 
