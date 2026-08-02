@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::fourier::{QueryChromData, build_query_chrom_data, compute_analytic_stats,
-    parse_bed_as_map};
+use crate::fourier::{QueryChromData, compute_analytic_stats};
 use crate::io::MappedMomentStore;
 use crate::matrix::SparseMatrix;
 
@@ -12,16 +11,17 @@ use super::PValueResult;
 
 /// For every non-zero (q_sid, d_sid) pair in `counts`, compute analytic NB stats.
 ///
-/// Phase A: Open `momentmap.rkyv`; return empty if absent.
-/// Phase B: Build query interval data once per query file.
-/// Phase C: For each DB source, look up pre-stored moments (O(1) per interval),
-///          accumulate μ_null / σ²_null, fit NB, score, return p-value and LLR.
+/// `query_chrom_data[q_sid]` holds the pre-built per-chromosome interval data for
+/// each query file (built once during `parse_file_batch`; no re-parse at query time).
 ///
-/// `overlap` supplies the exact base-pair overlap in 100 bp bins for each
-/// (q_sid, d_sid) pair, computed during the sweep phase.
+/// Phase A: Open `momentmap.rkyv`; return empty if absent.
+/// Phase B: For each DB source with hits, look up pre-stored moments (O(1) per
+///          unique block size), accumulate μ_null / σ²_null, fit NB, return p-value
+///          and LLR.  Zero-overlap pairs are not emitted; callers treat absent
+///          entries as p = 1.
 pub(super) fn compute_analytic_pvalues(
     counts: &SparseMatrix,
-    query_file_paths: &[PathBuf],
+    query_chrom_data: &[Vec<QueryChromData>],
     db_path: &Path,
     overlap: &HashMap<(usize, usize), f32>,
 ) -> Vec<PValueResult> {
@@ -44,20 +44,7 @@ pub(super) fn compute_analytic_pvalues(
         Err(_) => return Vec::new(),
     };
 
-    let needed_q_sids: HashSet<usize> = by_db.values().flatten().copied().collect();
-
-    // Phase B: build query interval data once per query file.
-    let query_cov_data: HashMap<usize, Vec<QueryChromData>> = needed_q_sids
-        .par_iter()
-        .filter_map(|&q_sid| {
-            let path = query_file_paths.get(q_sid)?;
-            let bed = parse_bed_as_map(path).ok()?;
-            let q_data = build_query_chrom_data(&bed);
-            Some((q_sid, q_data))
-        })
-        .collect();
-
-    // Phase C: score each (d_sid, q_sid) pair using stored moments.
+    // Phase B: score each (d_sid, q_sid) pair using stored moments.
     by_db
         .par_iter()
         .flat_map(|(&d_sid, q_sids)| -> Vec<PValueResult> {
@@ -69,11 +56,9 @@ pub(super) fn compute_analytic_pvalues(
             q_sids
                 .iter()
                 .filter_map(|&q_sid| {
-                    let q_data = query_cov_data.get(&q_sid)?;
-                    // Exact overlap in bins from the sweep phase.
+                    let q_data = query_chrom_data.get(q_sid)?;
                     let observed_bins =
                         overlap.get(&(q_sid, d_sid as usize)).copied().unwrap_or(0.0) as f64;
-
                     let lookup = |chrom: &str, l: f64| sid_moments.lookup(chrom, l);
                     let (p_value, llr) =
                         compute_analytic_stats(q_data, lookup, observed_bins)?;

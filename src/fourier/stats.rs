@@ -35,14 +35,34 @@ pub fn compute_analytic_stats(
     let mut mu_raw = 0.0f64;
     let mut any_shared = false;
 
+    // interval_lengths is pre-sorted; iterate in runs of equal l_int so we pay
+    // one lookup per unique block size per chrom instead of one per interval.
     for q_cd in q_data {
-        for &l in &q_cd.interval_lengths {
+        let lengths = &q_cd.interval_lengths;
+        let mut i = 0;
+        while i < lengths.len() {
+            let l = lengths[i];
             let l_int = (l.ceil() as usize).max(1);
-            let scale = l / l_int as f64;
+            let s0 = l / l_int as f64;
+            let mut sum_scale = s0;
+            let mut sum_scale2 = s0 * s0;
+            let mut count = 1usize;
+            i += 1;
+            while i < lengths.len() {
+                let l2 = lengths[i];
+                if (l2.ceil() as usize).max(1) != l_int {
+                    break;
+                }
+                let s2 = l2 / l_int as f64;
+                sum_scale += s2;
+                sum_scale2 += s2 * s2;
+                count += 1;
+                i += 1;
+            }
             if let Some((mean_l, var_l)) = lookup(&q_cd.chrom, l_int as f64) {
-                mu_total += mean_l * scale;
-                var_total += var_l * scale * scale;
-                mu_raw += mean_l / l_int as f64;
+                mu_total += mean_l * sum_scale;
+                var_total += var_l * sum_scale2;
+                mu_raw += mean_l / l_int as f64 * count as f64;
                 any_shared = true;
             }
         }

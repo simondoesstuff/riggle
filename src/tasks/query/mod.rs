@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 use voracious_radix_sort::RadixSort;
 
+use crate::fourier::QueryChromData;
 use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
 use crate::matrix::{DenseMatrix, OverlapMatrix, SparseMatrix};
 use crate::stats::IntervalHit;
@@ -171,7 +172,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     let mut all_entries: Vec<(usize, usize, u32)> = Vec::new();
     let mut query_names: Vec<String> = Vec::new();
     let mut query_sources: Vec<QuerySource> = Vec::new();
-    let mut query_file_paths: Vec<PathBuf> = Vec::new();
+    let mut all_query_chrom_data: Vec<Vec<QueryChromData>> = Vec::new();
     let mut global_q_offset = 0usize;
     // Exact overlap in bins for each (q_sid, d_sid) pair; populated for every hit.
     let mut overlap_map: HashMap<(usize, usize), f32> = HashMap::new();
@@ -267,39 +268,19 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         global_q_offset += batch_len;
         query_names.extend(parsed.query_names);
         query_sources.extend(parsed.query_sources);
-        query_file_paths.extend(parsed.file_paths);
+        all_query_chrom_data.extend(parsed.query_chrom_data);
     }
 
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
 
     let pvalues = if config.mode == QueryMode::Stats {
-        let mut pvalues = compute_analytic_pvalues(
+        compute_analytic_pvalues(
             &final_counts,
-            &query_file_paths,
+            &all_query_chrom_data,
             &config.db_path,
             &overlap_map,
-        );
-        // Zero-overlap pairs have a trivially known p-value of 1.0.
-        // Emit them explicitly so callers get a complete result set.
-        for q_sid in 0..num_queries {
-            let row = final_counts.outer_view(q_sid);
-            let nonzero: HashSet<usize> = row
-                .map(|rv| rv.iter().map(|(d, _)| d).collect())
-                .unwrap_or_default();
-            for d_sid in 0..num_sources {
-                if !nonzero.contains(&d_sid) {
-                    pvalues.push(PValueResult {
-                        query_id: q_sid,
-                        db_sid: d_sid as u32,
-                        observed_bins: 0.0,
-                        p_value: 1.0,
-                        llr: Some(0.0),
-                    });
-                }
-            }
-        }
-        pvalues
+        )
     } else {
         Vec::new()
     };
@@ -556,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_zero_overlap_pairs_have_pvalue_one() {
+    fn test_stats_only_overlapping_pairs_emitted() {
         let input = TempDir::new().unwrap();
         let db = TempDir::new().unwrap();
 
@@ -575,14 +556,10 @@ mod tests {
         config.mode = QueryMode::Stats;
         let result = query_database(&config).unwrap();
 
-        // 2 DB sources × 1 query file = 2 pvalue entries.
-        assert_eq!(result.pvalues.len(), 2);
-
-        let zero_pair = result
-            .pvalues
-            .iter()
-            .find(|pv| pv.observed_bins == 0.0)
-            .expect("zero-overlap entry missing");
-        assert_eq!(zero_pair.p_value, 1.0);
+        // Only the overlapping pair (q vs a) should appear; zero-overlap pairs are absent.
+        assert_eq!(result.pvalues.len(), 1);
+        assert!(result.pvalues[0].observed_bins > 0.0);
+        // The non-overlapping pair (q vs b) is not emitted.
+        assert!(!result.pvalues.iter().any(|pv| pv.observed_bins == 0.0));
     }
 }

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::Interval;
+use crate::fourier::{BedMap, QueryChromData, build_query_chrom_data};
 use crate::io::{is_bed_file, parse_bed_file};
 
 use super::{QueryError, QuerySource};
@@ -11,8 +12,9 @@ pub(super) struct ParsedQueries {
     pub shard_intervals: HashMap<String, Vec<Interval>>,
     pub query_sources: Vec<QuerySource>,
     pub query_names: Vec<String>,
-    /// Paths of non-empty files in this batch (same order as query_names).
-    pub file_paths: Vec<PathBuf>,
+    /// Pre-built per-chrom interval data for each non-empty file in this batch,
+    /// indexed by local Q_SID.  Avoids re-parsing at stats time.
+    pub query_chrom_data: Vec<Vec<QueryChromData>>,
     /// Number of non-empty files in this batch (= number of Q_SID rows used).
     pub total_count: usize,
 }
@@ -37,7 +39,7 @@ pub(super) fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, Query
     let mut shard_intervals: HashMap<String, Vec<Interval>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
-    let mut file_paths = Vec::new();
+    let mut query_chrom_data = Vec::new();
     let mut file_sid = 0u32;
 
     for bed_path in files {
@@ -54,11 +56,15 @@ pub(super) fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, Query
             .unwrap_or_else(|| format!("query_{}", file_sid));
 
         query_names.push(name.clone());
-        query_sources.push(QuerySource {
-            name,
-            count: file_count,
-        });
-        file_paths.push(bed_path.clone());
+        query_sources.push(QuerySource { name, count: file_count });
+
+        let bed_map: BedMap = file_shards
+            .iter()
+            .map(|(chrom, ivs)| {
+                (chrom.clone(), ivs.iter().map(|iv| (iv.start, iv.end)).collect())
+            })
+            .collect();
+        query_chrom_data.push(build_query_chrom_data(&bed_map));
 
         for (shard, intervals) in file_shards {
             shard_intervals.entry(shard).or_default().extend(intervals);
@@ -71,7 +77,7 @@ pub(super) fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, Query
         shard_intervals,
         query_sources,
         query_names,
-        file_paths,
+        query_chrom_data,
         total_count: file_sid as usize,
     })
 }

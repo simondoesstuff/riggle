@@ -208,8 +208,12 @@ for moment sampling and storage.
 1. Sweep phase: count interval overlaps (unchanged).
 2. Stats phase:
    - Load pre-stored moments from `momentmap.rkyv` (memmap'd, $O(1)$ per lookup).
-   - For each query interval: $O(1)$ moment lookup by direct array index.
+   - Group query intervals by unique block size $L$ per chromosome; one moment lookup per
+     unique $(L, \text{chrom})$ pair — $O(N_\text{unique})$ rather than $O(N_\text{intervals})$.
    - Accumulate $\mu$, $\sigma^2$, $\mu^\text{raw}$; dispatch on dispersion (§5.2); compute LLR and p-value.
+   - **Zero-overlap pairs** (no shared overlapping intervals) always satisfy $O = 0$, giving
+     $\text{LLR} = 0$ and $p = 1$ trivially.  These pairs are **not emitted** in the output;
+     callers treat any absent (query, DB) entry as $p = 1$.
 
 ---
 
@@ -219,5 +223,5 @@ for moment sampling and storage.
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `overlap_count` | Number of overlapping interval pairs from the sweep.                                                                                                                                                 |
 | `observed_bins` | Exact base-pair overlap in 100 bp bins: $\sum \bigl(\min(q_e, d_e) - \max(q_s, d_s)\bigr) / 100$ summed over all overlapping (query, DB) pairs. Computed during the sweep phase alongside the count. |
-| `p_value`       | Right-tailed analytic p-value: NB saddlepoint when overdispersed, Poisson saddlepoint on count units when underdispersed.                                                                            |
+| `p_value`       | Right-tailed analytic p-value: NB saddlepoint when overdispersed, Poisson saddlepoint on count units when underdispersed.  Only present for pairs with at least one overlapping interval; absent pairs have $p = 1$ implicitly. |
 | `llr`           | Saddlepoint LLR (NB or Poisson); `null` only when no query intervals share a chromosome with the DB.                                                                                                 |

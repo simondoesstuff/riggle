@@ -24,6 +24,7 @@
 //! Use `compact_index(l)` to map a block size to its 0-indexed position in the store.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use rayon::prelude::*;
 use realfft::RealFftPlanner;
@@ -111,21 +112,27 @@ pub fn build_chrom_moments(cdm: &ChromDepthMap) -> ChromMoments {
 }
 
 /// Build per-chromosome interval data from a raw BED map.
+///
+/// Iterates only the chromosomes present in `bed` (not the full hg38 list).
+/// `interval_lengths` are sorted so the stats accumulator can group by unique
+/// block size with a single linear pass instead of one lookup per interval.
 pub fn build_query_chrom_data(bed: &BedMap) -> Vec<QueryChromData> {
-    hg38_chrom_sizes()
-        .iter()
-        .filter_map(|&(chrom, size)| {
-            let ivs = bed.get(chrom)?;
+    let size_map: HashMap<&str, u32> =
+        hg38_chrom_sizes().iter().map(|&(c, s)| (c, s)).collect();
+    bed.iter()
+        .filter_map(|(chrom, ivs)| {
             if ivs.is_empty() {
                 return None;
             }
+            let &size = size_map.get(chrom.as_str())?;
             let n_bins = ((size + BIN_SIZE - 1) / BIN_SIZE) as usize;
-            let interval_lengths = ivs
+            let mut interval_lengths: Vec<f64> = ivs
                 .iter()
                 .map(|&(s, e)| (e - s) as f64 / BIN_SIZE as f64)
                 .collect();
+            interval_lengths.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
             Some(QueryChromData {
-                chrom: chrom.to_string(),
+                chrom: chrom.clone(),
                 n_bins,
                 interval_lengths,
             })

@@ -8,7 +8,6 @@
 //! `[mean_1, var_1, mean_2, var_2, …]` for block sizes L = 1..n_bins-1.
 //! Query lookup for size L is a direct index at `(L-1)*2` — no approximation.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -38,17 +37,16 @@ struct MomentStore {
 
 pub struct MappedSidMoments<'a> {
     entry: &'a [ArchivedStoredChromMoments],
-    index: HashMap<&'a str, usize>,
 }
 
 impl<'a> MappedSidMoments<'a> {
     /// Return `(mean, var)` for a sliding window of `l_bins` bins on `chrom`.
     ///
-    /// Direct O(1) index — no approximation.
+    /// Linear scan over the chromosome list (≤ 24 entries); faster than a HashMap
+    /// for small N due to cache locality.
     /// Returns `None` when `chrom` is absent or `l_bins` rounds to 0 or ≥ n_bins.
     pub fn lookup(&self, chrom: &str, l_bins: f64) -> Option<(f64, f64)> {
-        let &i = self.index.get(chrom)?;
-        let acm = &self.entry[i];
+        let acm = self.entry.iter().find(|c| c.chrom.as_str() == chrom)?;
         let n_bins = u32::from(acm.n_bins) as usize;
         let l = l_bins.round() as usize;
         if l == 0 || l >= n_bins {
@@ -86,12 +84,7 @@ impl MappedMomentStore {
         if entry.is_empty() {
             return None;
         }
-        let index: HashMap<&str, usize> = entry
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.chrom.as_str(), i))
-            .collect();
-        Some(MappedSidMoments { entry: &entry[..], index })
+        Some(MappedSidMoments { entry: &entry[..] })
     }
 }
 
