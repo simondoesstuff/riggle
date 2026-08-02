@@ -5,20 +5,23 @@ mod sweep;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use rayon::prelude::*;
 use thiserror::Error;
-use voracious_radix_sort::RadixSort;
 
 use crate::fourier::QueryChromData;
 use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
 use crate::matrix::{DenseMatrix, OverlapMatrix, SparseMatrix};
 use crate::stats::IntervalHit;
+use crate::sweep::query_sweep_windowed;
 
 use files::{enumerate_query_files, parse_file_batch};
 use intervals::collect_interval_pairs;
 use pvalues::compute_analytic_pvalues;
-use sweep::{build_csr_from_sorted_entries, run_sweep_block};
+use sweep::build_csr_from_sorted_entries;
+
+const SWEEP_WINDOW_SIZE: usize = 64;
 
 /// Errors from query execution
 #[derive(Debug, Error)]
@@ -160,7 +163,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         });
     }
 
-    let num_threads = config
+    let _num_threads = config
         .num_threads
         .unwrap_or_else(rayon::current_num_threads)
         .max(1);
@@ -177,8 +180,14 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     // Exact overlap in bins for each (q_sid, d_sid) pair; populated for every hit.
     let mut overlap_map: HashMap<(usize, usize), f32> = HashMap::new();
 
+    let mut t_parse = 0.0f64;
+    let mut t_sweep = 0.0f64;
+    let mut t_extract = 0.0f64;
+
     for batch_files in all_files.chunks(batch_size) {
+        let t0 = Instant::now();
         let parsed = parse_file_batch(batch_files)?;
+        t_parse += t0.elapsed().as_secs_f64();
         let batch_len = parsed.total_count;
         if batch_len == 0 {
             continue;
@@ -187,6 +196,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         let mut count_accumulator = DenseMatrix::new(batch_len, num_sources);
         let mut overlap_accumulator = OverlapMatrix::new(batch_len, num_sources);
 
+        let t1 = Instant::now();
         for (shard, mut shard_queries) in parsed.shard_intervals {
             if !db_shard_set.contains(shard.as_str()) {
                 continue;
@@ -195,24 +205,24 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 continue;
             }
 
-            shard_queries.voracious_sort();
+            // Sort by (q_sid, start) so windows are contiguous slices.
+            shard_queries.sort_unstable_by_key(|iv| (iv.sid, iv.start));
 
+            // Pre-load all layers for this shard before entering the parallel section.
+            let mut layers: Vec<(MappedLayer, u32, MappedJumpTable)> = Vec::new();
             for layer_idx in 0..meta.num_layers {
                 let layer_path = config
                     .db_path
                     .join("shards")
                     .join(&shard)
                     .join(format!("layer_{}.bin", layer_idx));
-
                 if !layer_path.exists() {
                     continue;
                 }
-
                 let layer = MappedLayer::open(&layer_path)?;
                 if layer.is_empty() {
                     continue;
                 }
-
                 let layer_max_size = meta.layer_config.layer_max_size(layer_idx);
                 let tile_size = meta.layer_config.tile_size(layer_idx);
                 let idx_path = config
@@ -221,38 +231,63 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                     .join(&shard)
                     .join(format!("layer_{}.idx", layer_idx));
                 let jump_table = MappedJumpTable::open(&idx_path, tile_size)?;
+                layers.push((layer, layer_max_size, jump_table));
+            }
+            if layers.is_empty() {
+                continue;
+            }
 
-                let db_intervals = layer.intervals();
+            // Extract interval slices so the par_iter closure captures only
+            // &[Interval] and &MappedJumpTable (both Send+Sync).
+            let layer_refs: Vec<(&[_], u32, &MappedJumpTable)> =
+                layers.iter().map(|(l, ms, jt)| (l.intervals(), *ms, jt)).collect();
 
-                let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
-                let blocks: Vec<&[_]> = shard_queries.chunks(block_size).collect();
+            let n_windows = (batch_len + SWEEP_WINDOW_SIZE - 1) / SWEEP_WINDOW_SIZE;
 
-                let layer_result = blocks
-                    .par_iter()
-                    .map(|block| {
-                        run_sweep_block(
+            // Parallel sweep: one task per Q_SID window.
+            // Each window operates on a sub-matrix of `window_rows × num_sources`
+            // (typically 64 × 1905 = ~0.5 MB) which fits in per-core cache,
+            // eliminating the DRAM misses of the full 1905×1905 matrix.
+            let window_results: Vec<(DenseMatrix, OverlapMatrix, usize)> = (0..n_windows)
+                .into_par_iter()
+                .map(|w| {
+                    let q_sid_lo = (w * SWEEP_WINDOW_SIZE) as u32;
+                    let q_sid_hi = ((w + 1) * SWEEP_WINDOW_SIZE).min(batch_len) as u32;
+                    let window_rows = (q_sid_hi - q_sid_lo) as usize;
+
+                    let lo = shard_queries.partition_point(|iv| iv.sid < q_sid_lo);
+                    let hi = shard_queries.partition_point(|iv| iv.sid < q_sid_hi);
+                    let window_queries = &shard_queries[lo..hi];
+
+                    let mut sub_counts = DenseMatrix::new(window_rows, num_sources);
+                    let mut sub_overlap = OverlapMatrix::new(window_rows, num_sources);
+
+                    for &(db_intervals, layer_max_size, jump_table) in &layer_refs {
+                        query_sweep_windowed(
                             db_intervals,
                             layer_max_size,
-                            &jump_table,
-                            block,
-                            batch_len,
-                            num_sources,
-                        )
-                    })
-                    .reduce_with(|mut a, b| {
-                        a.0.add_dense(&b.0);
-                        a.1.add_dense(&b.1);
-                        a
-                    });
+                            jump_table,
+                            window_queries,
+                            q_sid_lo,
+                            &mut sub_counts,
+                            &mut sub_overlap,
+                        );
+                    }
 
-                if let Some((layer_counts, layer_overlap)) = layer_result {
-                    count_accumulator.add_dense(&layer_counts);
-                    overlap_accumulator.add_dense(&layer_overlap);
-                }
+                    (sub_counts, sub_overlap, w)
+                })
+                .collect();
+
+            // Serial merge: each window's sub-matrix lands in the right rows.
+            for (sub_counts, sub_overlap, w) in window_results {
+                let row_offset = w * SWEEP_WINDOW_SIZE;
+                count_accumulator.add_submatrix_rows(&sub_counts, row_offset);
+                overlap_accumulator.add_submatrix_rows(&sub_overlap, row_offset);
             }
         }
+        t_sweep += t1.elapsed().as_secs_f64();
 
-        // Extract non-zero entries; collect exact overlap alongside count.
+        let t2 = Instant::now();
         for local_row in 0..batch_len {
             let row_slice = count_accumulator.row(local_row);
             let global_row = global_q_offset + local_row;
@@ -264,6 +299,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 }
             }
         }
+        t_extract += t2.elapsed().as_secs_f64();
 
         global_q_offset += batch_len;
         query_names.extend(parsed.query_names);
@@ -271,9 +307,16 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         all_query_chrom_data.extend(parsed.query_chrom_data);
     }
 
+    eprintln!("[perf] parse:   {t_parse:.3}s");
+    eprintln!("[perf] sweep:   {t_sweep:.3}s");
+    eprintln!("[perf] extract: {t_extract:.3}s");
+
+    let t3 = Instant::now();
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
+    eprintln!("[perf] csr:     {:.3}s", t3.elapsed().as_secs_f64());
 
+    let t4 = Instant::now();
     let pvalues = if config.mode == QueryMode::Stats {
         compute_analytic_pvalues(
             &final_counts,
@@ -284,6 +327,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     } else {
         Vec::new()
     };
+    eprintln!("[perf] pvalues: {:.3}s", t4.elapsed().as_secs_f64());
 
     Ok(QueryResult {
         counts: final_counts,

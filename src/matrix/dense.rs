@@ -70,6 +70,20 @@ impl DenseMatrix {
         self.num_rows = num_rows;
         self.num_cols = num_cols;
     }
+
+    /// Add all rows from `sub` into `self` starting at `row_offset`.
+    pub fn add_submatrix_rows(&mut self, sub: &DenseMatrix, row_offset: usize) {
+        debug_assert_eq!(self.num_cols, sub.num_cols);
+        debug_assert!(row_offset + sub.num_rows <= self.num_rows);
+        let src_len = sub.num_rows * sub.num_cols;
+        let dst_start = row_offset * self.num_cols;
+        for (dst, src) in self.data[dst_start..dst_start + src_len]
+            .iter_mut()
+            .zip(sub.data[..src_len].iter())
+        {
+            *dst += src;
+        }
+    }
 }
 
 /// Row-major f32 matrix for accumulating exact bin-overlap totals.
@@ -120,6 +134,28 @@ impl OverlapMatrix {
         self.data[..new_size].fill(0.0);
         self.num_rows = num_rows;
         self.num_cols = num_cols;
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn num_cols(&self) -> usize {
+        self.num_cols
+    }
+
+    /// Add all rows from `sub` into `self` starting at `row_offset`.
+    pub fn add_submatrix_rows(&mut self, sub: &OverlapMatrix, row_offset: usize) {
+        debug_assert_eq!(self.num_cols, sub.num_cols);
+        debug_assert!(row_offset + sub.num_rows <= self.num_rows);
+        let src_len = sub.num_rows * sub.num_cols;
+        let dst_start = row_offset * self.num_cols;
+        for (dst, src) in self.data[dst_start..dst_start + src_len]
+            .iter_mut()
+            .zip(sub.data[..src_len].iter())
+        {
+            *dst += src;
+        }
     }
 }
 

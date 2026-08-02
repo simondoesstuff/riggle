@@ -88,6 +88,48 @@ pub fn query_sweep(
     }
 }
 
+/// Like [`query_sweep`] but writes to a sub-window of Q_SID rows.
+///
+/// `q_sid_base` is the global Q_SID of row 0 in `results`.  Each query's
+/// local row index is `q.sid - q_sid_base`, so `results` need only be
+/// `window_rows × num_sources` rather than the full `num_queries × num_sources`.
+/// Keeping `results` small (a few hundred KB) lets it stay in L2/L3 cache
+/// rather than forcing DRAM traffic on every write.
+///
+/// The caller must guarantee that all intervals in `query_block` have
+/// `q_sid_base <= q.sid < q_sid_base + results.num_rows()`.
+pub fn query_sweep_windowed(
+    db_layer: &[Interval],
+    layer_max_size: u32,
+    jump_table: &MappedJumpTable,
+    query_block: &[Interval],
+    q_sid_base: u32,
+    results: &mut DenseMatrix,
+    overlap: &mut OverlapMatrix,
+) {
+    if query_block.is_empty() || db_layer.is_empty() {
+        return;
+    }
+    for q in query_block {
+        let lo = q.start.saturating_sub(layer_max_size);
+        let approx = jump_table.lookup(lo).min(db_layer.len());
+        let start_idx = approx + db_layer[approx..].partition_point(|d| d.start < lo);
+        let local_q_sid = (q.sid - q_sid_base) as usize;
+        for d in &db_layer[start_idx..] {
+            if d.start >= q.end {
+                break;
+            }
+            if d.end > q.start {
+                let d_sid = d.sid as usize;
+                results.add(local_q_sid, d_sid, 1);
+                let overlap_bins =
+                    (q.end.min(d.end) - q.start.max(d.start)) as f32 / BIN_SIZE as f32;
+                overlap.add(local_q_sid, d_sid, overlap_bins);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
