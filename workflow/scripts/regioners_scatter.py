@@ -11,13 +11,13 @@ Modes:
 Usage:
     uv run workflow/scripts/regioners_scatter.py \\
         --trait Rheumatoid_arthritis \\
-        --chuckle data/chuckle \\
+        --chuckle data/chuckle/hg38 \\
         --regioners data/regioners \\
         -o data/plots/scatter_regioners_Rheumatoid_arthritis.png --no-show
 
     uv run workflow/scripts/regioners_scatter.py \\
         --all-traits \\
-        --chuckle data/chuckle \\
+        --chuckle data/chuckle/hg38 \\
         --regioners data/regioners \\
         -o data/plots/scatter_regioners_all.png --no-show
 """
@@ -45,14 +45,16 @@ _METHODS = ["shuffle", "circle", "novl"]
 
 
 def load_chuckle(json_path: Path) -> tuple[dict[str, float], dict[str, float]]:
-    """Return ({bed_name: p_value}, {bed_name: llr})."""
+    """Return ({bed_name: p_value}, {bed_name: llr}).  Omitted results default to p=1, llr=0."""
     p_out: dict[str, float] = {}
     llr_out: dict[str, float] = {}
     for r in read_chuckle_records(json_path):
         try:
             name = strip_bed_name(Path(r["db_name"]).name)
-            p_out[name] = max(float(r["p_value"]), FLOAT_TINY)
-            llr_out[name] = float(r["llr"])
+            pval = r.get("p_value")
+            p_out[name] = max(1.0 if pval is None else float(pval), FLOAT_TINY)
+            llr = r.get("llr")
+            llr_out[name] = 0.0 if llr is None else float(llr)
         except (KeyError, ValueError):
             pass
     return p_out, llr_out

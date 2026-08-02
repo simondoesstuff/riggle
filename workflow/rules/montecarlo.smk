@@ -37,7 +37,7 @@ rule montecarlo_query:
     """
     input:
         query="data/queries/{trait}.bed",
-        bin=MC_BIN,
+        bin=ancient(MC_BIN),
         index=CHUCKLE_INDEX,
         whitelist=ancient(f"{RME_DIR}/whitelist.bed"),
     output:

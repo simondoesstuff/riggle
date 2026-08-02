@@ -104,9 +104,9 @@ rule gwas_disease_tissue:
 # ROC-AUC benchmark
 #
 # Giggle results are available for all GWAS diseases; chuckle results are
-# picked up opportunistically from data/chuckle/ (expensive to generate —
-# see chuckle.smk).  The data artifact is rebuilt whenever giggle results
-# change; re-run manually after adding new chuckle results.
+# picked up opportunistically from data/chuckle/hg38/ (expensive to generate —
+# see chuckle.smk / chuckle_gwas_all).  The data artifact is rebuilt whenever
+# giggle results change; re-run manually after adding new chuckle results.
 # ---------------------------------------------------------------------------
 
 import json as _json
@@ -134,7 +134,7 @@ rule gwas_roc_data:
         f"{GWAS_DIR}/roc_data.json",
     params:
         giggle_dir="data/giggle",
-        chuckle_dir="data/chuckle",
+        chuckle_dir="data/chuckle/hg38",  # mirrors CHUCKLE_DIR in chuckle.smk
     shell:
         "uv run workflow/scripts/gwas_roc.py"
         " --disease-tissue {input.disease_tissue}"

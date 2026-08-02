@@ -9,9 +9,9 @@
 # Giggle index + all traits:
 #   snakemake -j4 $(printf 'data/giggle/%s.tsv ' $(ls data/gwas/*.bed | xargs -n1 basename | sed 's/.bed//'))
 #
-# Chuckle (build index once, then one at a time — ~250 GB RAM per query):
+# Chuckle (build index once, then query all traits in parallel):
 #   snakemake data/roadmap_epigenomics/chuckle_index
-#   snakemake --resources mem_mb=260000 -j1 data/chuckle/Rheumatoid_arthritis.json
+#   snakemake -j39 chuckle_gwas_all
 #
 # Scatter plots (giggle vs BITS, 100 trials):
 #   snakemake data/plots/scatter_giggle_bits_100.png

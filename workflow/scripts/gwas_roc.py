@@ -13,7 +13,7 @@ Usage:
     uv run workflow/scripts/gwas_roc.py
         --disease-tissue data/gwas/disease_tissue.json
         --giggle-dir data/giggle
-        --chuckle-dir data/chuckle
+        --chuckle-dir data/chuckle/hg38
         --output data/gwas/roc_data.json
 """
 
@@ -107,12 +107,14 @@ def load_giggle(path: Path) -> dict[str, float]:
 
 
 def load_chuckle(path: Path) -> dict[str, float]:
-    """Parse chuckle JSON → {bed_filename: llr}."""
+    """Parse chuckle JSON → {bed_filename: llr}.  Omitted results default to llr=0."""
     scores: dict[str, float] = {}
     for r in read_chuckle_records(path):
-        if r.get("llr") is None:
+        try:
+            llr = r.get("llr")
+            scores[Path(r["db_name"]).name] = 0.0 if llr is None else float(llr)
+        except (KeyError, ValueError):
             continue
-        scores[Path(r["db_name"]).name] = float(r["llr"])
     return scores
 
 

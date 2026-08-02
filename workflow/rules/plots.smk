@@ -8,16 +8,10 @@ from pathlib import Path
 
 GWAS_TRAITS = glob_wildcards("data/gwas/{trait}.bed").trait
 
-# Traits that have both an existing chuckle JSON and all three regioners TSVs.
-# Derived from existing files rather than GWAS_TRAITS to avoid triggering
-# expensive chuckle rebuilds for traits not yet queried (e.g. Type_1_diabetes).
+# Traits with all three regioners TSVs — both chuckle and giggle scatter rules require all of these.
 _REGIONERS_TRAITS = sorted(
-    p.stem
-    for p in Path(CHUCKLE_DIR).glob("*.json")
-    if all(
-        Path(f"{REGIONERS_DIR}/{m}/{p.stem}.tsv").exists()
-        for m in ["shuffle", "circle", "novl"]
-    )
+    t for t in GWAS_TRAITS
+    if all(Path(f"{REGIONERS_DIR}/{m}/{t}.tsv").exists() for m in ["shuffle", "circle", "novl"])
 )
 
 RME_HEAT_TARGETS = expand(

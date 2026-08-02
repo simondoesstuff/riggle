@@ -7,14 +7,14 @@ Each point = one RME (cell × state) bed.  Produces one panel per tool pair
 Usage:
     uv run workflow/scripts/tool_scatter.py \\
         --per-bed Rheumatoid_arthritis \\
-        --chuckle data/chuckle \\
+        --chuckle data/chuckle/hg38 \\
         --giggle data/giggle \\
         --bits data/bits/1000 \\
         -o data/plots/scatter_bed_pvals_Rheumatoid_arthritis_1000.png --no-show
 
     uv run workflow/scripts/tool_scatter.py \\
         --per-bed Rheumatoid_arthritis \\
-        --chuckle data/chuckle \\
+        --chuckle data/chuckle/hg38 \\
         --giggle data/giggle \\
         --mc data/montecarlo \\
         -o data/plots/scatter_mc_Rheumatoid_arthritis.png --no-show
@@ -104,7 +104,8 @@ def load_chuckle_per_bed(json_path: str) -> dict[str, float]:
     for r in read_chuckle_records(json_path):
         try:
             name = strip_bed_name(Path(r["db_name"]).name)
-            p = max(float(r["p_value"]), FLOAT_TINY)
+            pval = r.get("p_value")
+            p = max(1.0 if pval is None else float(pval), FLOAT_TINY)
             out[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass

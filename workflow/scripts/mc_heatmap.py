@@ -8,7 +8,7 @@ have fewer than MIN_N beds.
 
 Usage:
     uv run workflow/scripts/mc_heatmap.py \\
-        --chuckle data/chuckle/Rheumatoid_arthritis.json \\
+        --chuckle data/chuckle/hg38/Rheumatoid_arthritis.json \\
         --mc data/montecarlo/Rheumatoid_arthritis.tsv \\
         --trait Rheumatoid_arthritis \\
         -o data/plots/mc_heatmap_Rheumatoid_arthritis.png --no-show
@@ -45,7 +45,8 @@ def load_chuckle(json_path: str) -> dict[str, float]:
     for r in read_chuckle_records(json_path):
         try:
             name = strip_bed_name(Path(r["db_name"]).name)
-            p = max(float(r["p_value"]), FLOAT_TINY)
+            pval = r.get("p_value")
+            p = max(1.0 if pval is None else float(pval), FLOAT_TINY)
             out[name] = -math.log10(p)
         except (KeyError, ValueError):
             pass

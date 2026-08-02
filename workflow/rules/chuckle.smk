@@ -1,16 +1,14 @@
 # Chuckle (analytic NB interval intersection significance testing)
 #
-# WARNING: querying the full RME index requires ~250 GB RAM — allocate
-# --resources mem_mb=260000 and run at most one query job at a time.
-# Run as:
-#   snakemake --resources mem_mb=260000 -j1 data/chuckle/<trait>.json
+# Generate all GWAS trait queries (runs in parallel):
+#   snakemake -j39 chuckle_gwas_all
 #
 # The RME index (data/roadmap_epigenomics/chuckle_index) is managed by the chuckle_index rule below.
 # Building it is a one-time cost; query jobs depend on it automatically.
 
 import os
 
-CHUCKLE_DIR = "data/chuckle"
+CHUCKLE_DIR = "data/chuckle/hg38"
 CHUCKLE_INDEX = f"{RME_DIR}/chuckle_index"
 CHUCKLE_BIN = "target/release/chuckle"
 
@@ -34,7 +32,7 @@ rule chuckle_index:
     """
     input:
         beds=rme_all_beds,
-        bin=CHUCKLE_BIN,
+        bin=ancient(CHUCKLE_BIN),
     output:
         directory(CHUCKLE_INDEX),
     params:
@@ -51,11 +49,26 @@ rule chuckle_query:
         index=CHUCKLE_INDEX,
     output:
         f"{CHUCKLE_DIR}/{{trait}}.json",
-    resources:
-        mem_mb=260000,
     shell:
         "{input.bin} query"
         " --db {CHUCKLE_INDEX}"
         " --query {input.query}"
         " --output {output}"
         " --stats"
+
+
+def _all_chuckle_gwas(wildcards):
+    """Chuckle hg38 JSONs for all GWAS traits (resolved after gwas_split checkpoint)."""
+    split_dir = checkpoints.gwas_split.get(**wildcards).output[0]
+    names = glob_wildcards(f"{split_dir}/{{name}}.bed").name
+    return expand(f"{CHUCKLE_DIR}/{{name}}.json", name=names)
+
+
+rule chuckle_gwas_all:
+    """Generate chuckle hg38 queries for all GWAS traits.
+
+    Example:
+        snakemake -j39 chuckle_gwas_all
+    """
+    input:
+        _all_chuckle_gwas,

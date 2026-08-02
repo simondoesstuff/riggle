@@ -173,9 +173,11 @@ def parse_score_file(
 def parse_json_file(
     json_path: Pathish, score_field: str = "p_value"
 ) -> tuple[list[str], list[float]]:
-    records = [r for r in read_chuckle_records(json_path) if r.get(score_field) is not None]
+    records = read_chuckle_records(json_path)
     if not records:
         return [], []
+
+    is_pval = "p_val" in score_field.lower() or "pval" in score_field.lower()
 
     # Find the file-path-like field with the most unique values (skip score_field)
     first = records[0]
@@ -186,13 +188,15 @@ def parse_json_file(
     ]
     name_field = max(path_fields, key=lambda k: len({r[k] for r in records}))
 
-    pairs = [
-        (strip_bed_name(Path(r[name_field]).name), float(r[score_field]))
-        for r in records
-    ]
+    pairs = []
+    for r in records:
+        raw = r.get(score_field)
+        # None means chuckle omitted the result: treat as p=1 (no enrichment) or score=0
+        val = (1.0 if is_pval else 0.0) if raw is None else float(raw)
+        pairs.append((strip_bed_name(Path(r[name_field]).name), val))
 
     # p_value-like fields: -log transform so higher = more significant
-    if "p_val" in score_field.lower() or "pval" in score_field.lower():
+    if is_pval:
         pairs = [(a, -math.log(b) if b > 0 else float("inf")) for a, b in pairs]
 
     pairs.sort(key=lambda x: -x[1])
@@ -373,13 +377,15 @@ def _prepare_plot_data(
     col_labels = states if states is not None else chromatin_states
     if score_fields is None:
         score_fields = ["p_value"] * len(score_paths)
-    result: list[_PlotData] = []
+
+    # First pass: parse every file, collect cell types for the union row set.
+    parsed_inputs: list[tuple[str, str, str, dict[tuple[str, str], float], set[str]]] = []
+    all_cell_types: set[str] = set()
 
     for path, name, sf in zip(score_paths, names, score_fields):
         beds, scores = parse_input_file(path, sf)
         cell_types: set[str] = set()
         parsed_data: dict[tuple[str, str], float] = {}
-
         for bed, score in zip(beds, scores):
             try:
                 cell_id, state = classify_bed_file(bed)
@@ -387,21 +393,35 @@ def _prepare_plot_data(
                 parsed_data[(cell_id, state)] = score
             except ValueError:
                 continue
+        parsed_inputs.append((str(path), name, sf, parsed_data, cell_types))
+        all_cell_types |= cell_types
 
+    if not all_cell_types:
+        return []
+
+    # Shared row ordering across all panels so heatmaps are aligned.
+    ordered_cells = sorted(all_cell_types)
+    result: list[_PlotData] = []
+
+    # Second pass: build matrices over the union cell-type set.
+    for path_str, name, sf, parsed_data, cell_types in parsed_inputs:
         if not cell_types:
-            print(
-                f"Warning: No valid parsed data for {name}. Skipping.", file=sys.stderr
-            )
+            print(f"Warning: No valid parsed data for {name}. Skipping.", file=sys.stderr)
             continue
 
-        ordered_cells = sorted(cell_types)
-        data = np.full((len(ordered_cells), len(col_labels)), np.nan, dtype=np.float64)
+        # JSON (chuckle): absent beds/states mean no enrichment → fill with 0
+        #   (equivalent to pval=1 → -log=0, or llr=0)
+        # TSV (giggle):   absent entries stay NaN (rendered as white/transparent)
+        missing_val = 0.0 if path_str.endswith(".json") else np.nan
+        data = np.full((len(ordered_cells), len(col_labels)), missing_val, dtype=np.float64)
         bed_to_category: dict[str, str] = {}
 
         for i, cell_id in enumerate(ordered_cells):
             bed_to_category[cell_id] = classify_cell_type(cell_id)
             for j, state in enumerate(col_labels):
-                data[i, j] = parsed_data.get((cell_id, state), np.nan)
+                val = parsed_data.get((cell_id, state))
+                if val is not None:
+                    data[i, j] = val
 
         result.append(
             _PlotData(
