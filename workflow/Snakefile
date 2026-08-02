@@ -30,6 +30,13 @@
 # GWAS traits fall back to data/gwas/{trait}.bed automatically.
 QUERY_BEDS: dict[str, str] = {}
 
+# Prevent {trait} from matching across directory separators, which would cause
+# gwas_liftover (output: data/gwas/{trait}.bed) to match its own input
+# (data/gwas/hg19/{trait}.bed) and recurse infinitely.
+wildcard_constraints:
+    trait="[^/]+",
+    trials=r"\d+",
+
 
 def _get_query_source(wildcards):
     return QUERY_BEDS.get(wildcards.trait, f"data/gwas/{wildcards.trait}.bed")

@@ -130,11 +130,12 @@ rule gwas_roc_data:
     input:
         disease_tissue=f"{GWAS_DIR}/disease_tissue.json",
         giggle=expand("data/giggle/{trait}.tsv", trait=GWAS_ROC_TRAITS),
+        chuckle=expand("data/chuckle/hg38/{trait}.json", trait=GWAS_ROC_TRAITS),
     output:
         f"{GWAS_DIR}/roc_data.json",
     params:
         giggle_dir="data/giggle",
-        chuckle_dir="data/chuckle/hg38",  # mirrors CHUCKLE_DIR in chuckle.smk
+        chuckle_dir="data/chuckle/hg38",
     shell:
         "uv run workflow/scripts/gwas_roc.py"
         " --disease-tissue {input.disease_tissue}"

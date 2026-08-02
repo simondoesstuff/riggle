@@ -307,10 +307,17 @@ def main() -> None:
     ap.add_argument("--giggle-dir")
     ap.add_argument("--chuckle-dir")
     ap.add_argument("--output", required=True)
+    ap.add_argument(
+        "--traits", nargs="+", metavar="TRAIT",
+        help="Restrict to these trait names (default: all available).",
+    )
     args = ap.parse_args()
 
     with open(args.disease_tissue) as f:
         disease_tissue: dict[str, dict] = json.load(f)
+
+    if args.traits:
+        disease_tissue = {k: v for k, v in disease_tissue.items() if k in args.traits}
 
     output: dict[str, dict] = {"methods": {}}
 

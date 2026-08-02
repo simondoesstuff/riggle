@@ -1,4 +1,5 @@
-# Monte Carlo shift permutation test against the RME chuckle index.
+# Monte Carlo permutation test against the RME chuckle index.
+# Mode: shuffle — each interval placed independently at a random position (preserves sizes).
 #
 # Intermediate data: data/montecarlo/{trait}.tsv
 #   Multi-milestone TSV; each milestone section is delimited by a
@@ -39,7 +40,6 @@ rule montecarlo_query:
         query="data/queries/{trait}.bed",
         bin=ancient(MC_BIN),
         index=CHUCKLE_INDEX,
-        whitelist=ancient(f"{RME_DIR}/whitelist.bed"),
     output:
         f"{MC_DIR}/{{trait}}.tsv",
     params:
@@ -50,8 +50,9 @@ rule montecarlo_query:
         "{input.bin}"
         " --db {CHUCKLE_INDEX}"
         " --query {input.query}"
-        " --whitelist {input.whitelist}"
+
         " --trials {params.milestones}"
         " --batch-size {params.batch_size}"
         " --seed {params.seed}"
+        " --mode shuffle"
         " > {output}"

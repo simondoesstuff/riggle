@@ -168,9 +168,8 @@ def plot_pval_scatter(
     mc_trials: int = 10000,
     output_path: str | None = None,
     show: bool = True,
-    raw_pval: bool = False,
 ) -> None:
-    """Per-bed -log10(p) scatter for one trait.  All provided tools are compared pairwise."""
+    """Per-bed p-value scatter for one trait.  Two rows: -log₁₀ p and raw p."""
     from itertools import combinations
 
     all_beds: dict[str, dict[str, float]] = {
@@ -191,17 +190,23 @@ def plot_pval_scatter(
 
     plt.style.use("dark_background")
     fig, axes = plt.subplots(
-        1, len(pairs), figsize=(6 * len(pairs), 5.5),
+        2, len(pairs), figsize=(6 * len(pairs), 10),
         squeeze=False, layout="constrained",
     )
 
     for col, (x_tool, y_tool) in enumerate(pairs):
+        color = _TOOL_COLORS.get(y_tool, "#aaaaaa")
         _pval_panel(
             axes[0, col],
             all_beds[x_tool], all_beds[y_tool],
             f"{x_tool}  (-log₁₀ p)", f"{y_tool}  (-log₁₀ p)",
-            color=_TOOL_COLORS.get(y_tool, "#aaaaaa"),
-            raw_pval=raw_pval,
+            color=color, raw_pval=False,
+        )
+        _pval_panel(
+            axes[1, col],
+            all_beds[x_tool], all_beds[y_tool],
+            f"{x_tool}  (-log₁₀ p)", f"{y_tool}  (-log₁₀ p)",
+            color=color, raw_pval=True,
         )
 
     fig.suptitle(
@@ -242,8 +247,6 @@ def main() -> None:
                         help="Which trial milestone to use from the MC TSV (default: 10000)")
     parser.add_argument("-o", "--output", help="Output image path")
     parser.add_argument("--no-show", action="store_true")
-    parser.add_argument("--raw-pval", action="store_true",
-                        help="Plot raw p-values instead of -log10(p)")
     args = parser.parse_args()
 
     trait = args.per_bed
@@ -260,7 +263,6 @@ def main() -> None:
         mc_trials=args.mc_trials,
         output_path=args.output,
         show=not args.no_show,
-        raw_pval=args.raw_pval,
     )
 
 

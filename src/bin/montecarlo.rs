@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -27,6 +27,14 @@ use tempfile::TempDir;
 
 use chuckle::fourier::{BedMap, hg38_chrom_sizes, parse_bed_as_map};
 use chuckle::tasks::{QueryConfig, query_database};
+
+#[derive(Clone, ValueEnum)]
+enum McMode {
+    /// Shift all intervals by the same random offset (preserves spacing)
+    Circular,
+    /// Place each interval at an independent random position (preserves sizes only)
+    Shuffle,
+}
 
 #[derive(Parser)]
 #[command(name = "montecarlo")]
@@ -55,6 +63,10 @@ struct Cli {
     /// Whitelist BED: restrict shifted intervals to these regions (matches chuckle behaviour)
     #[arg(short = 'w', long)]
     whitelist: Option<PathBuf>,
+
+    /// Permutation strategy
+    #[arg(long, value_enum, default_value = "circular")]
+    mode: McMode,
 }
 
 /// Returns the sub-intervals of [q_start, q_end) that overlap sorted merged whitelist intervals.
@@ -103,6 +115,47 @@ fn write_shifted_bed<W: Write>(
                 }
             } else {
                 writeln!(writer, "{}\t{}\t{}", chrom, trimmed_start, trimmed_end).unwrap();
+                wrote = true;
+            }
+        }
+    }
+    wrote
+}
+
+fn write_shuffled_bed<W: Write, R: Rng>(
+    bed: &BedMap,
+    chrom_sizes: &HashMap<&str, u32>,
+    whitelist: Option<&BedMap>,
+    rng: &mut R,
+    writer: &mut W,
+) -> bool {
+    let mut wrote = false;
+    let mut chroms: Vec<&String> = bed.keys().collect();
+    chroms.sort();
+
+    for chrom in chroms {
+        let intervals = &bed[chrom];
+        let chrom_size = match chrom_sizes.get(chrom.as_str()) {
+            Some(&s) => s,
+            None => continue,
+        };
+        let wl_chrom = whitelist.and_then(|wl| wl.get(chrom.as_str()));
+
+        for &(start, end) in intervals {
+            let size = end - start;
+            if size == 0 || size > chrom_size {
+                continue;
+            }
+            let new_start: u32 = rng.gen_range(0..=(chrom_size - size));
+            let new_end = new_start + size;
+
+            if let Some(wl) = wl_chrom {
+                for (is, ie) in intersect_whitelist(new_start, new_end, wl) {
+                    writeln!(writer, "{}\t{}\t{}", chrom, is, ie).unwrap();
+                    wrote = true;
+                }
+            } else {
+                writeln!(writer, "{}\t{}\t{}", chrom, new_start, new_end).unwrap();
                 wrote = true;
             }
         }
@@ -168,6 +221,13 @@ fn main() {
     if whitelist.is_some() {
         eprintln!("Whitelist: active — shifts clipped to annotated regions");
     }
+    eprintln!(
+        "Mode: {}",
+        match cli.mode {
+            McMode::Circular => "circular (global shift)",
+            McMode::Shuffle => "shuffle (per-interval independent placement)",
+        }
+    );
 
     // Chromosome sizes for shift range and trimming
     let chrom_sizes: HashMap<&str, u32> = hg38_chrom_sizes().iter().copied().collect();
@@ -218,19 +278,24 @@ fn main() {
 
         let tmp = TempDir::new().expect("Failed to create temp directory");
 
-        // Write shifted BED files for non-empty trials
+        // Write permuted BED files for non-empty trials
         let mut n_written = 0usize;
         for _ in 0..to_run {
-            let shift: i64 = rng.gen_range(-max_shift..=max_shift);
             let path = tmp.path().join(format!("trial_{:08}.bed", n_written));
             let f = fs::File::create(&path).expect("Failed to create trial BED file");
             let mut writer = BufWriter::new(f);
-            if write_shifted_bed(&query_bed, &chrom_sizes, whitelist.as_ref(), shift, &mut writer) {
+            let wrote = match cli.mode {
+                McMode::Circular => {
+                    let shift: i64 = rng.gen_range(-max_shift..=max_shift);
+                    write_shifted_bed(&query_bed, &chrom_sizes, whitelist.as_ref(), shift, &mut writer)
+                }
+                McMode::Shuffle => {
+                    write_shuffled_bed(&query_bed, &chrom_sizes, whitelist.as_ref(), &mut rng, &mut writer)
+                }
+            };
+            if wrote {
                 n_written += 1;
             } else {
-                // All intervals trimmed off-chromosome: remove the empty file
-                // so it doesn't appear as a query row (query_database skips it,
-                // but an empty .bed file is still a .bed file that may be listed).
                 drop(writer);
                 let _ = fs::remove_file(path);
             }
