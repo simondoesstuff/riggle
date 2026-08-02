@@ -83,8 +83,14 @@ pub fn compute_analytic_stats(
         poisson_llr(mu_raw, observed_count)
     };
 
+    // LLR is always ≥ 0 (KL divergence); direction comes from observed vs μ.
+    // Enrichment (observed ≥ μ): p = erfc(√LLR)/2 ∈ (0, 0.5].
+    // Depletion  (observed < μ): p = 1 − erfc(√LLR)/2 ∈ [0.5, 1).
     let p_value = match llr {
-        Some(l) if l > 0.0 => erfc(l.sqrt()) * 0.5,
+        Some(l) if l > 0.0 => {
+            let tail = erfc(l.sqrt()) * 0.5;
+            if observed >= mu_total { tail } else { 1.0 - tail }
+        }
         _ => 1.0,
     };
 
@@ -186,9 +192,30 @@ mod tests {
         q_bed.insert("chr22".to_string(), ivs);
         let q_data = build_query_chrom_data(&q_bed);
 
-        let (_p_value, llr) =
+        let (p_value, llr) =
             compute_analytic_stats(&q_data, make_lookup(&db_moments), 25_000.0).unwrap();
         assert!(llr.map_or(true, |l| l >= 0.0), "llr={llr:?}");
+        assert!(p_value < 0.5, "enriched pair should have p < 0.5, got {p_value}");
+    }
+
+    #[test]
+    fn test_compute_analytic_stats_depleted_gives_high_p() {
+        // Use a mock lookup to control μ/σ² exactly: mean=20, var=100 (overdispersed).
+        // Query: one interval of 1000bp = 10 bins on chr22 → scale=1, mu_total=20, var_total=100.
+        let mut q_bed = BedMap::new();
+        q_bed.insert("chr22".to_string(), vec![(0, 1_000)]);
+        let q_data = build_query_chrom_data(&q_bed);
+
+        let mock = |_: &str, _: f64| Some((20.0_f64, 100.0_f64));
+
+        // observed = 0: NB p_o = 1 fails bounds → LLR=None → p=1.0.
+        let (p_zero, _) = compute_analytic_stats(&q_data, mock, 0.0).unwrap();
+        assert_eq!(p_zero, 1.0, "observed=0 → p=1.0, got {p_zero}");
+
+        // observed = 10 < mu=20 (moderate depletion): p ∈ (0.5, 1.0).
+        let (p_depleted, llr) = compute_analytic_stats(&q_data, mock, 10.0).unwrap();
+        assert!(p_depleted > 0.5, "depletion (obs=10<mu=20) must have p>0.5, got {p_depleted} (llr={llr:?})");
+        assert!(p_depleted < 1.0, "depletion must have p<1.0 (not saturated), got {p_depleted}");
     }
 
     // ── nb_llr ────────────────────────────────────────────────────────────────
