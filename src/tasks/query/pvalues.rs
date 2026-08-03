@@ -59,9 +59,10 @@ pub(super) fn compute_analytic_pvalues(
                     let q_data = query_chrom_data.get(q_sid)?;
                     let observed_bins =
                         overlap.get(&(q_sid, d_sid as usize)).copied().unwrap_or(0.0) as f64;
-                    let lookup = |chrom: &str, l: f64| sid_moments.lookup(chrom, l);
+                    let resolve_chrom = |chrom: &str| sid_moments.find_chrom_idx(chrom);
+                    let lookup_l = |idx: usize, l_int: usize| sid_moments.lookup_by_chrom_idx(idx, l_int);
                     let (p_value, llr) =
-                        compute_analytic_stats(q_data, lookup, observed_bins)?;
+                        compute_analytic_stats(q_data, resolve_chrom, lookup_l, observed_bins)?;
                     Some(PValueResult {
                         query_id: q_sid,
                         db_sid: d_sid,

@@ -83,7 +83,9 @@ fn main() {
             Err(e) => { eprintln!("skip {gwas_path}: {e}"); continue }
         };
         let q_data: Vec<QueryChromData> = build_query_chrom_data(&bed);
-        let n_intervals: usize = q_data.iter().map(|c| c.interval_lengths.len()).sum();
+        let n_intervals: usize = q_data.iter()
+            .map(|c| c.grouped.iter().map(|g| g.count).sum::<usize>())
+            .sum();
 
         println!("\n=== GWAS query: {} ({} intervals) ===", gwas_path, n_intervals);
         println!("{:>8}  {:>12}  {:>12}  {:>10}  {:>10}",
@@ -101,12 +103,11 @@ fn main() {
             let mut any = false;
 
             for q_cd in &q_data {
-                for &l in &q_cd.interval_lengths {
-                    let l_int = (l.ceil() as usize).max(1);
-                    let scale = l / l_int as f64;
-                    if let Some((mean_l, var_l)) = sid_m.lookup(&q_cd.chrom, l_int as f64) {
-                        mu_total += mean_l * scale;
-                        var_total += var_l * scale * scale;
+                let Some(chrom_idx) = sid_m.find_chrom_idx(&q_cd.chrom) else { continue };
+                for g in &q_cd.grouped {
+                    if let Some((mean_l, var_l)) = sid_m.lookup_by_chrom_idx(chrom_idx, g.l_int) {
+                        mu_total += mean_l * g.sum_scale;
+                        var_total += var_l * g.sum_scale2;
                         any = true;
                     }
                 }

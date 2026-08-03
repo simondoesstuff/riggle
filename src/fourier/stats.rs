@@ -22,11 +22,19 @@ use super::moments::QueryChromData;
 
 /// Compute analytic statistics for a (query, DB) pair.
 ///
-/// `lookup(chrom, l_bins)` returns `(mean, var)` for a sliding window of
-/// `l_bins` bins on `chrom`.  Returns `(p_value, llr)`.
-pub fn compute_analytic_stats(
+/// `resolve_chrom(chrom)` is called once per query chromosome and returns an
+/// opaque handle `H` (e.g., a pre-resolved chromosome index).  `lookup_l(h,
+/// l_int)` is then called once per unique integer block size on that
+/// chromosome and returns `(mean, var)`.  Separating the two calls lets
+/// callers pay the O(N_chroms) chrom scan once per chrom rather than once
+/// per unique block size.
+///
+/// Returns `(p_value, llr)`, or `None` when no (query, DB) chromosome pair shares
+/// any moments.
+pub fn compute_analytic_stats<H: Copy>(
     q_data: &[QueryChromData],
-    lookup: impl Fn(&str, f64) -> Option<(f64, f64)>,
+    resolve_chrom: impl Fn(&str) -> Option<H>,
+    lookup_l: impl Fn(H, usize) -> Option<(f64, f64)>,
     observed: f64,
 ) -> Option<(f64, Option<f64>)> {
     let mut mu_total = 0.0f64;
@@ -35,34 +43,16 @@ pub fn compute_analytic_stats(
     let mut mu_raw = 0.0f64;
     let mut any_shared = false;
 
-    // interval_lengths is pre-sorted; iterate in runs of equal l_int so we pay
-    // one lookup per unique block size per chrom instead of one per interval.
     for q_cd in q_data {
-        let lengths = &q_cd.interval_lengths;
-        let mut i = 0;
-        while i < lengths.len() {
-            let l = lengths[i];
-            let l_int = (l.ceil() as usize).max(1);
-            let s0 = l / l_int as f64;
-            let mut sum_scale = s0;
-            let mut sum_scale2 = s0 * s0;
-            let mut count = 1usize;
-            i += 1;
-            while i < lengths.len() {
-                let l2 = lengths[i];
-                if (l2.ceil() as usize).max(1) != l_int {
-                    break;
-                }
-                let s2 = l2 / l_int as f64;
-                sum_scale += s2;
-                sum_scale2 += s2 * s2;
-                count += 1;
-                i += 1;
-            }
-            if let Some((mean_l, var_l)) = lookup(&q_cd.chrom, l_int as f64) {
-                mu_total += mean_l * sum_scale;
-                var_total += var_l * sum_scale2;
-                mu_raw += mean_l / l_int as f64 * count as f64;
+        let chrom_handle = match resolve_chrom(&q_cd.chrom) {
+            Some(h) => h,
+            None => continue,
+        };
+        for g in &q_cd.grouped {
+            if let Some((mean_l, var_l)) = lookup_l(chrom_handle, g.l_int) {
+                mu_total += mean_l * g.sum_scale;
+                var_total += var_l * g.sum_scale2;
+                mu_raw += mean_l / g.l_int as f64 * g.count as f64;
                 any_shared = true;
             }
         }
@@ -142,8 +132,12 @@ mod tests {
         BedMap, ChromMoments, DepthMap, build_depth_moments, build_query_chrom_data,
     };
 
-    fn make_lookup(moments: &[ChromMoments]) -> impl Fn(&str, f64) -> Option<(f64, f64)> + '_ {
-        |chrom, l| moments.iter().find(|m| m.chrom == chrom)?.lookup(l)
+    fn make_resolve(moments: &[ChromMoments]) -> impl Fn(&str) -> Option<usize> + '_ {
+        |chrom| moments.iter().position(|m| m.chrom == chrom)
+    }
+
+    fn make_lookup_l(moments: &[ChromMoments]) -> impl Fn(usize, usize) -> Option<(f64, f64)> + '_ {
+        |idx, l_int| moments.get(idx)?.lookup(l_int as f64)
     }
 
     // ── compute_analytic_stats ────────────────────────────────────────────────
@@ -159,7 +153,7 @@ mod tests {
         let db_dm = DepthMap::build(&db_bed);
         let db_moments = build_depth_moments(&db_dm);
 
-        assert!(compute_analytic_stats(&q_data, make_lookup(&db_moments), 0.0).is_none());
+        assert!(compute_analytic_stats(&q_data, make_resolve(&db_moments), make_lookup_l(&db_moments), 0.0).is_none());
     }
 
     #[test]
@@ -174,7 +168,7 @@ mod tests {
         let db_moments = build_depth_moments(&db_dm);
 
         let (p_value, _) =
-            compute_analytic_stats(&q_data, make_lookup(&db_moments), 0.0).unwrap();
+            compute_analytic_stats(&q_data, make_resolve(&db_moments), make_lookup_l(&db_moments), 0.0).unwrap();
         assert_eq!(p_value, 1.0);
     }
 
@@ -193,27 +187,28 @@ mod tests {
         let q_data = build_query_chrom_data(&q_bed);
 
         let (p_value, llr) =
-            compute_analytic_stats(&q_data, make_lookup(&db_moments), 25_000.0).unwrap();
+            compute_analytic_stats(&q_data, make_resolve(&db_moments), make_lookup_l(&db_moments), 25_000.0).unwrap();
         assert!(llr.map_or(true, |l| l >= 0.0), "llr={llr:?}");
         assert!(p_value < 0.5, "enriched pair should have p < 0.5, got {p_value}");
     }
 
     #[test]
     fn test_compute_analytic_stats_depleted_gives_high_p() {
-        // Use a mock lookup to control μ/σ² exactly: mean=20, var=100 (overdispersed).
+        // Use mock closures to control μ/σ² exactly: mean=20, var=100 (overdispersed).
         // Query: one interval of 1000bp = 10 bins on chr22 → scale=1, mu_total=20, var_total=100.
         let mut q_bed = BedMap::new();
         q_bed.insert("chr22".to_string(), vec![(0, 1_000)]);
         let q_data = build_query_chrom_data(&q_bed);
 
-        let mock = |_: &str, _: f64| Some((20.0_f64, 100.0_f64));
+        let resolve_all = |_: &str| -> Option<()> { Some(()) };
+        let fixed_moments = |_: (), _: usize| -> Option<(f64, f64)> { Some((20.0, 100.0)) };
 
         // observed = 0: NB p_o = 1 fails bounds → LLR=None → p=1.0.
-        let (p_zero, _) = compute_analytic_stats(&q_data, mock, 0.0).unwrap();
+        let (p_zero, _) = compute_analytic_stats(&q_data, resolve_all, fixed_moments, 0.0).unwrap();
         assert_eq!(p_zero, 1.0, "observed=0 → p=1.0, got {p_zero}");
 
         // observed = 10 < mu=20 (moderate depletion): p ∈ (0.5, 1.0).
-        let (p_depleted, llr) = compute_analytic_stats(&q_data, mock, 10.0).unwrap();
+        let (p_depleted, llr) = compute_analytic_stats(&q_data, resolve_all, fixed_moments, 10.0).unwrap();
         assert!(p_depleted > 0.5, "depletion (obs=10<mu=20) must have p>0.5, got {p_depleted} (llr={llr:?})");
         assert!(p_depleted < 1.0, "depletion must have p<1.0 (not saturated), got {p_depleted}");
     }

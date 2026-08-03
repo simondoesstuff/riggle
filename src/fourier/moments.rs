@@ -92,12 +92,29 @@ impl ChromMoments {
     }
 }
 
+/// One bucket of pre-grouped interval lengths for stats accumulation.
+///
+/// Intervals are grouped by `l_int = ceil(l_bins)`, allowing `compute_analytic_stats`
+/// to pay one moment lookup per unique block size rather than one per raw interval.
+pub struct GroupedL {
+    /// Integer block size: `ceil(l_bins)` for all intervals in this bucket.
+    pub l_int: usize,
+    /// Σ(l / l_int) over all intervals in this bucket.
+    pub sum_scale: f64,
+    /// Σ(l / l_int)² over all intervals in this bucket.
+    pub sum_scale2: f64,
+    /// Number of intervals in this bucket.
+    pub count: usize,
+}
+
 /// Per-chromosome interval data for one query file.
 pub struct QueryChromData {
     pub chrom: String,
     pub n_bins: usize,
-    /// Length of each interval in 100 bp bins (may be fractional).
-    pub interval_lengths: Vec<f64>,
+    /// Interval lengths grouped by `ceil(l_bins)`, sorted ascending by `l_int`.
+    /// Pre-computed at parse time so stats accumulation is O(N_unique_L) per
+    /// (query, DB-source) pair rather than O(N_intervals).
+    pub grouped: Vec<GroupedL>,
 }
 
 /// Build dense moment tables for every chromosome in a [`DepthMap`].
@@ -116,9 +133,8 @@ pub fn build_chrom_moments(cdm: &ChromDepthMap) -> ChromMoments {
 
 /// Build per-chromosome interval data from a raw BED map.
 ///
-/// Iterates only the chromosomes present in `bed` (not the full hg38 list).
-/// `interval_lengths` are sorted so the stats accumulator can group by unique
-/// block size with a single linear pass instead of one lookup per interval.
+/// Sorts interval lengths and pre-groups them by `ceil(l_bins)` so that
+/// `compute_analytic_stats` pays O(N_unique_L) per pair, not O(N_intervals).
 pub fn build_query_chrom_data(bed: &BedMap) -> Vec<QueryChromData> {
     let size_map: HashMap<&str, u32> =
         hg38_chrom_sizes().iter().map(|&(c, s)| (c, s)).collect();
@@ -129,23 +145,47 @@ pub fn build_query_chrom_data(bed: &BedMap) -> Vec<QueryChromData> {
             }
             let &size = size_map.get(chrom.as_str())?;
             let n_bins = ((size + BIN_SIZE - 1) / BIN_SIZE) as usize;
-            let mut interval_lengths: Vec<f64> = ivs
+            let mut lengths: Vec<f64> = ivs
                 .iter()
                 .map(|&(s, e)| (e - s) as f64 / BIN_SIZE as f64)
                 .collect();
-            interval_lengths.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            Some(QueryChromData {
-                chrom: chrom.clone(),
-                n_bins,
-                interval_lengths,
-            })
+            lengths.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+            let mut grouped: Vec<GroupedL> = Vec::new();
+            let mut i = 0;
+            while i < lengths.len() {
+                let l = lengths[i];
+                let l_int = (l.ceil() as usize).max(1);
+                let s0 = l / l_int as f64;
+                let mut sum_scale = s0;
+                let mut sum_scale2 = s0 * s0;
+                let mut count = 1usize;
+                i += 1;
+                while i < lengths.len() && (lengths[i].ceil() as usize).max(1) == l_int {
+                    let s = lengths[i] / l_int as f64;
+                    sum_scale += s;
+                    sum_scale2 += s * s;
+                    count += 1;
+                    i += 1;
+                }
+                grouped.push(GroupedL { l_int, sum_scale, sum_scale2, count });
+            }
+
+            Some(QueryChromData { chrom: chrom.clone(), n_bins, grouped })
         })
         .collect()
 }
 
 pub fn mean_interval_bins(q_data: &[QueryChromData]) -> f64 {
-    let total_l: f64 = q_data.iter().flat_map(|c| c.interval_lengths.iter()).sum();
-    let total_n: usize = q_data.iter().map(|c| c.interval_lengths.len()).sum();
+    let mut total_l = 0.0f64;
+    let mut total_n = 0usize;
+    for q_cd in q_data {
+        for g in &q_cd.grouped {
+            // l = s * l_int for each interval s in this bucket, so Σl = l_int * sum_scale
+            total_l += g.l_int as f64 * g.sum_scale;
+            total_n += g.count;
+        }
+    }
     if total_n == 0 { 0.0 } else { total_l / total_n as f64 }
 }
 

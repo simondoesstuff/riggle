@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use crate::core::Interval;
 use crate::fourier::{BedMap, QueryChromData, build_query_chrom_data};
 use crate::io::{is_bed_file, parse_bed_file};
@@ -36,38 +38,64 @@ pub(super) fn enumerate_query_files(path: &Path) -> Result<Vec<PathBuf>, QueryEr
 
 /// Parse a slice of BED files, assigning local Q_SIDs 0..N (one per non-empty file).
 pub(super) fn parse_file_batch(files: &[PathBuf]) -> Result<ParsedQueries, QueryError> {
+    // Parse all files in parallel; use position index as a temporary SID so
+    // that intervals from each file are tagged distinctly before we know which
+    // files are non-empty.
+    type RawEntry = (String, HashMap<String, Vec<Interval>>, Vec<QueryChromData>, usize);
+    let raw: Vec<Result<RawEntry, QueryError>> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, bed_path)| {
+            let file_shards = parse_bed_file(bed_path, i as u32)?;
+            let file_count: usize = file_shards.values().map(|v| v.len()).sum();
+            let name = bed_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("query_{}", i));
+            let chrom_data = if file_count > 0 {
+                let bed_map: BedMap = file_shards
+                    .iter()
+                    .map(|(chrom, ivs)| {
+                        (chrom.clone(), ivs.iter().map(|iv| (iv.start, iv.end)).collect())
+                    })
+                    .collect();
+                build_query_chrom_data(&bed_map)
+            } else {
+                Vec::new()
+            };
+            Ok((name, file_shards, chrom_data, file_count))
+        })
+        .collect();
+
     let mut shard_intervals: HashMap<String, Vec<Interval>> = HashMap::new();
     let mut query_sources = Vec::new();
     let mut query_names = Vec::new();
     let mut query_chrom_data = Vec::new();
     let mut file_sid = 0u32;
 
-    for bed_path in files {
-        let file_shards = parse_bed_file(bed_path, file_sid)?;
-        let file_count: usize = file_shards.values().map(|v| v.len()).sum();
+    for (position, result) in raw.into_iter().enumerate() {
+        let (name, file_shards, chrom_data, file_count) = result?;
 
         if file_count == 0 {
             continue;
         }
 
-        let name = bed_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("query_{}", file_sid));
-
         query_names.push(name.clone());
         query_sources.push(QuerySource { name, count: file_count });
-
-        let bed_map: BedMap = file_shards
-            .iter()
-            .map(|(chrom, ivs)| {
-                (chrom.clone(), ivs.iter().map(|iv| (iv.start, iv.end)).collect())
-            })
-            .collect();
-        query_chrom_data.push(build_query_chrom_data(&bed_map));
+        query_chrom_data.push(chrom_data);
 
         for (shard, intervals) in file_shards {
-            shard_intervals.entry(shard).or_default().extend(intervals);
+            // Remap SID from position index to compact Q_SID.  For datasets
+            // with no empty files, position == file_sid so this is a no-op.
+            let remapped: Vec<Interval> = if position as u32 == file_sid {
+                intervals
+            } else {
+                intervals
+                    .into_iter()
+                    .map(|iv| Interval { sid: file_sid, ..iv })
+                    .collect()
+            };
+            shard_intervals.entry(shard).or_default().extend(remapped);
         }
 
         file_sid += 1;

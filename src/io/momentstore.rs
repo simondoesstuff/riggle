@@ -46,13 +46,30 @@ impl<'a> MappedSidMoments<'a> {
     /// for small N due to cache locality.
     /// Returns `None` when `chrom` is absent or `l_bins` rounds to 0 or ≥ n_bins.
     pub fn lookup(&self, chrom: &str, l_bins: f64) -> Option<(f64, f64)> {
-        let acm = self.entry.iter().find(|c| c.chrom.as_str() == chrom)?;
+        let chrom_idx = self.find_chrom_idx(chrom)?;
+        self.lookup_by_chrom_idx(chrom_idx, l_bins.round() as usize)
+    }
+
+    /// Return the index of `chrom` in the entry slice, or `None` if absent.
+    ///
+    /// Separating chrom resolution from moment lookup allows callers to pay
+    /// the O(N_chroms) scan once per query chromosome rather than once per
+    /// unique block size.
+    pub fn find_chrom_idx(&self, chrom: &str) -> Option<usize> {
+        self.entry.iter().position(|c| c.chrom.as_str() == chrom)
+    }
+
+    /// Return `(mean, var)` for block size `l_int` at a pre-resolved chrom index.
+    ///
+    /// O(1): no chromosome scan. `l_int` must be the already-rounded integer
+    /// block size (≥ 1). Returns `None` when `l_int` is out of range.
+    pub fn lookup_by_chrom_idx(&self, chrom_idx: usize, l_int: usize) -> Option<(f64, f64)> {
+        let acm = self.entry.get(chrom_idx)?;
         let n_bins = u32::from(acm.n_bins) as usize;
-        let l = l_bins.round() as usize;
-        if l == 0 || l >= n_bins {
+        if l_int == 0 || l_int >= n_bins {
             return None;
         }
-        let base = compact_index(l) * 2;
+        let base = compact_index(l_int) * 2;
         if base + 1 >= acm.moments.len() {
             return None;
         }
