@@ -10,9 +10,11 @@ Chuckle's query engine computes dense intersection statistics across entire sets
 
 **1.1. Storage Engine (Disk / OS Page Cache)**
 
-- **Database ($D$):** Partitioned into distinct coordinate spaces (shards) and divided into **Exponential Layers**. There are no chunks or tiles. Each layer is a single, giant memory-mapped file.
+- **Database ($D$):** Partitioned into distinct coordinate spaces (shards) and divided into **Exponential Layers**. There are no chunks or tiles. Each layer is stored as two parallel memory-mapped files per shard.
   - _Constraint:_ Every interval in Layer $K$ has length $L \le \text{layerSize}$ (the maximum length boundary for that layer).
-  - _Layout:_ Flat, contiguous array of universally formatted structs: `(start: u32, end: u32, D_sid: u32)`. Strictly sorted by `start`.
+  - _Layout:_ Two parallel files, strictly sorted by `start`:
+    - `layer_K.pos` — flat array of `(start: u32, end: u32)` pairs (8 bytes each). The hot scan array; always read sequentially.
+    - `layer_K.sid` — flat array of `D_sid: u32` (4 bytes each), parallel to `.pos`. The cold array; accessed only on confirmed overlap hits.
 - **Queries ($Q$):** Fully loaded into RAM as a flat array.
   - _Layout:_ `(start: u32, end: u32, Q_sid: u32)`. Strictly sorted by `start`.
 

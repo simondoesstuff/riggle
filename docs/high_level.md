@@ -24,13 +24,14 @@ The meaning of the SetID (`sid`) depends entirely on the operational context:
 
 The database is heavily simplified for contiguous memory access. It is partitioned first by **shard** (a distinct coordinate space), and then divided into **layers** based on exponentially bounded interval sizes.
 
-### A. The Layer (The Memmap)
+### A. The Layer (Two Parallel Memmaps)
 
-Chunks and tiles do not exist in this architecture. A layer is a **single, giant memory-mapped file**.
+Chunks and tiles do not exist in this architecture. A layer is stored as **two parallel memory-mapped files** per shard:
 
-- **Structure:** It contains a flat, tightly packed array of intervals.
-- **Interval Tuple:** Every entry is strictly a `(start, end, sid)` tuple.
-- **Ordering:** Intervals within the memmap are strictly sorted by their `start` coordinate.
+- **`layer_K.pos`** — a flat, tightly packed array of `(start: u32, end: u32)` position pairs (8 bytes each). This is the hot scan array: the query engine reads it sequentially on every sweep.
+- **`layer_K.sid`** — a parallel flat array of `u32` source IDs (4 bytes each). Index `i` in this array corresponds to index `i` in `layer_K.pos`. This is a cold array: it is accessed only when a confirmed overlap is found, so it stays out of the cache during misses.
+
+Both files are strictly sorted by the `start` coordinate of `layer_K.pos`. The split reduces the per-entry scan footprint from 12 bytes to 8 bytes, fitting 8 positions per 64-byte cache line instead of 5.
 
 ### B. Global Metadata (`meta.json`)
 
@@ -47,7 +48,7 @@ The indexer processes a batch of interval TSV files into the memmap structure th
 
 1.  **Parse & Split:** The batched TSVs are parsed in parallel. Intervals are partitioned into their appropriate shards and layers based on their size and coordinate space.
 2.  **Sort:** Intervals within each partition are sorted by their `start` coordinate.
-3.  **Memmap Write:** The sorted `(start, end, sid)` tuples are written directly to their corresponding layer's giant memmap. During this index phase, the `sid` attached to each interval corresponds to its original **Database SID**.
+3.  **Memmap Write:** The sorted intervals are written to their corresponding layer's two files: positions `(start, end)` to `layer_K.pos` and source IDs to `layer_K.sid`. During this index phase, the `sid` attached to each interval corresponds to its original **Database SID**.
 
 ---
 

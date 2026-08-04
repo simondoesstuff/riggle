@@ -221,15 +221,16 @@ fn process_file_batch(
             if let Err(e) = fs::create_dir_all(&shard_dir) {
                 return Some(AddError::Io(e));
             }
-            let layer_path = shard_dir.join(format!("layer_{}.bin", layer_idx));
+            let pos_path = shard_dir.join(format!("layer_{}.pos", layer_idx));
+            let sid_path = shard_dir.join(format!("layer_{}.sid", layer_idx));
             let idx_path = shard_dir.join(format!("layer_{}.idx", layer_idx));
             let tile_sz = layer_config.tile_size(*layer_idx);
 
-            let layer_exists = layer_path.exists();
+            let layer_exists = pos_path.exists();
             let layer_result = if layer_exists {
-                extend_layer(&layer_path, sorted_ivs)
+                extend_layer(&pos_path, &sid_path, sorted_ivs)
             } else {
-                write_layer(&layer_path, sorted_ivs)
+                write_layer(&pos_path, &sid_path, sorted_ivs)
             };
             if let Err(e) = layer_result {
                 return Some(AddError::Layer(e));
@@ -346,10 +347,11 @@ mod tests {
         ))
         .unwrap();
 
-        let layer_path = db.path().join("shards").join("chr1").join("layer_0.bin");
-        assert!(layer_path.exists());
-        let mapped = MappedLayer::open(&layer_path).unwrap();
-        let ivs = mapped.intervals();
+        let pos_path = db.path().join("shards").join("chr1").join("layer_0.pos");
+        let sid_path = db.path().join("shards").join("chr1").join("layer_0.sid");
+        assert!(pos_path.exists());
+        let mapped = MappedLayer::open(&pos_path, &sid_path).unwrap();
+        let ivs = mapped.positions();
         for w in ivs.windows(2) {
             assert!(w[0].start <= w[1].start);
         }

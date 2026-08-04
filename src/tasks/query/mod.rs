@@ -5,13 +5,12 @@ mod sweep;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
 
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::fourier::QueryChromData;
-use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError};
+use crate::io::{BedParseError, LayerError, MappedJumpTable, MappedLayer, Meta, MetaError, Position};
 use crate::matrix::{DenseMatrix, OverlapMatrix, SparseMatrix};
 use crate::stats::IntervalHit;
 use crate::sweep::query_sweep_windowed;
@@ -180,14 +179,8 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     // Exact overlap in bins for each (q_sid, d_sid) pair; populated for every hit.
     let mut overlap_map: HashMap<(usize, usize), f32> = HashMap::new();
 
-    let mut t_parse = 0.0f64;
-    let mut t_sweep = 0.0f64;
-    let mut t_extract = 0.0f64;
-
     for batch_files in all_files.chunks(batch_size) {
-        let t0 = Instant::now();
         let parsed = parse_file_batch(batch_files)?;
-        t_parse += t0.elapsed().as_secs_f64();
         let batch_len = parsed.total_count;
         if batch_len == 0 {
             continue;
@@ -196,7 +189,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         let mut count_accumulator = DenseMatrix::new(batch_len, num_sources);
         let mut overlap_accumulator = OverlapMatrix::new(batch_len, num_sources);
 
-        let t1 = Instant::now();
+
         for (shard, mut shard_queries) in parsed.shard_intervals {
             if !db_shard_set.contains(shard.as_str()) {
                 continue;
@@ -211,15 +204,20 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
             // Pre-load all layers for this shard before entering the parallel section.
             let mut layers: Vec<(MappedLayer, u32, MappedJumpTable)> = Vec::new();
             for layer_idx in 0..meta.num_layers {
-                let layer_path = config
+                let pos_path = config
                     .db_path
                     .join("shards")
                     .join(&shard)
-                    .join(format!("layer_{}.bin", layer_idx));
-                if !layer_path.exists() {
+                    .join(format!("layer_{}.pos", layer_idx));
+                if !pos_path.exists() {
                     continue;
                 }
-                let layer = MappedLayer::open(&layer_path)?;
+                let sid_path = config
+                    .db_path
+                    .join("shards")
+                    .join(&shard)
+                    .join(format!("layer_{}.sid", layer_idx));
+                let layer = MappedLayer::open(&pos_path, &sid_path)?;
                 if layer.is_empty() {
                     continue;
                 }
@@ -237,10 +235,10 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 continue;
             }
 
-            // Extract interval slices so the par_iter closure captures only
-            // &[Interval] and &MappedJumpTable (both Send+Sync).
-            let layer_refs: Vec<(&[_], u32, &MappedJumpTable)> =
-                layers.iter().map(|(l, ms, jt)| (l.intervals(), *ms, jt)).collect();
+            // Extract position/sid slices so the par_iter closure captures only
+            // &[Position], &[u32], and &MappedJumpTable (all Send+Sync).
+            let layer_refs: Vec<(&[Position], &[u32], u32, &MappedJumpTable)> =
+                layers.iter().map(|(l, ms, jt)| (l.positions(), l.sids(), *ms, jt)).collect();
 
             let n_windows = (batch_len + SWEEP_WINDOW_SIZE - 1) / SWEEP_WINDOW_SIZE;
 
@@ -262,9 +260,10 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                     let mut sub_counts = DenseMatrix::new(window_rows, num_sources);
                     let mut sub_overlap = OverlapMatrix::new(window_rows, num_sources);
 
-                    for &(db_intervals, layer_max_size, jump_table) in &layer_refs {
+                    for &(db_positions, db_sids, layer_max_size, jump_table) in &layer_refs {
                         query_sweep_windowed(
-                            db_intervals,
+                            db_positions,
+                            db_sids,
                             layer_max_size,
                             jump_table,
                             window_queries,
@@ -285,9 +284,7 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 overlap_accumulator.add_submatrix_rows(&sub_overlap, row_offset);
             }
         }
-        t_sweep += t1.elapsed().as_secs_f64();
 
-        let t2 = Instant::now();
         for local_row in 0..batch_len {
             let row_slice = count_accumulator.row(local_row);
             let global_row = global_q_offset + local_row;
@@ -299,7 +296,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
                 }
             }
         }
-        t_extract += t2.elapsed().as_secs_f64();
 
         global_q_offset += batch_len;
         query_names.extend(parsed.query_names);
@@ -307,16 +303,9 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
         all_query_chrom_data.extend(parsed.query_chrom_data);
     }
 
-    eprintln!("[perf] parse:   {t_parse:.3}s");
-    eprintln!("[perf] sweep:   {t_sweep:.3}s");
-    eprintln!("[perf] extract: {t_extract:.3}s");
-
-    let t3 = Instant::now();
     let num_queries = global_q_offset;
     let final_counts = build_csr_from_sorted_entries(&all_entries, num_queries, num_sources);
-    eprintln!("[perf] csr:     {:.3}s", t3.elapsed().as_secs_f64());
 
-    let t4 = Instant::now();
     let pvalues = if config.mode == QueryMode::Stats {
         compute_analytic_pvalues(
             &final_counts,
@@ -327,7 +316,6 @@ pub fn query_database(config: &QueryConfig) -> Result<QueryResult, QueryError> {
     } else {
         Vec::new()
     };
-    eprintln!("[perf] pvalues: {:.3}s", t4.elapsed().as_secs_f64());
 
     Ok(QueryResult {
         counts: final_counts,

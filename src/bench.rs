@@ -225,7 +225,7 @@ pub fn analyze_index_size(
     let input_size = dir_size(input_path);
     let index_size = dir_size(db_path);
 
-    // Collect per-layer stats by scanning shard subdirectories for layer_*.bin files.
+    // Collect per-layer stats by scanning shard subdirectories for layer_*.pos files.
     let mut layer_map: std::collections::HashMap<u8, (u64, usize)> =
         std::collections::HashMap::new();
 
@@ -239,7 +239,7 @@ pub fn analyze_index_size(
                 for fentry in files.filter_map(|e| e.ok()) {
                     let fname = fentry.file_name().to_string_lossy().to_string();
                     if let Some(rest) = fname.strip_prefix("layer_") {
-                        if let Some(id_str) = rest.strip_suffix(".bin") {
+                        if let Some(id_str) = rest.strip_suffix(".pos") {
                             if let Ok(layer_id) = id_str.parse::<u8>() {
                                 let size = fentry.metadata().map(|m| m.len()).unwrap_or(0);
                                 let entry = layer_map.entry(layer_id).or_insert((0, 0));

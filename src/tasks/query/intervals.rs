@@ -45,15 +45,20 @@ pub(super) fn collect_interval_pairs(
             shard_queries.voracious_sort();
 
             for layer_idx in 0..meta.num_layers {
-                let layer_path = config
+                let pos_path = config
                     .db_path
                     .join("shards")
                     .join(&shard)
-                    .join(format!("layer_{}.bin", layer_idx));
-                if !layer_path.exists() {
+                    .join(format!("layer_{}.pos", layer_idx));
+                if !pos_path.exists() {
                     continue;
                 }
-                let layer = MappedLayer::open(&layer_path)?;
+                let sid_path = config
+                    .db_path
+                    .join("shards")
+                    .join(&shard)
+                    .join(format!("layer_{}.sid", layer_idx));
+                let layer = MappedLayer::open(&pos_path, &sid_path)?;
                 if layer.is_empty() {
                     continue;
                 }
@@ -65,7 +70,8 @@ pub(super) fn collect_interval_pairs(
                     .join(&shard)
                     .join(format!("layer_{}.idx", layer_idx));
                 let jump_table = MappedJumpTable::open(&idx_path, tile_size)?;
-                let db_intervals = layer.intervals();
+                let db_positions = layer.positions();
+                let db_sids = layer.sids();
 
                 let block_size = (shard_queries.len() + num_threads - 1) / num_threads;
                 let blocks: Vec<&[_]> = shard_queries.chunks(block_size).collect();
@@ -73,7 +79,7 @@ pub(super) fn collect_interval_pairs(
                 let pairs: Vec<(_, _, u32)> = blocks
                     .par_iter()
                     .flat_map(|block| {
-                        query_sweep_pairs(db_intervals, layer_max_size, &jump_table, block)
+                        query_sweep_pairs(db_positions, db_sids, layer_max_size, &jump_table, block)
                     })
                     .collect();
 

@@ -39,19 +39,17 @@ At index time, the system architecture separates the CPU-bound parsing/sorting f
 
 ## 4. The Zero-Spike Merge Algorithm (Index Insertion)
 
-Because both the existing memmap and the incoming batch vectors are strictly sorted, inserting new data is logically a merge operation. However, loading an entire multi-gigabyte layer memmap into RAM to perform a standard merge would cause catastrophic memory spikes.
+Because both the existing layer files and the incoming batch are strictly sorted, inserting new data is logically a merge operation. However, loading an entire multi-gigabyte layer into RAM to perform a standard merge would cause catastrophic memory spikes.
 
-To solve this, the Index Writer thread uses an in-place **Extend & Reverse-Shift** strategy to merge data directly on disk.
+To solve this, the Index Writer thread uses an in-place **Extend & Reverse-Shift co-merge** applied simultaneously to both layer files (`layer_K.pos` and `layer_K.sid`).
 
 ### Step-by-Step Merge Process
 
-1.  **Memmap Extension:** The existing memory-mapped file for the target `(shard, layerID)` is extended on disk to accommodate the exact byte size of the incoming `sorted_ivs`. The new space at the end of the file is initially zero-filled.
-2.  **Chunked Reading:** Instead of loading the whole file, Chuckle reads the existing data in discrete, memory-safe chunks.
-3.  **Reverse Merge & Overwrite (Down-Shift):** To prevent overwriting unread existing data, the merge is executed from **bottom-to-top** (end-to-start).
-    - The engine simultaneously iterates the layer memmap and `sorted_ivs` in reverse order.
-    - Using the merge routine (as used in merge sort), a sorted intermediate buffer is accumulated.
-    - Once this buffer is fully populated (or a data source is exhausted), the buffer can be written to the end of the memmap.
-    - This reverse-merge safely populates the file from back to front. As the pointers move backwards, the algorithm naturally creates the necessary gaps for the new intervals without ever clobbering data that hasn't been read yet.
+1.  **File Extension:** Both `layer_K.pos` and `layer_K.sid` are extended on disk to accommodate the incoming `sorted_ivs` (`.pos` by `M × 8` bytes, `.sid` by `M × 4` bytes). Both files are then memory-mapped as mutable slices.
+2.  **Reverse Co-Merge:** To prevent overwriting unread existing data, the merge is executed from **back to front** using two read pointers (`old_ptr`, `new_ptr`) and one write pointer (`out_ptr`).
+    - At every step, the position with the larger `start` is selected from either the existing data or `sorted_ivs`, written to `out_ptr`, and its corresponding sid written to the same index in the sid mmap.
+    - The key invariant is `out_ptr = old_ptr + new_ptr`, which guarantees the write pointer always leads the old-read pointer (`out_ptr ≥ old_ptr`). This holds independently on both files because they share the same index arithmetic — so neither file's write ever aliases its own unread region.
+    - When `sorted_ivs` is exhausted, any remaining old entries are already in their correct positions and require no movement.
 
 ---
 

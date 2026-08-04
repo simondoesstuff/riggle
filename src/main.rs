@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
@@ -194,21 +193,15 @@ fn run_query(
     };
 
     // Sort by p-value when available, otherwise by descending overlap count.
-    let t_sort = Instant::now();
     stat_results.sort_by(|a, b| match (a.p_value, b.p_value) {
         (Some(pa), Some(pb)) => pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => b.overlap_count.cmp(&a.overlap_count),
     });
-    eprintln!("[perf] sort:    {:.3}s ({} results)", t_sort.elapsed().as_secs_f64(), stat_results.len());
 
-    let t_json = Instant::now();
     let json = StatsOutput { results: stat_results }.to_json()?;
-    eprintln!("[perf] json:    {:.3}s ({} bytes)", t_json.elapsed().as_secs_f64(), json.len());
-    let t_write = Instant::now();
     std::fs::write(&output, json)?;
-    eprintln!("[perf] write:   {:.3}s", t_write.elapsed().as_secs_f64());
 
     println!(
         "Query complete: {} query files × {} database sources → {}",
